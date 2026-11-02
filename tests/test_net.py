@@ -712,6 +712,61 @@ class BrowserLogin(unittest.TestCase):
                 c.notify.assert_called_once_with("Page.handleJavaScriptDialog", {"accept": accept})
 
 
+class BrowserViewer(unittest.TestCase):
+    def test_external_scheme(self):
+        from envbox.cdp.viewer import external_scheme
+        self.assertEqual(external_scheme("claude://login?code=1"), "claude")
+        self.assertEqual(external_scheme("MAILTO:a@b.c"), "mailto")
+        for own in ("https://claude.ai/", "http://localhost:1/", "about:blank", "data:text/html,x", "blob:https://a/b",
+                    "javascript:void(0)", "chrome-error://chromewebdata/", "view-source:https://a/", "", "no scheme"):
+            self.assertEqual(external_scheme(own), "", own)
+
+    def test_external_navigation_is_reported_and_stuck_tab_closed(self):
+        # claude:// из страницы входа: Chrome без окна показывает запрос, и вкладка перестаёт принимать ввод
+        import threading
+        from envbox.cdp.viewer import CdpViewer
+        got, done = [], threading.Event()
+        v = CdpViewer("/nonexistent.sock", lambda *_: None, on_external=got.append)
+        bg, fg = mock.Mock(), mock.Mock()
+        v.clients = {"TAB1": fg, "TAB2": bg}
+        v.client = fg
+        closed = []
+        v.close_tab = lambda tid: (closed.append(tid), done.set())
+        v._page_event(bg, "Page.frameRequestedNavigation",
+                      {"url": "claude://login?code=1", "frameId": "F", "reason": "scriptInitiated"})   # фоновая вкладка
+        self.assertTrue(done.wait(5))
+        self.assertEqual(got, ["claude://login?code=1"])
+        self.assertEqual(closed, ["TAB2"])
+        done.clear()
+        v._page_event(fg, "Page.frameRequestedNavigation", {"url": "https://claude.ai/x", "frameId": "F"})
+        self.assertFalse(done.wait(0.3))                       # обычные адреса не трогаем
+        self.assertEqual((got, closed), (["claude://login?code=1"], ["TAB2"]))
+
+    def test_page_sees_real_window_size_and_zoom(self):
+        # безоконный Chrome отвечал странице «окно 500x87, экран 1x1» (страница подтверждения входа: «окно слишком
+        # маленькое»); масштаб был CSS-хитростью, и страница его не видела
+        from envbox.cdp.viewer import CdpViewer
+        v = CdpViewer("/nonexistent.sock", lambda *_: None)
+        page, browser = mock.Mock(closed=False), mock.Mock()
+        browser.call.side_effect = lambda m, p=None: (
+            {"windowId": 7, "bounds": {"width": 500, "height": 87}} if m == "Browser.getWindowForTarget" else {})
+        v.browser.client = browser
+        v.client, v.active, v.size = page, "T", (1200, 700)
+        v.zoom["T"] = 0.8
+        v._apply_metrics()
+        args = page.call.call_args[0]
+        self.assertEqual(args[0], "Emulation.setDeviceMetricsOverride")
+        m = args[1]
+        self.assertEqual((m["width"], m["height"], m["deviceScaleFactor"]), (1500, 875, 0.8))   # страница видит зум
+        self.assertEqual((m["screenWidth"], m["screenHeight"]), (1500, 875))
+        calls = [c[0] for c in browser.call.call_args_list]
+        self.assertEqual(calls[-1][0], "Browser.setWindowBounds")
+        self.assertEqual((calls[-1][1]["bounds"]["width"], calls[-1][1]["bounds"]["height"]), (1200, 700))
+        browser.reset_mock()
+        v._apply_metrics()
+        self.assertEqual([c[0][0] for c in browser.call.call_args_list], [])                    # окно уже нужного размера
+
+
 class AppImageBuild(unittest.TestCase):
     def test_existing_appimage_is_replaced_not_overwritten(self):
         # запущенный AppImage нельзя открыть на запись («Text file busy»): собираем рядом и подменяем

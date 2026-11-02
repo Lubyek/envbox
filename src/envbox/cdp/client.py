@@ -28,7 +28,6 @@ class CdpClient:
         self._pending = {}
         self._ids = itertools.count(1)
         self._closed = False
-        self.zoom_script = None
         self.applied_size = None
 
     # ---- websocket

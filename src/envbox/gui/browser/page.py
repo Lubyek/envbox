@@ -5,9 +5,10 @@ import threading
 from ...cdp.http import cdp_listening
 from ...cdp.viewer import CdpViewer
 from ...core.browser import cdp_socket_path
+from ...core.links import find_env_for_url, safe_link_label
 from ...core.store import load_profile
 from ..gtk import GLib, Gtk
-from ..widgets import alert, hint
+from ..widgets import alert, choose, hint
 
 
 class BrowserPageMixin:
@@ -32,6 +33,7 @@ class BrowserPageMixin:
         self.b_tabs_sig = None
         self.b_ctx = {}
         self.b_detached = None        # отдельное окно браузера (Gtk.Window) или None
+        self.b_ext_busy = False       # открыт вопрос «передать ссылку приложению?»
         self.b_detached_env = ""
         self.b_want_url = ""          # ссылка, которую нужно открыть вкладкой сразу после подключения
         self.link_queue = []          # запросы на открытие ссылок из сред: (среда, адрес)
@@ -234,7 +236,8 @@ class BrowserPageMixin:
             try:
                 v = CdpViewer(cdp_socket_path(name), self.browser_on_frame, self.browser_on_url,
                                    lambda: GLib.idle_add(self.browser_closed, holder.get("v")),
-                                   lambda tabs, active: GLib.idle_add(self.browser_set_tabs, tabs, active))
+                                   lambda tabs, active: GLib.idle_add(self.browser_set_tabs, tabs, active),
+                                   lambda url: GLib.idle_add(self.browser_ask_external, url))
                 holder["v"] = v
                 v.connect(w, h)
                 GLib.idle_add(self.browser_connected, v, name)
@@ -259,6 +262,37 @@ class BrowserPageMixin:
         if self.b_want_url:  # ссылка из приложения среды: открыть новой вкладкой и показать
             url, self.b_want_url = self.b_want_url, ""
             self.bg(lambda: v.new_tab(url))
+        return False
+
+    def browser_ask_external(self, url):
+        """Страница в браузере-среде открывает приложение (claude://…): спросить и передать приложению в среде.
+
+        Сам браузер без окна запускать программы не умеет и показывает запрос, который нельзя закрыть, поэтому
+        вкладку он закрывает, а ссылку отдаёт сюда. Адрес приходит со страницы (недоверенный): показываем без
+        параметров (в них коды входа), передаёт только среда с такой схемой в «Схемах ссылок»."""
+        if self.b_ext_busy:
+            return False
+        label = safe_link_label(url)
+        try:
+            envs = find_env_for_url(url)
+        except (OSError, ValueError):
+            envs = []
+        if not envs:
+            alert(self, "Страница хочет открыть приложение",
+                  f"Адрес: {label}\n\nНи у одной среды нет такой схемы в «Схемах ссылок», передавать некуда. "
+                  "Для Claude Desktop укажите схему claude в настройках его среды.")
+            return False
+        self.b_ext_busy = True
+
+        def answer(idx):
+            self.b_ext_busy = False
+            if idx == 1:
+                self.send_link_to_env(url, envs[0])
+
+        choose(self, "Страница хочет открыть приложение",
+               f"Адрес: {label}\nСреда: {envs[0]}\n\nПередать ссылку приложению в этой среде? Так завершается вход "
+               "в Claude Desktop. Не передавайте ссылки с сайтов, которым не доверяете.",
+               ["Отмена", "Передать приложению"], answer)
         return False
 
     def browser_failed(self, msg):

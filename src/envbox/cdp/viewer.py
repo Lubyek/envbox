@@ -2,6 +2,7 @@
 
 import base64
 import json
+import re
 import threading
 
 from ..core.consts import CDP_PORT
@@ -11,14 +12,29 @@ from .http import CdpError, cdp_pick_page
 from .keys import cdp_key_events, normalize_url
 
 
+# Схемы, которые браузер открывает сам. Всё остальное (claude://, mailto:…) — запуск внешней программы.
+_OWN_SCHEMES = ("http", "https", "about", "data", "blob", "file", "filesystem", "javascript", "ws", "wss", "ftp",
+                "chrome", "chrome-error", "chrome-untrusted", "chrome-extension", "devtools", "view-source")
+
+
+def external_scheme(url):
+    """Схема адреса, если по нему браузер запускает внешнюю программу (claude://…), иначе пустая строка."""
+    m = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*):", url or "")
+    return m.group(1).lower() if m and m.group(1).lower() not in _OWN_SCHEMES else ""
+
+
 class CdpViewer:
     """Просмотр браузера среды: вкладки, кадры (JPEG) в on_frame, ввод мышью и клавиатурой, масштаб.
 
-    on_tabs(список вкладок, id активной) вызывается из потока чтения при любом изменении вкладок."""
+    on_tabs(список вкладок, id активной) вызывается из потока чтения при любом изменении вкладок.
+    on_external(адрес) — страница пыталась открыть внешнюю программу (claude://…): Chrome без окна показывает
+    запрос, который нельзя закрыть, и вкладка перестаёт принимать ввод, поэтому вкладку мы закрываем сами."""
 
-    def __init__(self, sock_path, on_frame, on_url=None, on_close=None, on_tabs=None):
+    def __init__(self, sock_path, on_frame, on_url=None, on_close=None, on_tabs=None, on_external=None):
         self.sock_path = sock_path
         self.on_frame, self.on_url, self.on_close, self.on_tabs = on_frame, on_url, on_close, on_tabs
+        self.on_external = on_external
+        self.windows = {}
         self.browser = CdpBrowser(sock_path, self._tabs_event, self._browser_closed)
         self.client = None
         self.clients = {}
@@ -48,7 +64,7 @@ class CdpViewer:
         try:
             client.call("Page.enable")
             self.client = client
-            self._apply_metrics()
+            self._apply_metrics(tid)
         except BaseException:
             client.close()
             raise
@@ -78,8 +94,6 @@ class CdpViewer:
                         pass
                 self.client, self.active = client, tid
                 self._apply_metrics()
-                if self.cur_zoom != 1.0 and client.zoom_script is None:
-                    self._apply_zoom()
                 client.call("Page.startScreencast", {"format": "jpeg", "quality": 75, "everyNthFrame": 1})
                 try:
                     info = client.call("Page.getNavigationHistory")
@@ -102,6 +116,7 @@ class CdpViewer:
     def _tabs_event(self, tabs, created, destroyed):
         ids = [t["id"] for t in tabs]
         if destroyed is not None:
+            self.windows.pop(destroyed, None)
             gone = self.clients.pop(destroyed, None)
             if gone is not None:
                 gone.close()
@@ -152,6 +167,11 @@ class CdpViewer:
             except OSError:
                 pass
             return
+        if method == "Page.frameRequestedNavigation":
+            url = (params or {}).get("url", "")
+            if external_scheme(url):
+                self._external(client, url)
+            return
         if client is not self.client:
             return
         if method == "Page.screencastFrame":
@@ -171,6 +191,24 @@ class CdpViewer:
         elif method == "Page.navigatedWithinDocument" and self.on_url:
             self.on_url(params.get("url", ""))
 
+    def _external(self, client, url):
+        """Страница запросила запуск внешней программы: сообщаем наружу и закрываем вкладку (она уже зависла)."""
+        tid = next((t for t, c in self.clients.items() if c is client), None)
+
+        def work():
+            if self.on_external:
+                try:
+                    self.on_external(url)
+                except Exception:  # noqa: BLE001  ошибка обработчика не должна оставить вкладку висеть
+                    pass
+            if tid is not None and not self._closing:
+                try:
+                    self.close_tab(tid)
+                except (OSError, CdpError, KeyError, ValueError):
+                    pass
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _page(self):
         c = self.client
         if c is None or c.closed:
@@ -182,31 +220,39 @@ class CdpViewer:
     def cur_zoom(self):
         return self.zoom.get(self.active, 1.0)
 
-    def _apply_metrics(self):
+    def _apply_metrics(self, tid=None):
+        """Размер страницы, экрана и окна браузера.
+
+        Страница читает размер окна сама: innerWidth/outerWidth, screen.width, devicePixelRatio. Безоконный Chrome
+        по умолчанию отвечает ей «окно 500x87, экран 1x1», и сайты (например, страница подтверждения входа) пишут
+        «окно слишком маленькое». Масштаб — настоящий, как в браузере: страница видит innerWidth = ширина / масштаб
+        и devicePixelRatio = масштаб, адаптивная вёрстка перестраивается. Кадры идут в размере CSS-пикселей, поэтому
+        координаты кадра = координаты страницы."""
+        tid = tid or self.active
         w, h = self.size
+        z = self.zoom.get(tid, 1.0)
+        cw, ch = max(1, round(w / z)), max(1, round(h / z))
         c = self._page()
-        c.call("Emulation.setDeviceMetricsOverride", {"width": w, "height": h, "deviceScaleFactor": 1, "mobile": False})
+        c.call("Emulation.setDeviceMetricsOverride", {"width": cw, "height": ch, "deviceScaleFactor": z,
+                                                      "mobile": False, "screenWidth": cw, "screenHeight": ch})
+        self._fit_window(tid, w, h)
         c.applied_size = (w, h)
 
-    def _apply_zoom(self):
-        """Масштаб страницы как CSS zoom корневого элемента (в отличие от deviceScaleFactor кадр остаётся
-        чётким 1:1, а координаты мыши не пересчитываются). Сценарий на новый документ сохраняет масштаб
-        при переходах, пока вкладка показывается."""
-        c = self._page()
-        z = self.cur_zoom
-        old = getattr(c, "zoom_script", None)
-        if old:
-            try:
-                c.call("Page.removeScriptToEvaluateOnNewDocument", {"identifier": old})
-            except CdpError:
-                pass
-            c.zoom_script = None
-        value = "" if z == 1.0 else repr(z)
-        if z != 1.0:
-            src = ("(function(){var z=%s;function a(){var r=document.documentElement;if(r){r.style.zoom=String(z);}}"
-                   "a();document.addEventListener('DOMContentLoaded',a);})();" % repr(z))
-            c.zoom_script = c.call("Page.addScriptToEvaluateOnNewDocument", {"source": src}).get("identifier")
-        self.evaluate("(function(){var r=document.documentElement;if(r){r.style.zoom=%s;}})()" % json.dumps(value))
+    def _fit_window(self, tid, w, h):
+        """Окно браузера не меньше показываемой области (только увеличиваем: настоящее окно не трогаем)."""
+        try:
+            win = self.windows.get(tid)
+            if win is None:
+                info = self.browser.client.call("Browser.getWindowForTarget", {"targetId": tid})
+                win = self.windows[tid] = {"id": info["windowId"], "size": (info["bounds"].get("width", 0),
+                                                                           info["bounds"].get("height", 0))}
+            if win["size"][0] < w or win["size"][1] < h:
+                bounds = {"left": 0, "top": 0, "width": max(w, win["size"][0]), "height": max(h, win["size"][1]),
+                          "windowState": "normal"}
+                self.browser.client.call("Browser.setWindowBounds", {"windowId": win["id"], "bounds": bounds})
+                win["size"] = (bounds["width"], bounds["height"])
+        except (CdpError, KeyError, TypeError, AttributeError):
+            pass   # не все сборки Chrome умеют управлять окном: страница получит то, что есть
 
     def set_size(self, width, height):
         width, height = max(200, int(width)), max(150, int(height))
@@ -217,9 +263,9 @@ class CdpViewer:
             self._apply_metrics()
 
     def set_zoom(self, value):
-        value = round(min(5.0, max(0.25, float(value))), 2)
+        value = round(min(ZOOM_STEPS[-1], max(ZOOM_STEPS[0], float(value))), 2)
         self.zoom[self.active] = value
-        self._apply_zoom()
+        self._apply_metrics()
         return value
 
     def zoom_step(self, direction):
@@ -231,7 +277,7 @@ class CdpViewer:
         return self.set_zoom(nxt)
 
     def _css(self, x, y):
-        return x, y  # координаты кадра = координаты окна страницы (масштаб — CSS zoom, см. _apply_zoom)
+        return x, y  # кадр идёт в CSS-пикселях страницы (см. _apply_metrics): пересчёт не нужен
 
     # ---- навигация
     def navigate(self, text):

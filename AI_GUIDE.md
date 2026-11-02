@@ -291,6 +291,13 @@ src/envbox/
 - `http.py` (`_unix_connect`, `cdp_http`, `cdp_pick_page`, `cdp_listening`), `client.py` (`CdpClient`: свой WebSocket,
   лимит сообщения 64 МБ), `keys.py` (`normalize_url`: только http/https/about:blank; перевод координат/клавиш),
   `browser.py` (`CdpBrowser`: вкладки), `viewer.py` (`CdpViewer`: кадры, ввод, масштаб, поиск). Данные от браузера — недоверенные.
+  `CdpViewer._apply_metrics`: размер страницы, экрана (`screenWidth/Height`) и окна (`Browser.setWindowBounds`, только
+  в сторону увеличения) и масштаб как настоящий `deviceScaleFactor` (страница видит `innerWidth = ширина / масштаб`).
+  Кадры идут в CSS-пикселях страницы, поэтому координаты мыши пересчитывать не нужно; масштаб ограничен 50–300%.
+  `Page.frameRequestedNavigation` на внешнюю схему (`external_scheme`: claude://, mailto:…) → `on_external(адрес)` и
+  закрытие вкладки: безоконный Chrome показывает запрос «открыть программу?», который нельзя закрыть, и вкладка
+  перестаёт принимать ввод (reload, навигация, Escape не помогают, помогает только закрытие). GUI спрашивает
+  пользователя и передаёт ссылку в среду (`gui/browser/page.py browser_ask_external` → `send_link_to_env`).
 
 ### 4.5. `gui/` — GTK 4
 
@@ -667,6 +674,8 @@ python3 -I dist/envbox.py wrap --map 3999:/tmp/ebp/p.sock -- curl --noproxy '' -
 | Claude Desktop: «Connection problem», попытки каждые несколько секунд | в журнале повторяются `deny not-in-allowlist` для `bridge.claudeusercontent.com` (список профиля без него) | `CLAUDE_DESKTOP_DOMAINS` (пресет и миграция в `Profile.from_dict`); у профиля со своим списком — добавить хост вручную (вкладка «Сеть» → разрешить). Sentry/Datadog/GitHub отказы безвредны |
 | Вход в браузере-среде: Google/Cloudflare пишут «браузер не прошёл проверку»; окно просмотра зависает после входа через Google | (1) порт отладки включает `navigator.webdriver`; (2) страница открыла JS-диалог (`alert`, `beforeunload`), пока он открыт, кадры не идут; (3) allowlist браузера не пускает `challenges.cloudflare.com`/`*.gstatic.com` | (1) `--disable-blink-features=AutomationControlled` в `core/browser.py browser_command`; (2) `cdp/viewer.py _page_event` закрывает диалоги сам; (3) `net.log` браузера: `deny not-in-allowlist` |
 | Вход в Claude Desktop: «Couldn't verify your browser. Try again.» | allowlist среды без hCaptcha: в журнале `deny not-in-allowlist` для `js.hcaptcha.com` | `CLAUDE_DESKTOP_DOMAINS` (`*.hcaptcha.com`; миграция прежнего пресета — `OLD_CLAUDE_DESKTOP_DOMAINS`). У профиля со своим списком разрешить `*.hcaptcha.com` вручную (вкладка «Сеть»). Список всех отказов: `grep -h deny net.log`, поле `host` |
+| В просмотре браузера страница не реагирует на клики, прокрутку, выделение (особенно «Finish sign-in in the Claude app») | страница перешла на `claude://…`: безоконный Chrome показал запрос о запуске программы, вкладка заблокирована | `cdp/viewer.py _page_event` (`Page.frameRequestedNavigation`) закрывает такую вкладку и отдаёт ссылку GUI (`browser_ask_external`); у среды-приложения в «Схемах ссылок» должна быть `claude` |
+| Страница пишет «окно слишком маленькое» (`Authorize isn't available in a window this small`); масштаб страницу не меняет | безоконный Chrome сообщал `outerWidth/Height` 500x87 и `screen` 1x1; масштаб был CSS-зумом | `CdpViewer._apply_metrics` (экран, окно, `deviceScaleFactor`); проверка на настоящем Chrome: страница с `outerWidth`, `screen.width`, `devicePixelRatio` |
 | 403 «Private address forbidden» на обычных сайтах | локальный DNS отдаёт частные/нулевые адреса (fake-ip 198.18/15 уже разрешён; `0.0.0.0` от блокировщиков, split-DNS, Tailscale `100.64/10`) | `net.log`: `deny private-address`, поле `resolved`; `--dns`, `--net-allow-private` или чинить DNS |
 | 502 «Upstream proxy failed» | вышестоящий прокси (VPN-клиент) не запущен/не отвечает/требует пароль; цель недоступна (ждёт 15 с) | `net.log`: `error upstream: …`; `envbox.py probe --upstream URL` |
 | 502 «DNS resolution failed» | не работает DNS хоста или заданные `--dns` | `error dns: …`; `Resolver` кэширует отказ 2 с |
