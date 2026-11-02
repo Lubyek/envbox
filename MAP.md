@@ -53,8 +53,8 @@
   detect_terminal(), terminal_argv(), dry_run(), launch_background(), read_tail()
 - `src/envbox/core/upstream.py` (70 стр.) — Вышестоящий прокси профиля: разбор URL, чтение из файла, проверка.
   split_proxy_url(), read_proxy_file(), probe_upstream()
-- `src/envbox/core/vpn.py` (336 стр.) — Хранилище VPN-конфигураций: импорт, список, удаление и проверка наличия клиента.
-  vpn_dir(), vpn_path(), vpn_name_from_file(), exit_chain(), exit_mode(), normalize_name(), free_name(), looks_like_source(), is_subscription_url(), list_vpns(), vpn_source(), import_vpn(), delete_vpn(), vpn_binary_problem() …
+- `src/envbox/core/vpn.py` (587 стр.) — Хранилище VPN-конфигураций: импорт, список, удаление и проверка наличия клиента.
+  vpn_dir(), vpn_path(), vpn_name_from_file(), exit_chain(), exit_mode(), normalize_name(), free_name(), looks_like_source(), is_subscription_url(), clean_folder(), load_meta(), save_meta(), set_folder(), human_bytes() …
 - `src/envbox/gui/app.py` (24 стр.) — Приложение GTK и точка входа gui_main.
   App (2 методов), gui_main()
 - `src/envbox/gui/browser/page.py` (412 стр.) — Страница встроенного браузера: подключение, отключение, запуск.
@@ -75,7 +75,7 @@
   NetPageMixin (11 методов)
 - `src/envbox/gui/pages/overview.py` (162 стр.) — Страницы «Добро пожаловать» и «Обзор».
   OverviewMixin (3 методов)
-- `src/envbox/gui/pages/profile_net.py` (328 стр.) — Настройки сети среды: секрет, прокси, подключение приложений, CDP.
+- `src/envbox/gui/pages/profile_net.py` (331 стр.) — Настройки сети среды: секрет, прокси, подключение приложений, CDP.
   ProfileNetMixin (18 методов)
 - `src/envbox/gui/pages/profile_page.py` (570 стр.) — Страница настроек среды: сбор формы, сохранение.
   ProfilePageMixin (10 методов)
@@ -85,8 +85,8 @@
   SidebarMixin (6 методов)
 - `src/envbox/gui/pages/terminal.py` (276 стр.) — Встроенный терминал (VTE).
   TerminalMixin (9 методов)
-- `src/envbox/gui/pages/vpn.py` (236 стр.) — Вкладка «VPN»: загрузка конфигураций (WireGuard, VLESS/Xray, sing-box), проверка и удаление.
-  VpnPageMixin (11 методов)
+- `src/envbox/gui/pages/vpn.py` (391 стр.) — Вкладка «VPN»: серверы по папкам (сервисам), поиск, пинг, загрузка, проверка и удаление.
+  VpnPageMixin (21 методов)
 - `src/envbox/gui/tables.py` (62 стр.) — Таблицы и строки списков GUI.
   Row (1 методов), Table (5 методов)
 - `src/envbox/gui/widgets.py` (222 стр.) — Мелкие виджеты и диалоги GTK: кнопки, карточки, переключатели, alert/choose/prompt.
@@ -119,8 +119,8 @@
   seccomp_program_x86_64(), cmd_seccomp()
 - `src/envbox/net/upstream.py` (121 стр.) — Сетевой шлюз: вышестоящий прокси (http / socks5 / socks5h).
   UpstreamError (0 методов), Upstream (2 методов)
-- `src/envbox/net/vpn.py` (457 стр.) — Сетевой шлюз: VPN-клиенты как локальные SOCKS-прокси.
-  detect_kind(), wg_sections(), wg_validate(), wg_runtime(), share_scheme(), b64decode(), stream_settings(), check_server(), parse_vmess_json(), parse_shadowsocks(), parse_share_link(), link_server(), split_links(), xray_runtime() …
+- `src/envbox/net/vpn.py` (509 стр.) — Сетевой шлюз: VPN-клиенты как локальные SOCKS-прокси.
+  detect_kind(), wg_sections(), wg_validate(), wg_runtime(), share_scheme(), b64decode(), stream_settings(), check_server(), parse_vmess_json(), parse_shadowsocks(), parse_share_link(), link_server(), is_stub_link(), stub_remark() …
 - `src/envbox/resources.py` (9 стр.) — Встроенные ресурсы (envbox.sh, значки, CSS…): файлы из resources/; в собранном envbox.py они вшиты строками.
   resource_text()
 - `src/envbox/selfpath.py` (21 стр.) — Пути к самому envbox: точка запуска (SELF) и единый файл для установки (bundle_path).

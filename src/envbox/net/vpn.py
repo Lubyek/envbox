@@ -283,6 +283,58 @@ def link_server(out):
     return f"{node['address']}:{node['port']}"
 
 
+# Адреса, которые подписки подставляют вместо серверов, когда приложение им «не подходит»
+STUB_HOSTS = ("0.0.0.0", "127.0.0.1", "::", "::1", "localhost")
+
+
+def is_stub_link(link):
+    """Заглушка провайдера вместо сервера: адрес 0.0.0.0/localhost или порт 0–1 («Используйте Happ»…)."""
+    try:
+        out, _remark = parse_share_link(link)
+        node = (out["settings"].get("vnext") or out["settings"].get("servers"))[0]
+    except (ValueError, KeyError, IndexError, TypeError):
+        return False
+    return str(node["address"]).lower() in STUB_HOSTS or int(node["port"]) <= 1
+
+
+def stub_remark(link):
+    """Что провайдер написал в имени заглушки (например «Приложение не поддерживается»)."""
+    try:
+        return parse_share_link(link)[1]
+    except ValueError:
+        return ""
+
+
+def json_server(cfg):
+    """(хост, порт) первого исходящего подключения конфигурации Xray или sing-box; ('', 0), если не нашли."""
+    for o in cfg.get("outbounds") or []:
+        if not isinstance(o, dict):
+            continue
+        s = o.get("settings") or {}
+        node = ((s.get("vnext") or s.get("servers") or [None])[0]) or {}
+        host, port = node.get("address") or o.get("server"), node.get("port") or o.get("server_port")
+        if host and port:
+            try:
+                return str(host), int(port)
+            except (TypeError, ValueError):
+                continue
+    return "", 0
+
+
+def vpn_info(kind, text):
+    """Сведения для списка: {title, host, port, udp}. ValueError при плохой конфигурации (как vpn_validate)."""
+    if kind == "wireguard":
+        host, _, port = wg_validate(text).rpartition(":")
+        return {"title": "", "host": host.strip("[]"), "port": int(port) if port.isdigit() else 0, "udp": True}
+    if share_scheme(text):
+        out, remark = parse_share_link(text)
+        node = (out["settings"].get("vnext") or out["settings"].get("servers"))[0]
+        return {"title": remark, "host": str(node["address"]), "port": int(node["port"]), "udp": False}
+    vpn_validate(kind, text)
+    host, port = json_server(json.loads(text))
+    return {"title": "", "host": host, "port": port, "udp": False}
+
+
 def split_links(text):
     """Ссылки на серверы из текста подписки -> (поддерживаемые ссылки, схемы остальных ссылок).
 

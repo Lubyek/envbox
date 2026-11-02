@@ -171,9 +171,12 @@ class ProfileNetMixin:
         """Список VPN в выпадающих списках (после загрузки или удаления VPN и при показе профиля)."""
         if not hasattr(self, "dd_vpns"):
             return
-        names = [v["name"] for v in list_vpns()]
+        vpns = list_vpns()
+        names = [v["name"] for v in vpns]
         self.exit_vpns = names
-        model = ["—"] + names
+        # подпись: имя, затем название из ссылки или сервер (по подписи видно, что это за сервер); выбор — по номеру
+        model = ["—"] + [f"{v['name']} · {(v['title'] or v['host'])[:28]}" if (v["title"] or v["host"]) else v["name"]
+                         for v in vpns]
         was, self.exit_sync = getattr(self, "exit_sync", False), True   # смена модели не должна переписывать порядок
         try:
             self.dd_vpns.set_model(Gtk.StringList.new(model))
@@ -248,8 +251,8 @@ class ProfileNetMixin:
         set_text(self.tv_chain, "\n".join(lines))
 
     def on_chain_add_vpn(self, *_):
-        chosen = self.dd_vpns.get_selected_item()
-        name = chosen.get_string() if chosen is not None else "—"
+        i = self.dd_vpns.get_selected()
+        name = self.exit_vpns[i - 1] if 0 < i <= len(self.exit_vpns) else "—"
         if name == "—":
             alert(self, "Нет VPN", "Сначала загрузите VPN на вкладке «VPN», затем выберите его в списке.")
             return

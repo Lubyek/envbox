@@ -1188,7 +1188,7 @@ class VpnSubscriptions(unittest.TestCase):
         self.assertEqual([s for _n, _k, s in done], ["A (a.example:443)", "B (b.example:443)"])
         self.assertTrue(any("hysteria2" in x for x in skipped))                 # неподдерживаемое названо, а не молчком
         self.assertTrue(any("сервер 3" in x for x in skipped))                  # битая ссылка объяснена
-        self.assertEqual(self.agents, ["v2rayN/6.42"])                          # так панели отдают список ссылок
+        self.assertEqual(self.agents, ["Happ/2.5.0"])                           # первым пробуем Happ: ему отдают всё
         import_subscription("prov", self.url + "/token")                        # повторно: обновляет, а не падает
         self.assertEqual([v["name"] for v in list_vpns()], ["prov-1", "prov-2"])
         # имя можно не указывать: берётся из адреса
@@ -1308,6 +1308,135 @@ class VpnSubscriptions(unittest.TestCase):
         self.assertEqual(text, "trojan://pw@b.example:443#B")                    # TLS поверх туннеля и переход /old → /new
         self.assertEqual(len(seen), 2)
 
+    def test_stubs_are_not_imported_and_other_apps_are_tried(self):
+        # volnasubs: «Приложение не поддерживается (0.0.0.0:1)» и «Используйте Happ» были импортированы как серверы
+        from envbox.core.vpn import fetch_subscription_full, import_subscription, list_vpns
+        real = f"vless://{self.UUID}@real.example:443?security=tls#Berlin"
+        stub1 = f"vless://{self.UUID}@0.0.0.0:1?security=none#%D0%9F%D1%80%D0%B8%D0%BB%D0%BE%D0%B6%D0%B5%D0%BD%D0%B8%D0%B5"
+        stub2 = f"vless://{self.UUID}@0.0.0.0:1#Use-Happ"
+        import http.server
+        import threading
+        seen = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append((self.headers.get("User-Agent"), self.headers.get("x-hwid")))
+                if self.path == "/happ-only":
+                    body = real if self.headers.get("User-Agent", "").startswith("v2rayN") else f"{stub1}\n{stub2}"
+                elif self.path == "/never":
+                    body = f"{stub1}\n{stub2}"
+                else:
+                    body = f"{stub1}\n{real}\n{stub2}"
+                self.send_response(200)
+                self.send_header("profile-title", "base64:" + ShareLinks.b64("Мой сервис"))
+                self.send_header("subscription-userinfo", "upload=10; download=20; total=1000; expire=1893456000")
+                self.send_header("profile-update-interval", "6")
+                self.end_headers()
+                self.wfile.write(body.encode())
+
+            def log_message(self, *a):
+                pass
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        # настоящий сервер среди заглушек: заглушки пропущены, а не добавлены
+        done, skipped = import_subscription("svc", base + "/mixed")
+        self.assertEqual([x[0] for x in done], ["svc"])
+        self.assertTrue(any("заглушки" in x and "Use-Happ" in x for x in skipped), skipped)
+        self.assertEqual([v["host"] for v in list_vpns()], ["real.example"])
+        # провайдер отдаёт настоящее только другому приложению: перебираем
+        seen.clear()
+        done, _ = import_subscription("svc2", base + "/happ-only")
+        self.assertEqual([a for a, _h in seen], ["Happ/2.5.0", "v2rayN/6.42"])
+        self.assertEqual(len({h for _a, h in seen}), 1)                       # заголовок устройства один и тот же
+        self.assertRegex(seen[0][1], r"^[0-9a-f]{32}$")
+        self.assertEqual(len(done), 1)
+        # только заглушки: понятная ошибка, ничего не добавлено
+        before = len(list_vpns())
+        with self.assertRaises(ValueError) as cm:
+            import_subscription("svc3", base + "/never")
+        self.assertIn("Use-Happ", str(cm.exception))
+        self.assertIn("приложении провайдера", str(cm.exception))
+        self.assertEqual(len(list_vpns()), before)
+        text, headers = fetch_subscription_full(base + "/mixed")
+        self.assertEqual(headers["profile-update-interval"], "6")
+
+    def test_folders_are_services_with_traffic_and_refresh(self):
+        from envbox.core.vpn import (delete_folder, import_subscription, list_folders, list_vpns, refresh_folder,
+                                     set_folder, subscription_info)
+        info = subscription_info({"profile-title": "base64:" + ShareLinks.b64("Мой сервис"),
+                                  "subscription-userinfo": "upload=10; download=20; total=1000; expire=1893456000",
+                                  "profile-update-interval": "6", "support-url": "https://t.me/support"})
+        self.assertEqual((info["title"], info["used"], info["total"], info["expire"], info["interval"]),
+                         ("Мой сервис", 30, 1000, 1893456000, 6))
+        done, _ = import_subscription("prov", self.url + "/token")
+        folders = list_folders()
+        self.assertEqual(list(folders), ["prov"])                              # без заголовка название — из адреса
+        self.assertEqual(folders["prov"]["url"], self.url + "/token")
+        self.assertEqual({v["folder"] for v in list_vpns()}, {"prov"})
+        meta_path = os.path.join(self.root, "_vpn", "meta.json")
+        self.assertEqual(os.stat(meta_path).st_mode & 0o777, 0o600)            # в нём адрес с токеном
+        # ручное перемещение и возврат
+        import_many_ = __import__("envbox.core.vpn", fromlist=["import_many"]).import_many
+        import_many_("mine", f"trojan://a@x.example:443")
+        set_folder("mine", "Мои серверы")
+        self.assertEqual(sorted(list_folders()), sorted(["Мои серверы", "prov"]))
+        set_folder("mine", "")
+        self.assertEqual(sorted(list_folders()), ["prov"])                     # пустая папка не висит
+        # у папки без подписки обновлять нечего; у подписочной — обновляется
+        set_folder("mine", "Ручные")
+        with self.assertRaises(ValueError):
+            refresh_folder("Ручные")
+        again, _skipped, gone = refresh_folder("prov")
+        self.assertEqual([n for n, _k, _s in again], ["prov-1", "prov-2"])
+        self.assertEqual(gone, [])
+        self.assertEqual(delete_folder("prov"), 2)
+        self.assertEqual([v["name"] for v in list_vpns()], ["mine"])
+        self.assertEqual(sorted(list_folders()), ["Ручные"])
+
+    def test_search_and_ping(self):
+        import socket as _socket
+        from envbox.core.vpn import import_many, list_vpns, ping_vpns, search_vpns, tcp_ping
+        listener = _socket.socket()
+        listener.bind(("127.0.0.2", 0))
+        listener.listen(5)
+        self.addCleanup(listener.close)
+        port = listener.getsockname()[1]
+        closed = _socket.socket()
+        closed.bind(("127.0.0.2", 0))
+        dead = closed.getsockname()[1]
+        closed.close()
+        import_many("alive", f"trojan://a@127.0.0.2:{port}#Berlin-1", folder="Сервис А")
+        import_many("dead", f"trojan://a@127.0.0.2:{dead}#Paris", folder="Сервис Б")
+        import_many("wg", VpnConfigs.WG, folder="Сервис А")
+        vpns = list_vpns()
+        by = lambda q: sorted(v["name"] for v in search_vpns(vpns, q))      # noqa: E731
+        self.assertEqual(by("berlin"), ["alive"])                           # по названию из ссылки
+        self.assertEqual(by("127.0.0.2"), ["alive", "dead"])                # по адресу сервера
+        self.assertEqual(by(str(dead)), ["dead"])                           # по порту
+        self.assertEqual(by("сервис а"), ["alive", "wg"])                   # по папке, слова в любом месте
+        self.assertEqual(by("сервис а berlin"), ["alive"])                  # все слова сразу
+        self.assertEqual(by("wireguard"), ["wg"])                           # по виду
+        self.assertEqual(by(""), ["alive", "dead", "wg"])
+        self.assertEqual(by("нет такого"), [])
+        self.assertIsNotNone(tcp_ping("127.0.0.2", port))
+        self.assertIsNone(tcp_ping("127.0.0.2", dead, timeout=1))
+        res = ping_vpns(vpns, timeout=1)
+        self.assertIsInstance(res["alive"], int)
+        self.assertIsNone(res["dead"])                                      # не ответил
+        self.assertNotIn("wg", res)                                         # WireGuard — UDP, пингом не измеряется
+
+    def test_folder_summary_and_natural_order(self):
+        from envbox.core.vpn import folder_summary, human_bytes, natural_key
+        self.assertEqual(human_bytes(512), "512 Б")
+        self.assertEqual(human_bytes(5 * 1024 ** 3), "5.0 ГБ")
+        text = folder_summary({"used": 1024 ** 3, "total": 10 * 1024 ** 3, "expire": 1893456000, "support": "t.me/s"})
+        for part in ("1.0 ГБ из 10.0 ГБ", "до 01.01.2030", "поддержка: t.me/s"):
+            self.assertIn(part, text)
+        self.assertEqual(folder_summary({}), "")
+        self.assertEqual(sorted(["vpn-10", "vpn-2", "vpn-1"], key=natural_key), ["vpn-1", "vpn-2", "vpn-10"])
+
     def test_name_is_optional_and_forgiving(self):
         # «имя VPN: латинские буквы…» мешало добавить ссылку: имя пустое, с кириллицей или в него вставили ссылку
         from envbox.core.vpn import (free_name, import_many, is_subscription_url, list_vpns, looks_like_source,
@@ -1342,7 +1471,7 @@ class VpnSubscriptions(unittest.TestCase):
         from envbox.core.vpn import import_many, list_vpns
         done, _ = import_many("one", f"vless://{self.UUID}@a.example:443")
         self.assertEqual([n for n, _k, _s in done], ["one"])                    # одна ссылка: имя как задано
-        done, _ = import_many("many", f"trojan://a@x.example:1\ntrojan://b@y.example:2")
+        done, _ = import_many("many", f"trojan://a@x.example:443\ntrojan://b@y.example:8443")
         self.assertEqual([n for n, _k, _s in done], ["many-1", "many-2"])
         self.assertEqual(len(list_vpns()), 3)
         with self.assertRaises(ValueError) as cm:

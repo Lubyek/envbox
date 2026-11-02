@@ -38,7 +38,7 @@ import time
 
 # ---- version.py: Версия envbox (строка читается регулярным выражением при установке — не менять формат).
 
-ENVBOX_VERSION = "2026.11.02.9"
+ENVBOX_VERSION = "2026.11.02.10"
 
 
 # ---- lazy.py: Ленивые модули стандартной библиотеки: настоящий import происходит при первом обращении к атрибуту.
@@ -1349,6 +1349,58 @@ def link_server(out):
     s = out["settings"]
     node = (s.get("vnext") or s.get("servers"))[0]
     return f"{node['address']}:{node['port']}"
+
+
+# Адреса, которые подписки подставляют вместо серверов, когда приложение им «не подходит»
+STUB_HOSTS = ("0.0.0.0", "127.0.0.1", "::", "::1", "localhost")
+
+
+def is_stub_link(link):
+    """Заглушка провайдера вместо сервера: адрес 0.0.0.0/localhost или порт 0–1 («Используйте Happ»…)."""
+    try:
+        out, _remark = parse_share_link(link)
+        node = (out["settings"].get("vnext") or out["settings"].get("servers"))[0]
+    except (ValueError, KeyError, IndexError, TypeError):
+        return False
+    return str(node["address"]).lower() in STUB_HOSTS or int(node["port"]) <= 1
+
+
+def stub_remark(link):
+    """Что провайдер написал в имени заглушки (например «Приложение не поддерживается»)."""
+    try:
+        return parse_share_link(link)[1]
+    except ValueError:
+        return ""
+
+
+def json_server(cfg):
+    """(хост, порт) первого исходящего подключения конфигурации Xray или sing-box; ('', 0), если не нашли."""
+    for o in cfg.get("outbounds") or []:
+        if not isinstance(o, dict):
+            continue
+        s = o.get("settings") or {}
+        node = ((s.get("vnext") or s.get("servers") or [None])[0]) or {}
+        host, port = node.get("address") or o.get("server"), node.get("port") or o.get("server_port")
+        if host and port:
+            try:
+                return str(host), int(port)
+            except (TypeError, ValueError):
+                continue
+    return "", 0
+
+
+def vpn_info(kind, text):
+    """Сведения для списка: {title, host, port, udp}. ValueError при плохой конфигурации (как vpn_validate)."""
+    if kind == "wireguard":
+        host, _, port = wg_validate(text).rpartition(":")
+        return {"title": "", "host": host.strip("[]"), "port": int(port) if port.isdigit() else 0, "udp": True}
+    if share_scheme(text):
+        out, remark = parse_share_link(text)
+        node = (out["settings"].get("vnext") or out["settings"].get("servers"))[0]
+        return {"title": remark, "host": str(node["address"]), "port": int(node["port"]), "udp": False}
+    vpn_validate(kind, text)
+    host, port = json_server(json.loads(text))
+    return {"title": "", "host": host, "port": port, "udp": False}
 
 
 def split_links(text):
@@ -5778,6 +5830,17 @@ SUB_MAX_BYTES = 2 * 1024 * 1024
 SUB_MAX_LINKS = 40
 
 
+# Под какими приложениями пробуем скачать подписку: многие провайдеры отдают настоящие серверы только «своему»
+# клиенту (Happ), остальным — заглушки «Приложение не поддерживается». Берётся первый ответ с настоящими серверами.
+SUB_AGENTS = ("Happ/2.5.0", "v2rayN/6.42", "sing-box/1.9.0")
+
+
+META_FILE = "meta.json"
+
+
+HWID_FILE = ".hwid"
+
+
 def vpn_dir():
     return os.path.join(envbox_root(), VPN_DIR)
 
@@ -5861,28 +5924,153 @@ def is_subscription_url(text):
     return bool(re.match(r"^https?://\S+$", t))
 
 
+def clean_folder(name):
+    """Название папки (сервиса) для показа: без управляющих знаков, до 40 знаков; пусто — «без папки»."""
+    return "".join(c for c in (name or "") if c.isprintable()).strip()[:40]
+
+
+def load_meta():
+    """Папки и принадлежность VPN к ним: {"folders": {папка: сведения подписки}, "vpns": {имя: {"folder": …}}}."""
+    try:
+        with open(os.path.join(vpn_dir(), META_FILE), encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        d = {}
+    if not isinstance(d, dict):
+        d = {}
+    d.setdefault("folders", {})
+    d.setdefault("vpns", {})
+    return d
+
+
+def save_meta(meta):
+    """В метаданных адрес подписки с токеном, поэтому права только владельцу."""
+    os.makedirs(vpn_dir(), mode=0o700, exist_ok=True)
+    path = os.path.join(vpn_dir(), META_FILE)
+    fd = os.open(path + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=1)
+    os.replace(path + ".new", path)
+
+
+def set_folder(name, folder):
+    """Положить VPN в папку (пустое название — вынуть из папки)."""
+    meta = load_meta()
+    folder = clean_folder(folder)
+    if folder:
+        meta["vpns"].setdefault(name, {})["folder"] = folder
+        meta["folders"].setdefault(folder, {})
+    else:
+        meta["vpns"].pop(name, None)
+    save_meta(meta)
+
+
+def human_bytes(n):
+    n = float(n)
+    for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
+        if n < 1024 or unit == "ТБ":
+            return f"{n:.0f} {unit}" if unit == "Б" else f"{n:.1f} {unit}"
+        n /= 1024
+    return ""
+
+
+def folder_summary(info):
+    """Строка про подписку папки: трафик, срок, когда обновлялась, поддержка."""
+    parts = []
+    if info.get("total"):
+        parts.append(f"трафик: {human_bytes(info.get('used', 0))} из {human_bytes(info['total'])}")
+    elif info.get("used"):
+        parts.append(f"трафик: {human_bytes(info['used'])}")
+    if info.get("expire"):
+        parts.append("действует до " + time.strftime("%d.%m.%Y", time.localtime(info["expire"])))
+    if info.get("updated"):
+        parts.append("обновлено " + time.strftime("%d.%m %H:%M", time.localtime(info["updated"])))
+    if info.get("support"):
+        parts.append("поддержка: " + info["support"])
+    return " · ".join(parts)
+
+
+def natural_key(name):
+    """Ключ сортировки, при котором vpn-2 идёт раньше vpn-10."""
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name.lower())]
+
+
+def list_folders():
+    """Папки (сервисы): {название: сведения подписки}; пустые папки без серверов не показываются."""
+    meta = load_meta()
+    used = {m.get("folder") for m in meta["vpns"].values()}
+    return {f: info for f, info in sorted(meta["folders"].items()) if f in used}
+
+
+def delete_folder(folder):
+    """Удалить папку вместе со всеми её VPN. Возвращает, сколько VPN удалено."""
+    meta = load_meta()
+    names = [n for n, m in meta["vpns"].items() if m.get("folder") == folder]
+    for n in names:
+        delete_vpn(n)
+    meta = load_meta()
+    meta["folders"].pop(folder, None)
+    save_meta(meta)
+    return len(names)
+
+
+def search_vpns(vpns, query):
+    """Поиск по названию, серверу (адрес и порт), папке и виду; все слова запроса должны встретиться."""
+    tokens = (query or "").lower().split()
+    if not tokens:
+        return list(vpns)
+
+    def hay(v):
+        return " ".join([v["name"], v.get("title", ""), v.get("host", ""), str(v.get("port") or ""),
+                         v.get("folder", ""), v.get("label", ""), v["kind"]]).lower()
+    return [v for v in vpns if all(t in hay(v) for t in tokens)]
+
+
+def tcp_ping(host, port, timeout=3.0):
+    """Время подключения к серверу в мс (TCP) или None, если не ответил. С вашего компьютера напрямую."""
+    import socket
+    t0 = time.monotonic()
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return max(1, int((time.monotonic() - t0) * 1000))
+    except OSError:
+        return None
+
+
+def ping_vpns(vpns, timeout=3.0, workers=16):
+    """Пинг серверов: {имя: мс или None}. WireGuard (UDP) и конфигурации без адреса сервера не измеряются."""
+    from concurrent.futures import ThreadPoolExecutor
+    todo = [v for v in vpns if v.get("host") and v.get("port") and not v.get("udp")]
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(todo) or 1))) as pool:
+        times = list(pool.map(lambda v: tcp_ping(v["host"], v["port"], timeout), todo))
+    return {v["name"]: ms for v, ms in zip(todo, times)}
+
+
 def list_vpns():
-    """Сохранённые VPN: [{name, kind, label, path, server, error, binary}] по имени."""
+    """Сохранённые VPN: [{name, kind, label, path, server, error, binary, folder, title, host, port, udp}] по имени."""
     out = []
     try:
         names = sorted(os.listdir(vpn_dir()))
     except OSError:
         return out
     by_ext = {ext: kind for kind, ext in VPN_EXT.items()}
+    folders = {n: m.get("folder", "") for n, m in load_meta()["vpns"].items()}
     for fname in names:
         stem, ext = os.path.splitext(fname)
         kind = by_ext.get(ext)
         path = os.path.join(vpn_dir(), fname)
         if kind is None or not NAME_RE.match(stem) or not os.path.isfile(path) or os.path.islink(path):
             continue
-        server, error = "", ""
+        server, error, info = "", "", {"title": "", "host": "", "port": 0, "udp": False}
         try:
             with open(path, encoding="utf-8") as f:
-                server = vpn_validate(kind, f.read(VPN_MAX_BYTES + 1))
+                text = f.read(VPN_MAX_BYTES + 1)
+            server = vpn_validate(kind, text)
+            info = vpn_info(kind, text)
         except (OSError, ValueError) as e:
             error = str(e)
         out.append({"name": stem, "kind": kind, "label": VPN_LABELS[kind], "path": path, "server": server,
-                    "error": error, "binary": find_binary(kind) or ""})
+                    "error": error, "binary": find_binary(kind) or "", "folder": folders.get(stem, ""), **info})
     return out
 
 
@@ -5894,7 +6082,7 @@ def vpn_source(name):
     raise ValueError(f"VPN «{name}» не найден: добавьте его на вкладке «VPN»")
 
 
-def import_vpn(name, text, replace=False):
+def import_vpn(name, text, replace=False, folder=None):
     """Проверить и сохранить конфигурацию. Возвращает (имя, вид, описание сервера). ValueError — понятный текст."""
     name = (name or "").strip()
     if not NAME_RE.match(name):
@@ -5917,6 +6105,8 @@ def import_vpn(name, text, replace=False):
     for v in existing:
         if v["path"] != path:
             os.unlink(v["path"])    # заменили конфигурацию другого вида под тем же именем
+    if folder is not None:
+        set_folder(name, folder)
     return name, kind, server
 
 
@@ -5924,6 +6114,9 @@ def delete_vpn(name):
     for v in list_vpns():
         if v["name"] == name:
             os.unlink(v["path"])
+            meta = load_meta()
+            if meta["vpns"].pop(name, None) is not None:
+                save_meta(meta)
             return True
     return False
 
@@ -5996,12 +6189,39 @@ def open_via_proxy(proxy, auth, host, port, timeout):
     return sock
 
 
-def fetch_subscription(url, timeout=20, proxy="", auth=""):
+def device_headers():
+    """Заголовки устройства, как у приложений-клиентов (Happ и др.): провайдеры с лимитом устройств (HWID) считают по
+    ним. Идентификатор случайный, создаётся один раз и хранится рядом с VPN; настоящих данных о компьютере нет."""
+    import platform
+    import uuid
+    path = os.path.join(vpn_dir(), HWID_FILE)
+    try:
+        with open(path, encoding="utf-8") as f:
+            hwid = f.read().strip()
+    except OSError:
+        hwid = ""
+    if not re.match(r"^[0-9a-f]{16,64}$", hwid):
+        hwid = uuid.uuid4().hex
+        os.makedirs(vpn_dir(), mode=0o700, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(hwid + "\n")
+    return {"x-hwid": hwid, "x-device-os": "Linux", "x-ver-os": platform.release()[:40] or "linux",
+            "x-device-model": "envbox"}
+
+
+def fetch_subscription(url, timeout=20, proxy="", auth="", agent=SUB_AGENTS[0]):
+    """Текст подписки (см. fetch_subscription_full)."""
+    return fetch_subscription_full(url, timeout, proxy, auth, agent)[0]
+
+
+def fetch_subscription_full(url, timeout=20, proxy="", auth="", agent=SUB_AGENTS[0]):
     """Скачать подписку по ссылке: напрямую с вашего компьютера (сервер подписки увидит ваш настоящий адрес) или
     через прокси `proxy` (тогда имя сайта разрешает он: помогает, когда сайт блокируется или не находится по DNS).
 
-    Многие панели отдают разные форматы разным программам, поэтому представляемся клиентом v2rayN: он получает
-    список ссылок. ValueError с понятным текстом при любой неудаче."""
+    Многие панели отдают разные форматы и разные наборы серверов разным программам, поэтому представляемся клиентом
+    `agent` и отправляем заголовки устройства. Возвращает (текст, заголовки ответа в нижнем регистре).
+    ValueError с понятным текстом при любой неудаче."""
     import http.client
     import socket
     import ssl
@@ -6024,8 +6244,8 @@ def fetch_subscription(url, timeout=20, proxy="", auth=""):
             if proxy:
                 raw = open_via_proxy(proxy, auth, host, port, timeout)
                 conn.sock = ssl.create_default_context().wrap_socket(raw, server_hostname=host) if https else raw
-            conn.request("GET", path, headers={"User-Agent": "v2rayN/6.42", "Accept": "*/*",
-                                               "Accept-Encoding": "identity", "Connection": "close"})
+            conn.request("GET", path, headers={"User-Agent": agent, "Accept": "*/*", "Accept-Encoding": "identity",
+                                               "Connection": "close", **device_headers()})
             r = conn.getresponse()
             if r.status in (301, 302, 303, 307, 308) and r.getheader("Location"):
                 url = urllib.parse.urljoin(url, r.getheader("Location"))
@@ -6033,6 +6253,7 @@ def fetch_subscription(url, timeout=20, proxy="", auth=""):
             if r.status >= 400:
                 raise ValueError(f"сервер подписки ответил: HTTP {r.status}")
             data = r.read(SUB_MAX_BYTES + 1)
+            headers = {k.lower(): v for k, v in r.getheaders()}
         except socket.gaierror:
             raise ValueError(f"не удалось найти сайт «{host}»: DNS вашего компьютера не отвечает или сайт "
                              "заблокирован. Выберите «Через прокси среды…» в окне добавления") from None
@@ -6042,16 +6263,46 @@ def fetch_subscription(url, timeout=20, proxy="", auth=""):
             conn.close()
         if len(data) > SUB_MAX_BYTES:
             raise ValueError("ответ сервера слишком большой (больше 2 МБ): это не подписка")
-        return data.decode("utf-8", "replace")
+        return data.decode("utf-8", "replace"), headers
     raise ValueError("слишком много перенаправлений")
 
 
-def import_many(base, text, replace=False):
+def header_text(value):
+    """Значение заголовка подписки: бывает `base64:…` или в процентной записи."""
+    import base64
+    import urllib.parse
+    v = (value or "").strip()
+    if v.lower().startswith("base64:"):
+        try:
+            return base64.b64decode(v[7:] + "=" * (-len(v[7:]) % 4)).decode("utf-8", "replace").strip()
+        except ValueError:
+            return ""
+    return urllib.parse.unquote(v)
+
+
+def subscription_info(headers):
+    """Сведения о подписке из заголовков: {title, used, total, expire, interval, support}; нужные есть не всегда."""
+    info = {"title": clean_folder(header_text(headers.get("profile-title", ""))),
+            "support": header_text(headers.get("support-url", ""))[:200]}
+    for part in (headers.get("subscription-userinfo") or "").split(";"):
+        key, _, val = part.strip().partition("=")
+        if key in ("upload", "download", "total", "expire") and val.strip().isdigit():
+            info[key] = int(val)
+    if "upload" in info or "download" in info:
+        info["used"] = info.pop("upload", 0) + info.pop("download", 0)
+    interval = (headers.get("profile-update-interval") or "").strip()
+    if interval.isdigit():
+        info["interval"] = int(interval)
+    return info
+
+
+def import_many(base, text, replace=False, folder=None):
     """Добавить VPN из текста: одна конфигурация, ссылка или подписка (список ссылок, в том числе в base64).
 
     Возвращает ([(имя, вид, описание)], [причины пропуска]). Из подписки каждый сервер сохраняется отдельным VPN
-    с именем <основа>-1, <основа>-2…; повторный импорт заменяет одноимённые. Ссылки других видов
-    (hysteria2, tuic…) пропускаются с пояснением."""
+    с именем <основа>-1, <основа>-2…; повторный импорт заменяет одноимённые. Заглушки провайдера (адрес 0.0.0.0,
+    «Используйте Happ») и ссылки других видов (hysteria2, tuic…) пропускаются с пояснением. `folder` — в какую
+    папку (сервис) положить (None — не менять)."""
     base = normalize_name(base, "")
     if not base:
         base = free_name("vpn")     # имя не задано или целиком из недопустимых знаков: не затираем то, что уже есть
@@ -6060,13 +6311,20 @@ def import_many(base, text, replace=False):
         if other:
             raise ValueError("в подписке только неподдерживаемые ссылки: " + ", ".join(sorted(set(other)))
                              + ". Поддерживаются vless, vmess, trojan, ss, WireGuard и JSON Xray / sing-box")
-        return [import_vpn(base, text, replace=replace)], []
+        return [import_vpn(base, text, replace=replace, folder=folder)], []
+    stubs = [stub_remark(x) or x[:30] for x in links if is_stub_link(x)]
+    links = [x for x in links if not is_stub_link(x)]
     done, skipped = [], []
+    if stubs:
+        skipped.append("заглушки провайдера пропущены: " + ", ".join("«" + t + "»" for t in dict.fromkeys(stubs)))
+    if not links:
+        raise ValueError("провайдер вернул вместо серверов только заглушки (" + ", ".join(dict.fromkeys(stubs))
+                         + "): подписка привязана к приложению провайдера или лимиту устройств")
     base = base[:40]
     for i, link in enumerate(links[:SUB_MAX_LINKS], 1):
         name = base if len(links) == 1 else f"{base}-{i}"
         try:
-            done.append(import_vpn(name, link, replace=replace or len(links) > 1))
+            done.append(import_vpn(name, link, replace=replace or len(links) > 1, folder=folder))
         except ValueError as e:
             skipped.append(f"сервер {i}: {e}")
     if len(links) > SUB_MAX_LINKS:
@@ -6078,10 +6336,53 @@ def import_many(base, text, replace=False):
     return done, skipped
 
 
-def import_subscription(base, url, proxy="", auth=""):
-    """Скачать подписку (напрямую или через прокси) и добавить серверы из неё (см. import_many)."""
+def import_subscription(base, url, proxy="", auth="", via="", folder=None):
+    """Скачать подписку (напрямую или через прокси) и добавить серверы в папку-сервис (см. import_many).
+
+    Пробуем приложения из SUB_AGENTS по очереди и берём первый ответ с настоящими серверами. Папка — название из
+    заголовка подписки (profile-title) или имя сайта; рядом запоминаются адрес подписки (для «Обновить»), трафик,
+    срок и ссылка на поддержку. `via` — среда, через чей прокси скачивали (чтобы обновлять так же)."""
     url = (url or "").strip().strip("\"'<>")
-    return import_many(base or base_name_from_url(url), fetch_subscription(url, proxy=proxy, auth=auth), replace=True)
+    stubs, text, headers = [], "", {}
+    for agent in SUB_AGENTS:
+        text, headers = fetch_subscription_full(url, proxy=proxy, auth=auth, agent=agent)
+        links, _other = split_links(text)
+        real = [x for x in links if not is_stub_link(x)]
+        stubs += [stub_remark(x) for x in links if is_stub_link(x)]
+        if real or not links:        # настоящие серверы или не список ссылок (JSON, WireGuard): дальше не перебираем
+            break
+    info = subscription_info(headers)
+    base = base or base_name_from_url(url)
+    folder = clean_folder(folder if folder is not None else (info["title"] or base))
+    try:
+        done, skipped = import_many(base, text, replace=True, folder=folder)
+    except ValueError as e:
+        if stubs:
+            raise ValueError(f"{e}. Пробовал как {', '.join(SUB_AGENTS)}; откройте подписку в приложении провайдера "
+                             "или попросите у поддержки ссылку для других клиентов") from None
+        raise
+    meta = load_meta()
+    meta["folders"][folder] = {**info, "url": url, "via": via, "base": base, "updated": int(time.time()),
+                               "count": len(done)}
+    meta["folders"][folder].pop("title", None)
+    save_meta(meta)
+    return done, skipped
+
+
+def refresh_folder(folder, proxy="", auth=""):
+    """Обновить папку по сохранённой подписке: новые серверы добавляются, пропавшие у провайдера удаляются.
+    Возвращает (импортировано, пропущено, удалено)."""
+    meta = load_meta()
+    sub = meta["folders"].get(folder) or {}
+    if not sub.get("url"):
+        raise ValueError(f"у папки «{folder}» нет подписки: серверы добавлены вручную")
+    before = {n for n, m in meta["vpns"].items() if m.get("folder") == folder}
+    done, skipped = import_subscription(sub.get("base") or "", sub["url"], proxy=proxy, auth=auth,
+                                        via=sub.get("via", ""), folder=folder)
+    gone = sorted(before - {n for n, _k, _s in done})
+    for n in gone:
+        delete_vpn(n)
+    return done, skipped, gone
 
 
 # ---- core/profile.py: Профиль среды (dataclass Profile) и его проверка.
@@ -10704,9 +11005,12 @@ def _build_gui():
             """Список VPN в выпадающих списках (после загрузки или удаления VPN и при показе профиля)."""
             if not hasattr(self, "dd_vpns"):
                 return
-            names = [v["name"] for v in list_vpns()]
+            vpns = list_vpns()
+            names = [v["name"] for v in vpns]
             self.exit_vpns = names
-            model = ["—"] + names
+            # подпись: имя, затем название из ссылки или сервер (по подписи видно, что это за сервер); выбор — по номеру
+            model = ["—"] + [f"{v['name']} · {(v['title'] or v['host'])[:28]}" if (v["title"] or v["host"]) else v["name"]
+                             for v in vpns]
             was, self.exit_sync = getattr(self, "exit_sync", False), True   # смена модели не должна переписывать порядок
             try:
                 self.dd_vpns.set_model(Gtk.StringList.new(model))
@@ -10781,8 +11085,8 @@ def _build_gui():
             set_text(self.tv_chain, "\n".join(lines))
 
         def on_chain_add_vpn(self, *_):
-            chosen = self.dd_vpns.get_selected_item()
-            name = chosen.get_string() if chosen is not None else "—"
+            i = self.dd_vpns.get_selected()
+            name = self.exit_vpns[i - 1] if 0 < i <= len(self.exit_vpns) else "—"
             if name == "—":
                 alert(self, "Нет VPN", "Сначала загрузите VPN на вкладке «VPN», затем выберите его в списке.")
                 return
@@ -11970,73 +12274,217 @@ def _build_gui():
             GLib.timeout_add(900, self.refresh_sessions_once)
 
 
-    # ---- gui/pages/vpn.py: Вкладка «VPN»: загрузка конфигураций (WireGuard, VLESS/Xray, sing-box), проверка и удаление.
+    # ---- gui/pages/vpn.py: Вкладка «VPN»: серверы по папкам (сервисам), поиск, пинг, загрузка, проверка и удаление.
 
     class VpnPageMixin:
-        """VPN-конфигурации общие для всех сред; в настройках среды они ставятся в «Порядок выхода»."""
+        """VPN-конфигурации общие для всех сред; в настройках среды они ставятся в «Выход в интернет»."""
 
         def build_vpn_page(self):
+            self.vpn_query = ""
+            self.vpn_ping = {}          # имя -> миллисекунды или None (не ответил); у не измеренных нет записи
+            self.vpn_open = {}          # папка -> раскрыта ли
+            self.vpn_by_ping = False
             box = margins(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10), 16)
             title = Gtk.Label(label="VPN", xalign=0)
             title.add_css_class("eb-h2")
             box.append(title)
             box.append(hint("Загрузите конфигурацию WireGuard (.conf), ссылку на сервер (vless://, vmess://, trojan://, ss://), "
-                            "ссылку-подписку от провайдера (https://…: из неё добавятся все серверы) или JSON для Xray / "
-                            "sing-box. "
-                            "envbox сам запускает VPN-клиент вместе со средой и останавливает его вместе с ней, без root: "
-                            "клиент слушает только 127.0.0.1 с одноразовым паролем, а среда по-прежнему выходит только "
-                            "через прокси envbox. Нужна программа клиента: wireproxy для WireGuard, xray или sing-box "
-                            "для остальных. Затем добавьте VPN в «Порядок выхода» на вкладке «Настройки» среды. "
+                            "ссылку-подписку от провайдера (https://…: серверы сложатся в папку-сервис) или JSON для Xray / "
+                            "sing-box. envbox сам запускает VPN-клиент вместе со средой и останавливает вместе с ней, без "
+                            "root: клиент слушает только 127.0.0.1 с одноразовым паролем, а среда по-прежнему выходит "
+                            "только через прокси envbox. Нужна программа клиента: wireproxy для WireGuard, xray или "
+                            "sing-box для остальных. Затем выберите VPN в «Выход в интернет» на вкладке «Настройки» среды. "
                             "Если VPN уже запущен на самом компьютере, используйте в порядке выхода «direct»."))
             bar = Gtk.Box(spacing=8)
-            for label, handler in (("Загрузить из файла…", self.on_vpn_file), ("Вставить ссылку или текст…", self.on_vpn_paste),
-                                   ("Обновить список", lambda *_: self.refresh_vpn_list())):
+            for label, handler in (("Загрузить из файла…", self.on_vpn_file), ("Вставить ссылку или текст…", self.on_vpn_paste)):
                 bt = Gtk.Button(label=label)
                 bt.connect("clicked", handler)
                 bar.append(bt)
             box.append(bar)
+            search = Gtk.Box(spacing=8)
+            self.vpn_search = Gtk.SearchEntry(hexpand=True, placeholder_text="Поиск: название, сервер, адрес, порт, папка")
+            self.vpn_search.connect("search-changed", self.on_vpn_search)
+            search.append(self.vpn_search)
+            ping_all = Gtk.Button(label="Измерить пинг")
+            ping_all.connect("clicked", lambda *_: self.on_vpn_ping(None))
+            search.append(ping_all)
+            by_ping = Gtk.CheckButton(label="Сначала быстрые")
+            by_ping.connect("toggled", self.on_vpn_sort)
+            search.append(by_ping)
+            box.append(search)
             self.vpn_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
             scroll = Gtk.ScrolledWindow(vexpand=True)
             scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
             scroll.set_child(self.vpn_list)
             box.append(scroll)
-            box.append(hint("Конфигурации лежат в каталоге данных envbox (папка _vpn, права только владельцу): в них "
-                            "приватные ключи. Сценарии wg-quick (PostUp и подобные) и лишние туннели wireproxy при "
-                            "запуске вырезаются."))
+            box.append(hint("Пинг — время TCP-подключения к серверу с вашего компьютера; у WireGuard (UDP) он не измеряется. "
+                            "Конфигурации лежат в каталоге данных envbox (папка _vpn, права только владельцу): в них "
+                            "приватные ключи и адреса подписок. Сценарии wg-quick (PostUp и подобные) и лишние туннели "
+                            "wireproxy при запуске вырезаются."))
             self.refresh_vpn_list()
             return box
 
+        # ---- список: папки, поиск, пинг
+
+        def on_vpn_search(self, entry):
+            self.vpn_query = entry.get_text().strip()
+            self.refresh_vpn_list()
+
+        def on_vpn_sort(self, button):
+            self.vpn_by_ping = button.get_active()
+            self.refresh_vpn_list()
+
+        def vpn_ping_text(self, v):
+            if v["udp"]:
+                return "UDP"
+            if v["name"] not in self.vpn_ping:
+                return "—"
+            ms = self.vpn_ping[v["name"]]
+            return f"{ms} мс" if ms is not None else "нет ответа"
+
+        def vpn_sort_key(self, v):
+            if self.vpn_by_ping:
+                ms = self.vpn_ping.get(v["name"])
+                return (ms is None, ms or 0, natural_key(v["name"]))
+            return natural_key(v["name"])
+
         def refresh_vpn_list(self):
             clear_children(self.vpn_list)
-            vpns = list_vpns()
-            if not vpns:
+            everything = list_vpns()
+            shown = search_vpns(everything, self.vpn_query)
+            if not everything:
                 self.vpn_list.append(hint("Пока нет ни одного VPN."))
-            for v in vpns:
-                row = Gtk.Box(spacing=8)
-                text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
-                name = Gtk.Label(label=v["name"], xalign=0)
-                name.add_css_class("eb-h2")
-                text.append(name)
-                if v["error"]:
-                    info = f"{v['label']}: конфигурация не читается: {v['error']}"
-                else:
-                    info = f"{v['label']} · {v['server']}"
-                    problem = vpn_binary_problem(v["kind"])
-                    if problem:
-                        info += f"\n⚠ {problem}"
-                text.append(hint(info))
-                row.append(text)
-                check = Gtk.Button(label="Проверить")
-                check.connect("clicked", lambda _b, n=v["name"]: self.on_vpn_test(n))
-                row.append(check)
-                drop = Gtk.Button(label="Удалить")
-                drop.connect("clicked", lambda _b, n=v["name"]: self.on_vpn_delete(n))
-                row.append(drop)
-                card = margins(row, 8)
-                card.add_css_class("frame")
-                self.vpn_list.append(card)
+            elif not shown:
+                self.vpn_list.append(hint(f"По запросу «{self.vpn_query}» ничего не найдено."))
+            groups = {}
+            for v in shown:
+                groups.setdefault(v["folder"], []).append(v)
+            folders = list_folders()
+            for folder in sorted(f for f in groups if f) + ([""] if "" in groups else []):
+                self.vpn_list.append(self.vpn_folder(folder, sorted(groups[folder], key=self.vpn_sort_key),
+                                                     folders.get(folder, {}),
+                                                     sum(1 for v in everything if v["folder"] == folder)))
             if hasattr(self, "refresh_vpn_choices"):
                 self.refresh_vpn_choices()
+
+        def vpn_folder(self, folder, items, info, total):
+            exp = Gtk.Expander()
+            exp.set_expanded(self.vpn_open.get(folder, True) or bool(self.vpn_query))
+            exp.connect("notify::expanded", lambda e, _p, f=folder: self.vpn_open.__setitem__(f, e.get_expanded()))
+            head = Gtk.Box(spacing=8, hexpand=True)
+            text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+            count = f"{len(items)} из {total}" if len(items) != total else str(total)
+            name = Gtk.Label(label=f"{folder or 'Без папки'} · {count}", xalign=0)
+            name.add_css_class("eb-h2")
+            text.append(name)
+            summary = folder_summary(info)
+            if summary:
+                text.append(hint(summary))
+            head.append(text)
+            names = [v["name"] for v in items]
+            ping = Gtk.Button(label="Пинг")
+            ping.connect("clicked", lambda _b, n=names: self.on_vpn_ping(n))
+            head.append(ping)
+            if info.get("url"):
+                upd = Gtk.Button(label="Обновить")
+                upd.connect("clicked", lambda _b, f=folder: self.on_vpn_folder_update(f))
+                head.append(upd)
+            if folder:
+                drop = Gtk.Button(label="Удалить папку")
+                drop.connect("clicked", lambda _b, f=folder, n=total: self.on_vpn_folder_delete(f, n))
+                head.append(drop)
+            exp.set_label_widget(head)
+            rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            for v in items:
+                rows.append(self.vpn_row(v))
+            exp.set_child(margins(rows, 6))
+            return exp
+
+        def vpn_row(self, v):
+            row = Gtk.Box(spacing=8)
+            text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+            name = Gtk.Label(label=v["title"] or v["name"], xalign=0)
+            name.add_css_class("eb-h2")
+            text.append(name)
+            if v["error"]:
+                info = f"{v['name']} · конфигурация не читается: {v['error']}"
+            else:
+                where = f" · {v['host']}:{v['port']}" if v["host"] else ""
+                info = f"{v['name']} · {v['label']}{where}"
+                problem = vpn_binary_problem(v["kind"])
+                if problem:
+                    info += f"\n⚠ {problem}"
+            text.append(hint(info))
+            row.append(text)
+            ping = Gtk.Label(label=self.vpn_ping_text(v), width_chars=10)
+            ping.add_css_class("dim-label")
+            row.append(ping)
+            for label, handler in (("Проверить", lambda _b, n=v["name"]: self.on_vpn_test(n)),
+                                   ("В папку…", lambda _b, n=v["name"], f=v["folder"]: self.on_vpn_move(n, f)),
+                                   ("Удалить", lambda _b, n=v["name"]: self.on_vpn_delete(n))):
+                bt = Gtk.Button(label=label)
+                bt.connect("clicked", handler)
+                row.append(bt)
+            card = margins(row, 8)
+            card.add_css_class("frame")
+            return card
+
+        def on_vpn_ping(self, names):
+            """Измерить пинг: names — какие VPN (None — все, подходящие под поиск)."""
+            vpns = list_vpns()
+            vpns = search_vpns(vpns, self.vpn_query) if names is None else [v for v in vpns if v["name"] in names]
+            self.status(f"Измеряю пинг: серверов {len(vpns)}…")
+
+            def done(res):
+                if isinstance(res, Exception):
+                    alert(self, "Не удалось измерить пинг", str(res))
+                    return
+                self.vpn_ping.update(res)
+                ok = sum(1 for ms in res.values() if ms is not None)
+                self.status(f"Пинг измерен: ответили {ok} из {len(res)}")
+                self.refresh_vpn_list()
+
+            self.run_async(lambda: ping_vpns(vpns), done)
+
+        def on_vpn_move(self, name, folder):
+            def got(value):
+                set_folder(name, value)
+                self.refresh_vpn_list()
+                self.status(f"VPN «{name}»: папка «{value.strip()}»" if value.strip() else f"VPN «{name}» вынут из папки")
+
+            prompt(self, "Папка", "Название папки (сервиса). Пусто — вынуть из папки.", got, initial=folder)
+
+        def on_vpn_folder_update(self, folder):
+            self.status(f"Обновляю подписку «{folder}»…")
+
+            def work():
+                via = (list_folders().get(folder) or {}).get("via", "")
+                proxy, auth = self.env_proxy(via) if via else ("", "")
+                return refresh_folder(folder, proxy=proxy, auth=auth)
+
+            def done(res):
+                if isinstance(res, Exception):
+                    alert(self, "Не удалось обновить подписку", str(res))
+                    return
+                imported, skipped, gone = res
+                self.refresh_vpn_list()
+                self.status(f"Подписка «{folder}» обновлена: серверов {len(imported)}"
+                            + (f", убрано пропавших: {len(gone)}" if gone else ""))
+                if skipped:
+                    alert(self, "Часть серверов пропущена", "\n".join(skipped[:10]))
+
+            self.run_async(work, done)
+
+        def on_vpn_folder_delete(self, folder, total):
+            def go(idx):
+                if idx == 1:
+                    delete_folder(folder)
+                    self.refresh_vpn_list()
+                    self.status(f"Папка «{folder}» удалена вместе с серверами ({total})")
+
+            choose(self, f"Удалить папку «{folder}»?",
+                   f"Будут удалены все серверы в ней ({total}) вместе с ключами. Среды, где они выбраны в «Выход в интернет», "
+                   "не запустятся, пока вы не выберете другой выход.", ["Отмена", "Удалить"], go)
 
         # ---- добавление
 
@@ -12066,11 +12514,13 @@ def _build_gui():
             box = margins(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10), 16)
             box.append(hint("Вставьте ссылку на сервер (vless://, vmess://, trojan://, ss://), список таких ссылок, "
                             "конфигурацию WireGuard, JSON Xray / sing-box или ссылку-подписку https://… Вид определяется "
-                            "сам. Подписка скачивается с вашего компьютера напрямую: её сервер увидит ваш настоящий "
-                            "адрес. Каждый сервер подписки сохраняется отдельным VPN (имя-1, имя-2…); Clash-подписки "
-                            "в формате YAML не поддерживаются."))
+                            "сам. Подписка скачивается как приложение-клиент (Happ, v2rayN…) с заголовком устройства; "
+                            "серверы сложатся в папку с названием сервиса, а настоящих серверов вместо заглушек "
+                            "(«Используйте Happ») мы не добавляем. Clash-подписки в формате YAML не поддерживаются."))
             name = Gtk.Entry(hexpand=True, placeholder_text="имя, например vpn1 (для подписки можно не указывать)")
             box.append(name)
+            folder = Gtk.Entry(hexpand=True, placeholder_text="папка (сервис), необязательно")
+            box.append(folder)
             view, sw = text_area(height=160)
             box.append(sw)
             envs = self.proxy_envs()
@@ -12087,10 +12537,10 @@ def _build_gui():
             box.append(buttons)
 
             def go(*_a):
-                text, n = get_text(view), name.get_text().strip()
+                text, n, fld = get_text(view), name.get_text().strip(), folder.get_text().strip()
                 idx = via.get_selected() if envs else 0
                 win.destroy()
-                self.add_vpn(n, text, via=envs[idx - 1] if idx > 0 else None)
+                self.add_vpn(n, text, via=envs[idx - 1] if idx > 0 else None, folder=fld)
 
             cancel.connect("clicked", lambda *_a: win.destroy())
             ok.connect("clicked", go)
@@ -12098,19 +12548,19 @@ def _build_gui():
             win.present()
             name.grab_focus()
 
-        def add_vpn(self, name, text, replace=False, via=None):
+        def add_vpn(self, name, text, replace=False, via=None, folder=""):
             text = (text or "").strip()
             if not text and looks_like_source(name):
                 name, text = "", name.strip()      # ссылку вставили в поле имени: это не имя, а источник
             if is_subscription_url(text):          # ссылка-подписка: серверы скачиваются, а не вставлены
-                self.add_subscription((name or "").strip(), text, via)
+                self.add_subscription((name or "").strip(), text, via, folder)
                 return
             try:
-                imported, skipped = import_many(name, text, replace=replace)
+                imported, skipped = import_many(name, text, replace=replace, folder=folder or None)
             except ValueError as e:
                 if "уже есть" in str(e) and not replace:
                     choose(self, f"VPN «{name}» уже есть", "Заменить его новой конфигурацией?", ["Отмена", "Заменить"],
-                           lambda idx: self.add_vpn(name, text, True, via) if idx == 1 else None)
+                           lambda idx: self.add_vpn(name, text, True, via, folder) if idx == 1 else None)
                     return
                 alert(self, "Не удалось добавить VPN", str(e))
                 return
@@ -12139,12 +12589,12 @@ def _build_gui():
                     auth = ""
             return url, auth
 
-        def add_subscription(self, name, url, via=None):
+        def add_subscription(self, name, url, via=None, folder=""):
             self.status("Скачиваю подписку" + (f" через прокси среды «{via}»" if via else "") + "…")
 
             def work():
                 proxy, auth = self.env_proxy(via) if via else ("", "")
-                return import_subscription(name, url, proxy=proxy, auth=auth)
+                return import_subscription(name, url, proxy=proxy, auth=auth, via=via or "", folder=folder or None)
 
             def done(res):
                 if isinstance(res, Exception):
@@ -12157,7 +12607,7 @@ def _build_gui():
         def vpn_imported(self, imported, skipped):
             self.refresh_vpn_list()
             names = ", ".join(n for n, _k, _s in imported[:6]) + (" …" if len(imported) > 6 else "")
-            self.status(f"Добавлено VPN: {len(imported)} ({names}). Добавьте нужный в «Порядок выхода» в настройках среды")
+            self.status(f"Добавлено VPN: {len(imported)} ({names}). Выберите нужный в «Выход в интернет» в настройках среды")
             if skipped:
                 alert(self, "Часть серверов пропущена", "\n".join(skipped[:10]))
 
@@ -12180,8 +12630,9 @@ def _build_gui():
             def go(idx):
                 if idx == 1:
                     delete_vpn(name)
+                    self.vpn_ping.pop(name, None)
                     self.refresh_vpn_list()
-                    self.status(f"VPN «{name}» удалён. Среды, где он стоял в порядке выхода, не запустятся, пока вы его не уберёте")
+                    self.status(f"VPN «{name}» удалён. Среды, где он выбран, не запустятся, пока вы не выберете другой выход")
 
             choose(self, f"Удалить VPN «{name}»?", "Конфигурация (с ключами) будет стёрта.", ["Отмена", "Удалить"], go)
 
