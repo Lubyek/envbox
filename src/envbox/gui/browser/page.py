@@ -1,6 +1,7 @@
 """Страница встроенного браузера: подключение, отключение, запуск."""
 
 import threading
+import urllib.parse
 
 from ...cdp.http import cdp_listening
 from ...cdp.viewer import CdpViewer
@@ -279,7 +280,13 @@ class BrowserPageMixin:
         except (OSError, ValueError):
             envs = []
         if not envs and local:
-            return False   # обычная недоступная локальная страница: не наше дело, окно с ошибкой не нужно
+            q = urllib.parse.urlsplit(url)
+            if "callback" in q.path.lower() and "code=" in q.query:   # похоже на колбэк входа, а принять его некому
+                alert(self, "Вход вернулся на адрес внутри компьютера, но принять его некому",
+                      f"Адрес: {label}\n\nЭтот порт слушает программа в какой-то среде (например, Claude CLI при "
+                      "входе). Откройте настройки той среды и включите «Принимать вход по ссылке localhost», "
+                      "затем перезапустите её и повторите вход.")
+            return False   # обычная недоступная локальная страница: окно с ошибкой не нужно
         if not envs:
             alert(self, "Страница хочет передать ссылку программе",
                   f"Адрес: {label}\n\nНи у одной среды нет для этого настройки, передавать некуда. "
