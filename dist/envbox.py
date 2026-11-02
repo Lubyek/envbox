@@ -38,7 +38,7 @@ import time
 
 # ---- version.py: Версия envbox (строка читается регулярным выражением при установке — не менять формат).
 
-ENVBOX_VERSION = "2026.11.02.11"
+ENVBOX_VERSION = "2026.11.02.12"
 
 
 # ---- lazy.py: Ленивые модули стандартной библиотеки: настоящий import происходит при первом обращении к атрибуту.
@@ -1444,6 +1444,69 @@ def vpn_info(kind, text):
     host, port = json_server(cfg)
     return {"title": str(cfg.get("remarks") or cfg.get("remark") or "") if isinstance(cfg, dict) else "",
             "host": host, "port": port, "udp": False}
+
+
+def first_proxy_outbound(cfg):
+    """Первый прокси-выход конфигурации Xray или sing-box (словарь) или None."""
+    for o in cfg.get("outbounds") or []:
+        if isinstance(o, dict) and (o.get("protocol") or o.get("type")) in PROXY_PROTOCOLS:
+            return o
+    return None
+
+
+def transport_report(kind, text):
+    """Безопасность и «отпечаток» самого VPN-транспорта по конфигурации (без сети): [(уровень, текст)].
+
+    Уровни: ok, warn, bad. Это не то, что видит Anthropic (он видит выходной адрес), а то, что видит ваш провайдер и
+    тот, кто просматривает трафик до VPN-сервера."""
+    out = []
+    if kind == "wireguard":
+        out.append(("ok", "WireGuard: шифрование ChaCha20-Poly1305, ключи из вашей конфигурации"))
+        out.append(("warn", "WireGuard работает по UDP и легко опознаётся по рукопожатию: многие провайдеры и "
+                            "сети его блокируют или замедляют; для таких сетей надёжнее VLESS с Reality"))
+        return out
+    try:
+        if share_scheme(text):
+            cfg = {"outbounds": [parse_share_link(text)[0]]}
+        else:
+            cfg = json.loads(text)
+    except ValueError:
+        return [("bad", "конфигурация не читается")]
+    o = first_proxy_outbound(cfg)
+    if o is None:
+        return [("bad", "нет прокси-выхода: трафик пошёл бы напрямую")]
+    proto = o.get("protocol") or o.get("type")
+    st = o.get("streamSettings") or {}
+    tls = o.get("tls") or {}
+    net = st.get("network") or (o.get("transport") or {}).get("type") or "tcp"
+    sec = (st.get("security") or ("reality" if (tls.get("reality") or {}).get("enabled") else
+                                  "tls" if tls.get("enabled") else "none")).lower()
+    fp = ((st.get("realitySettings") or st.get("tlsSettings") or {}).get("fingerprint")
+          or (tls.get("utls") or {}).get("fingerprint") or "")
+    insecure = bool((st.get("tlsSettings") or {}).get("allowInsecure") or tls.get("insecure"))
+    sni = ((st.get("realitySettings") or st.get("tlsSettings") or {}).get("serverName") or tls.get("server_name") or "")
+    out.append(("ok", f"протокол {proto}, транспорт {net}, защита канала: {sec}" + (f", SNI {sni}" if sni else "")))
+    if sec == "none" and proto in ("vless", "trojan"):
+        out.append(("bad", f"{proto} без TLS/Reality: трафик до VPN-сервера идёт открыто, его видно провайдеру и "
+                           "каждому узлу по пути"))
+    elif sec == "none" and proto in ("vmess", "shadowsocks"):
+        out.append(("warn", f"{proto} без TLS: содержимое шифруется самим протоколом, но по виду трафика VPN легко "
+                            "опознать и заблокировать"))
+    elif sec == "reality":
+        out.append(("ok", "Reality: рукопожатие выглядит как обычный HTTPS к чужому сайту, сертификаты подделывать "
+                          "не нужно"))
+    if insecure:
+        out.append(("bad", "allowInsecure: сертификат сервера не проверяется, VPN-сервер можно подменить"))
+    if sec in ("tls", "reality"):
+        if not fp:
+            out.append(("warn", "не задан отпечаток TLS (fp): рукопожатие клиента отличается от браузера и легче "
+                                "опознаётся; задайте fp=chrome"))
+        elif fp.lower() in ("random", "randomized", "randomizednoalpn"):
+            out.append(("warn", f"отпечаток TLS {fp}: меняется от соединения к соединению; стабильный chrome "
+                                "обычно незаметнее"))
+        else:
+            out.append(("ok", f"отпечаток TLS (uTLS): {fp}"))
+    return out
 
 
 def split_links(text):
@@ -5884,7 +5947,7 @@ VPN_MAX_BYTES = 256 * 1024
 SUB_MAX_BYTES = 2 * 1024 * 1024
 
 
-SUB_MAX_LINKS = 40
+SUB_MAX_LINKS = 300
 
 
 # Под какими приложениями пробуем скачать подписку: многие провайдеры отдают настоящие серверы только «своему»
@@ -6265,6 +6328,37 @@ def device_headers():
             f.write(hwid + "\n")
     return {"x-hwid": hwid, "x-device-os": "Linux", "x-ver-os": platform.release()[:40] or "linux",
             "x-device-model": "envbox"}
+
+
+def http_errors():
+    """Какие исключения означают сбой сети в http_request (http.client подключается лениво: он тяжёлый)."""
+    import http.client
+    return (OSError, http.client.HTTPException, UnicodeError, ValueError)
+
+
+def http_request(url, proxy="", auth="", timeout=15, headers=None, max_bytes=256 * 1024):
+    """Один GET напрямую или через прокси (имя сайта разрешает прокси): (статус, заголовки в нижнем регистре, тело,
+    миллисекунды до ответа). Перенаправления не выполняются: нужен сам ответ. Сбой сети — исключение из http_errors()."""
+    import http.client
+    import ssl
+    import urllib.parse
+    u = urllib.parse.urlsplit(url)
+    https, host = u.scheme == "https", u.hostname or ""
+    port = u.port or (443 if https else 80)
+    conn = (http.client.HTTPSConnection if https else http.client.HTTPConnection)(host, port, timeout=timeout)
+    t0 = time.monotonic()
+    try:
+        if proxy:
+            raw = open_via_proxy(proxy, auth, host, port, timeout)
+            conn.sock = ssl.create_default_context().wrap_socket(raw, server_hostname=host) if https else raw
+        conn.request("GET", (u.path or "/") + (("?" + u.query) if u.query else ""),
+                     headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) envbox-check", "Accept": "*/*",
+                              "Accept-Encoding": "identity", "Connection": "close", **(headers or {})})
+        r = conn.getresponse()
+        ms = int((time.monotonic() - t0) * 1000)
+        return r.status, {k.lower(): v for k, v in r.getheaders()}, r.read(max_bytes), ms
+    finally:
+        conn.close()
 
 
 def fetch_subscription(url, timeout=20, proxy="", auth="", agent=SUB_AGENTS[0]):
@@ -8279,6 +8373,274 @@ def clear_net_log(name):
     if os.path.exists(p):
         with open(p, "w"):
             pass
+
+
+# ---- core/vpncheck.py: Проверка выхода в интернет (VPN, прокси, этот компьютер) с точки зрения Claude.
+
+# Сервисы определения адреса: (адрес запроса, разбор ответа). Берём ответы всех, кто ответил: у одних есть пометки
+# «дата-центр/VPN», у других точнее город. Порядок — важность для основных полей.
+def _parse_ipapi_is(d):
+    if not isinstance(d, dict) or not d.get("ip"):
+        return None
+    loc, comp, asn = d.get("location") or {}, d.get("company") or {}, d.get("asn") or {}
+    return {"ip": d["ip"], "country": loc.get("country", ""), "code": loc.get("country_code", ""),
+            "region": loc.get("state", ""), "city": loc.get("city", ""), "timezone": loc.get("timezone", ""),
+            "org": comp.get("name") or asn.get("org", ""), "asn": f"AS{asn['asn']}" if asn.get("asn") else "",
+            "net_type": comp.get("type") or asn.get("type") or "",
+            "flags": {"datacenter": bool(d.get("is_datacenter")), "proxy": bool(d.get("is_proxy")),
+                      "vpn": bool(d.get("is_vpn")), "tor": bool(d.get("is_tor")), "abuser": bool(d.get("is_abuser")),
+                      "mobile": bool(d.get("is_mobile"))}}
+
+
+def _parse_ip_api(d):
+    if not isinstance(d, dict) or d.get("status") != "success":
+        return None
+    return {"ip": d.get("query", ""), "country": d.get("country", ""), "code": d.get("countryCode", ""),
+            "region": d.get("regionName", ""), "city": d.get("city", ""), "timezone": d.get("timezone", ""),
+            "org": d.get("org") or d.get("isp", ""), "asn": (d.get("as") or "").split(" ")[0], "net_type": "",
+            "flags": {"datacenter": bool(d.get("hosting")), "proxy": bool(d.get("proxy")),
+                      "mobile": bool(d.get("mobile"))}}
+
+
+def _parse_ipwho(d):
+    if not isinstance(d, dict) or not d.get("success", True) or not d.get("ip"):
+        return None
+    conn = d.get("connection") or {}
+    return {"ip": d["ip"], "country": d.get("country", ""), "code": d.get("country_code", ""),
+            "region": d.get("region", ""), "city": d.get("city", ""),
+            "timezone": (d.get("timezone") or {}).get("id", ""), "org": conn.get("org") or conn.get("isp", ""),
+            "asn": f"AS{conn['asn']}" if conn.get("asn") else "", "net_type": "", "flags": {}}
+
+
+GEO_PROVIDERS = [
+    ("https://api.ipapi.is/", _parse_ipapi_is),
+    ("http://ip-api.com/json/?fields=status,message,country,countryCode,regionName,city,timezone,isp,org,as,"
+     "mobile,proxy,hosting,query", _parse_ip_api),
+    ("https://ipwho.is/", _parse_ipwho),
+]
+
+
+# Что открываем «как Claude»: без ключа сервисы отвечают предсказуемо (api: 401 из разрешённого региона, 403 из запрещённого)
+CLAUDE_SITE = "https://claude.ai/"
+
+
+CLAUDE_API = "https://api.anthropic.com/v1/models"
+
+
+# Страны, из которых Claude, по сообщениям Anthropic, недоступен. Список может устареть: настоящий ответ api.anthropic.com
+# важнее, это только запасное предупреждение, если проверить сервис не удалось.
+CLAUDE_UNSUPPORTED = ("CN", "RU", "BY", "IR", "KP", "CU", "SY")
+
+
+FLAG_TEXT = {"datacenter": "дата-центр / хостинг", "proxy": "известный прокси", "vpn": "известный VPN",
+             "tor": "выходной узел Tor", "abuser": "жалобы на злоупотребления"}
+
+
+def judge_claude_site(status, headers, body):
+    """Ответ claude.ai без входа -> (уровень, текст)."""
+    loc = headers.get("location", "")
+    text = body[:4000].decode("utf-8", "replace") if isinstance(body, bytes) else str(body)[:4000]
+    if "app-unavailable-in-region" in loc or "app-unavailable-in-region" in text:
+        return "bad", "claude.ai: недоступен в этом регионе (app-unavailable-in-region)"
+    if headers.get("cf-mitigated") == "challenge" or (
+            status in (403, 429, 503) and ("Just a moment" in text or "challenge-platform" in text)):
+        return "warn", ("claude.ai: Cloudflare требует проверку браузера. У адреса плохая репутация: вход часто "
+                        "заканчивается «Couldn't verify your browser»")
+    if status in (200, 301, 302, 303, 307, 308):
+        return "ok", f"claude.ai: открывается (HTTP {status})"
+    if status == 403:
+        return "bad", "claude.ai: HTTP 403, доступ запрещён (вероятно, регион или блокировка адреса)"
+    return "warn", f"claude.ai: неожиданный ответ HTTP {status}"
+
+
+def judge_claude_api(status, body):
+    """Ответ api.anthropic.com без ключа -> (уровень, текст)."""
+    text = body[:500].decode("utf-8", "replace") if isinstance(body, bytes) else str(body)[:500]
+    if status == 401:
+        return "ok", "api.anthropic.com: регион разрешён (без ключа ответ 401, как и должно быть)"
+    if status == 403:
+        return "bad", "api.anthropic.com: HTTP 403 («Request not allowed»): регион или адрес не разрешён"
+    if status in (400, 404, 405):
+        return "ok", f"api.anthropic.com: отвечает (HTTP {status})"
+    if status == 429:
+        return "warn", "api.anthropic.com: HTTP 429, слишком много запросов с этого адреса"
+    return "warn", f"api.anthropic.com: неожиданный ответ HTTP {status} {text[:60]}".strip()
+
+
+def utc_hours(tzid):
+    """Смещение пояса tzid от UTC в часах сейчас или None."""
+    try:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(tzid)).utcoffset().total_seconds() / 3600
+    except Exception:  # noqa: BLE001  нет базы часовых поясов или неизвестный пояс
+        return None
+
+
+def merge_geo(found):
+    """Объединить ответы сервисов: основные поля — от первого ответившего, пометки — от всех."""
+    merged, flags = {}, {}
+    for g in found:
+        for k, v in g.items():
+            if k == "flags":
+                for f, on in v.items():
+                    flags[f] = flags.get(f, False) or on
+            elif v and not merged.get(k):
+                merged[k] = v
+    merged["flags"] = flags
+    merged["sources"] = len(found)
+    return merged
+
+
+def assess(exit_info, real_ip, claude, env_tz="", host_offset=None):
+    """Выводы по результатам: [(уровень, текст)]."""
+    out = []
+    if not exit_info:
+        return [("bad", "не удалось определить выходной адрес: сервисы определения не ответили через этот выход")]
+    ip, code = exit_info.get("ip", ""), (exit_info.get("code") or "").upper()
+    if real_ip:
+        if real_ip == ip:
+            out.append(("bad", "ВЫХОД СОВПАДАЕТ С ВАШИМ НАСТОЯЩИМ АДРЕСОМ: защиты нет, трафик идёт мимо VPN или прокси"))
+        else:
+            out.append(("ok", "выходной адрес отличается от настоящего: настоящий адрес сайтам не виден"))
+    bad = [FLAG_TEXT[f] for f in FLAG_TEXT if exit_info["flags"].get(f)]
+    if bad:
+        out.append(("warn", "адрес помечен как «" + "», «".join(bad) + "»: Claude и Cloudflare чаще просят проверку, "
+                            "а аккаунты с таких адресов чаще блокируют; надёжнее домашний (residential) адрес"))
+    elif exit_info["flags"]:
+        out.append(("ok", "адрес не значится ни дата-центром, ни VPN/прокси, ни Tor, жалоб нет"))
+    else:
+        out.append(("warn", "сервисы определения не дали пометок о типе сети (дата-центр/VPN): репутацию адреса "
+                            "проверить не удалось"))
+    if exit_info.get("net_type") in ("hosting", "datacenter") and not bad:
+        out.append(("warn", "тип сети: хостинг. Для Claude надёжнее провайдер домашнего интернета"))
+    if exit_info["flags"].get("mobile"):
+        out.append(("ok", "адрес мобильного оператора: у таких адресов хорошая репутация, но он общий для многих"))
+    site, api = claude.get("site"), claude.get("api")
+    for res in (site, api):
+        if res:
+            out.append(res)
+    decided = bool(api and api[0] in ("ok", "bad"))
+    if code in CLAUDE_UNSUPPORTED and not decided:
+        out.append(("warn", f"страна {code} в списке регионов без Claude (список может устареть; прямая проверка "
+                            "api.anthropic.com не удалась)"))
+    if env_tz and exit_info.get("timezone"):
+        a, b = utc_hours(env_tz), utc_hours(exit_info["timezone"])
+        if a is not None and b is not None and abs(a - b) >= 1:
+            out.append(("warn", f"часовой пояс среды {env_tz} не совпадает с регионом выхода ({exit_info['timezone']}): "
+                                "сайты сравнивают пояс браузера с адресом; задайте поясу среды значение региона"))
+        elif a is not None and b is not None:
+            out.append(("ok", f"часовой пояс среды совпадает с регионом выхода ({exit_info['timezone']})"))
+    elif exit_info.get("timezone") and host_offset is not None:
+        b = utc_hours(exit_info["timezone"])
+        if b is not None and abs(host_offset - b) >= 1:
+            out.append(("warn", f"пояс региона выхода {exit_info['timezone']}, а на компьютере другой: задайте среде "
+                                "часовой пояс региона выхода (настройки среды, «Система внутри среды»)"))
+    return out
+
+
+def verdict(findings):
+    levels = {lvl for lvl, _t in findings}
+    return "bad" if "bad" in levels else "warn" if "warn" in levels else "ok"
+
+
+def check_exit(proxy="", auth="", timeout=15, real_url=None, compare_real=True, env_tz=""):
+    """Проверить выход через `proxy` (пусто — напрямую с этого компьютера) -> словарь отчёта.
+
+    Ключи: exit (адрес и местоположение), real_ip, claude, latency_ms, findings, verdict. Запросы к сервисам
+    определения адреса идут параллельно; сбой одного сервиса не мешает остальным."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def geo(provider, via=None):
+        url, parse = provider
+        try:
+            # via: None — через проверяемый выход; "" — напрямую (настоящий адрес для сравнения)
+            status, _h, body, _ms = (http_request(url, proxy, auth, timeout) if via is None
+                                     else http_request(url, via, "", timeout))
+            return parse(json.loads(body.decode("utf-8", "replace"))) if status == 200 else None
+        except http_errors():
+            return None
+
+    def claude_get(url):
+        try:
+            return http_request(url, proxy, auth, timeout)
+        except http_errors() as e:
+            return e
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        geo_jobs = [pool.submit(geo, p) for p in GEO_PROVIDERS]
+        site_job = pool.submit(claude_get, CLAUDE_SITE)
+        api_job = pool.submit(claude_get, CLAUDE_API)
+        real_job = pool.submit(geo, ((real_url or GEO_PROVIDERS[0][0]), GEO_PROVIDERS[0][1]), "") if (
+            compare_real and proxy) else None
+        found = [g for g in (j.result() for j in geo_jobs) if g]
+        site, api = site_job.result(), api_job.result()
+        real = real_job.result() if real_job else None
+    exit_info = merge_geo(found) if found else None
+    claude = {}
+    for key, res, judge in (("site", site, lambda r: judge_claude_site(r[0], r[1], r[2])),
+                            ("api", api, lambda r: judge_claude_api(r[0], r[2]))):
+        if isinstance(res, Exception):
+            name = "claude.ai" if key == "site" else "api.anthropic.com"
+            claude[key] = ("bad", f"{name}: не открылся через этот выход ({res})")
+        else:
+            claude[key] = judge(res)
+    latency = api[3] if not isinstance(api, Exception) else None
+    findings = assess(exit_info, (real or {}).get("ip", ""), claude, env_tz=env_tz,
+                      host_offset=time.localtime().tm_gmtoff / 3600)
+    if compare_real and proxy and not real:
+        findings.append(("warn", "настоящий адрес определить не удалось: сравнить выход с ним нельзя"))
+    return {"exit": exit_info, "real_ip": (real or {}).get("ip", ""), "claude": claude, "latency_ms": latency,
+            "findings": findings, "verdict": verdict(findings)}
+
+
+def check_vpn(name, timeout=15, compare_real=True, env_tz=""):
+    """Запустить клиент VPN `name`, проверить выход через него (check_exit) и остановить клиент."""
+    import asyncio
+    kind, path = vpn_source(name)
+    problem = vpn_binary_problem(kind)
+    if problem:
+        raise ValueError(problem)
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    client = VpnClient(kind, path, vpn_dir() + "/" + name + ".test.log")
+    try:
+        try:
+            asyncio.run(client.start())
+        except OSError as e:
+            raise ValueError(f"VPN «{name}» не запустился: {e}") from None
+        report = check_exit(client.upstream.label, client.upstream.auth or "", timeout, compare_real=compare_real,
+                            env_tz=env_tz)
+    finally:
+        client.stop()
+    report["transport"] = transport_report(kind, text)
+    report["verdict"] = verdict(report["findings"] + report["transport"])
+    return report
+
+
+def format_report(report, title=""):
+    """Отчёт текстом для окна: ✔ хорошо, ⚠ предупреждение, ✖ плохо."""
+    mark = {"ok": "✔", "warn": "⚠", "bad": "✖"}
+    lines = [title] if title else []
+    e = report.get("exit")
+    if e:
+        place = ", ".join(x for x in (e.get("city"), e.get("region"), e.get("country")) if x)
+        lines += [f"Адрес выхода:  {e.get('ip', '?')}",
+                  f"Место:         {place or '?'}" + (f" ({e['code']})" if e.get("code") else ""),
+                  f"Провайдер:     {e.get('org') or '?'}" + (f" · {e['asn']}" if e.get("asn") else "")
+                  + (f" · тип: {e['net_type']}" if e.get("net_type") else ""),
+                  f"Часовой пояс:  {e.get('timezone') or '?'}",
+                  f"Источников:    {e.get('sources', 0)} из {len(GEO_PROVIDERS)}"]
+    if report.get("real_ip"):
+        lines.append(f"Настоящий:     {report['real_ip']}")
+    if report.get("latency_ms") is not None:
+        lines.append(f"Задержка до api.anthropic.com через выход: {report['latency_ms']} мс")
+    lines += ["", "Выводы:"] + [f"  {mark[lvl]} {t}" for lvl, t in report["findings"]]
+    if report.get("transport"):
+        lines += ["", "Безопасность и отпечаток VPN-транспорта:"] + [f"  {mark[lvl]} {t}" for lvl, t in report["transport"]]
+    final = {"ok": "ИТОГ: подходит для Claude", "warn": "ИТОГ: работать можно, но есть риски (см. ⚠)",
+             "bad": "ИТОГ: для Claude не подходит или не защищает (см. ✖)"}[report["verdict"]]
+    return "\n".join(lines + ["", final])
 
 
 # ---- gui/*: графический интерфейс. Классы требуют импортированного GTK, поэтому
@@ -11053,6 +11415,33 @@ def _build_gui():
 
             self.run_async(lambda: probe_upstream(url, auth), done)
 
+        def on_proxy_check(self, *_):
+            """Проверка выхода прокси для Claude: адрес, страна, репутация, утечка, claude.ai и api.anthropic.com."""
+            if not self.current:
+                return
+            try:
+                url, auth = split_proxy_url(self.e_upstream.get_text())
+            except ValueError as e:
+                alert(self, "Адрес прокси неверен", str(e))
+                return
+            name, tz = self.current.name, self.e_tz.get_text().strip()
+            if not auth and self.current.upstream_auth and secret_tool_available():
+                try:
+                    auth = secret_lookup(name, UPSTREAM_AUTH_VAR)
+                except (OSError, subprocess.SubprocessError):
+                    auth = ""
+            self.status("Проверяю выход прокси для Claude…")
+
+            def done(res):
+                if isinstance(res, Exception):
+                    alert(self, "Проверка не удалась", str(res))
+                    return
+                self.status({"ok": "Для Claude подходит", "warn": "Для Claude: есть риски", "bad": "Для Claude не подходит"}
+                            [res["verdict"]] + " (прокси)")
+                self.show_report("Прокси для Claude", format_report(res, f"Прокси {url}"))
+
+            self.run_async(lambda: check_exit(url, auth, env_tz=tz), done)
+
         def on_proxy_auth(self, *_):
             if not self.current:
                 return
@@ -11377,7 +11766,7 @@ def _build_gui():
             up_box = Gtk.Box(spacing=6)
             up_box.append(self.e_upstream)
             for label, handler in (("Из файла…", self.on_proxy_file), ("Проверить", self.on_proxy_test),
-                                   ("Логин и пароль…", self.on_proxy_auth)):
+                                   ("Для Claude…", self.on_proxy_check), ("Логин и пароль…", self.on_proxy_auth)):
                 bt = Gtk.Button(label=label)
                 bt.connect("clicked", handler)
                 up_box.append(bt)
@@ -12505,6 +12894,7 @@ def _build_gui():
             ping.add_css_class("dim-label")
             row.append(ping)
             for label, handler in (("Проверить", lambda _b, n=v["name"]: self.on_vpn_test(n)),
+                                   ("Для Claude", lambda _b, n=v["name"]: self.on_vpn_check(n)),
                                    ("В папку…", lambda _b, n=v["name"], f=v["folder"]: self.on_vpn_move(n, f)),
                                    ("Удалить", lambda _b, n=v["name"]: self.on_vpn_delete(n))):
                 bt = Gtk.Button(label=label)
@@ -12710,6 +13100,40 @@ def _build_gui():
                 alert(self, "VPN работает" if ok else "VPN не работает", msg)
 
             self.run_async(lambda: test_vpn(name), done)
+
+        def on_vpn_check(self, name):
+            """Проверка выхода для Claude: адрес, страна, репутация, утечка, claude.ai и api.anthropic.com, транспорт."""
+            self.status(f"Проверяю VPN «{name}» для Claude: запускаю клиент и опрашиваю сервисы…")
+
+            def done(res):
+                if isinstance(res, Exception):
+                    alert(self, "Проверка не удалась", str(res))
+                    return
+                self.status({"ok": "Для Claude подходит", "warn": "Для Claude: есть риски", "bad": "Для Claude не подходит"}
+                            [res["verdict"]] + f" (VPN «{name}»)")
+                self.show_report(f"VPN «{name}» для Claude", format_report(res, f"VPN «{name}»"))
+
+            self.run_async(lambda: check_vpn(name), done)
+
+        def show_report(self, title, text):
+            """Окно с текстовым отчётом и кнопкой «Копировать»."""
+            win = Gtk.Window(title=title, transient_for=self, modal=False)
+            win.set_default_size(780, 560)
+            box = margins(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10), 16)
+            view, sw = text_area(editable=False, height=420)
+            set_text(view, text)
+            sw.set_vexpand(True)
+            box.append(sw)
+            bar = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+            copy = Gtk.Button(label="Копировать")
+            copy.connect("clicked", lambda *_: (self.get_clipboard().set_text(text), self.status("Отчёт скопирован")))
+            close = Gtk.Button(label="Закрыть")
+            close.connect("clicked", lambda *_: win.destroy())
+            bar.append(copy)
+            bar.append(close)
+            box.append(bar)
+            win.set_child(box)
+            win.present()
 
         def on_vpn_delete(self, name):
             def go(idx):

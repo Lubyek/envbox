@@ -30,7 +30,7 @@ VPN_MAX_BYTES = 256 * 1024
 SUB_MAX_BYTES = 2 * 1024 * 1024
 
 
-SUB_MAX_LINKS = 40
+SUB_MAX_LINKS = 300
 
 
 # Под какими приложениями пробуем скачать подписку: многие провайдеры отдают настоящие серверы только «своему»
@@ -411,6 +411,37 @@ def device_headers():
             f.write(hwid + "\n")
     return {"x-hwid": hwid, "x-device-os": "Linux", "x-ver-os": platform.release()[:40] or "linux",
             "x-device-model": "envbox"}
+
+
+def http_errors():
+    """Какие исключения означают сбой сети в http_request (http.client подключается лениво: он тяжёлый)."""
+    import http.client
+    return (OSError, http.client.HTTPException, UnicodeError, ValueError)
+
+
+def http_request(url, proxy="", auth="", timeout=15, headers=None, max_bytes=256 * 1024):
+    """Один GET напрямую или через прокси (имя сайта разрешает прокси): (статус, заголовки в нижнем регистре, тело,
+    миллисекунды до ответа). Перенаправления не выполняются: нужен сам ответ. Сбой сети — исключение из http_errors()."""
+    import http.client
+    import ssl
+    import urllib.parse
+    u = urllib.parse.urlsplit(url)
+    https, host = u.scheme == "https", u.hostname or ""
+    port = u.port or (443 if https else 80)
+    conn = (http.client.HTTPSConnection if https else http.client.HTTPConnection)(host, port, timeout=timeout)
+    t0 = time.monotonic()
+    try:
+        if proxy:
+            raw = open_via_proxy(proxy, auth, host, port, timeout)
+            conn.sock = ssl.create_default_context().wrap_socket(raw, server_hostname=host) if https else raw
+        conn.request("GET", (u.path or "/") + (("?" + u.query) if u.query else ""),
+                     headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) envbox-check", "Accept": "*/*",
+                              "Accept-Encoding": "identity", "Connection": "close", **(headers or {})})
+        r = conn.getresponse()
+        ms = int((time.monotonic() - t0) * 1000)
+        return r.status, {k.lower(): v for k, v in r.getheaders()}, r.read(max_bytes), ms
+    finally:
+        conn.close()
 
 
 def fetch_subscription(url, timeout=20, proxy="", auth="", agent=SUB_AGENTS[0]):

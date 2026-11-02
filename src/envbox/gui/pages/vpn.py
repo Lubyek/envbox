@@ -26,8 +26,9 @@ from ...core.vpn import (
     vpn_binary_problem,
     vpn_name_from_file,
 )
+from ...core.vpncheck import check_vpn, format_report
 from ..gtk import GLib, Gtk
-from ..widgets import alert, choose, clear_children, get_text, hint, margins, prompt, text_area
+from ..widgets import alert, choose, clear_children, get_text, hint, margins, prompt, set_text, text_area
 
 
 class VpnPageMixin:
@@ -174,6 +175,7 @@ class VpnPageMixin:
         ping.add_css_class("dim-label")
         row.append(ping)
         for label, handler in (("Проверить", lambda _b, n=v["name"]: self.on_vpn_test(n)),
+                               ("Для Claude", lambda _b, n=v["name"]: self.on_vpn_check(n)),
                                ("В папку…", lambda _b, n=v["name"], f=v["folder"]: self.on_vpn_move(n, f)),
                                ("Удалить", lambda _b, n=v["name"]: self.on_vpn_delete(n))):
             bt = Gtk.Button(label=label)
@@ -379,6 +381,40 @@ class VpnPageMixin:
             alert(self, "VPN работает" if ok else "VPN не работает", msg)
 
         self.run_async(lambda: test_vpn(name), done)
+
+    def on_vpn_check(self, name):
+        """Проверка выхода для Claude: адрес, страна, репутация, утечка, claude.ai и api.anthropic.com, транспорт."""
+        self.status(f"Проверяю VPN «{name}» для Claude: запускаю клиент и опрашиваю сервисы…")
+
+        def done(res):
+            if isinstance(res, Exception):
+                alert(self, "Проверка не удалась", str(res))
+                return
+            self.status({"ok": "Для Claude подходит", "warn": "Для Claude: есть риски", "bad": "Для Claude не подходит"}
+                        [res["verdict"]] + f" (VPN «{name}»)")
+            self.show_report(f"VPN «{name}» для Claude", format_report(res, f"VPN «{name}»"))
+
+        self.run_async(lambda: check_vpn(name), done)
+
+    def show_report(self, title, text):
+        """Окно с текстовым отчётом и кнопкой «Копировать»."""
+        win = Gtk.Window(title=title, transient_for=self, modal=False)
+        win.set_default_size(780, 560)
+        box = margins(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10), 16)
+        view, sw = text_area(editable=False, height=420)
+        set_text(view, text)
+        sw.set_vexpand(True)
+        box.append(sw)
+        bar = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+        copy = Gtk.Button(label="Копировать")
+        copy.connect("clicked", lambda *_: (self.get_clipboard().set_text(text), self.status("Отчёт скопирован")))
+        close = Gtk.Button(label="Закрыть")
+        close.connect("clicked", lambda *_: win.destroy())
+        bar.append(copy)
+        bar.append(close)
+        box.append(bar)
+        win.set_child(box)
+        win.present()
 
     def on_vpn_delete(self, name):
         def go(idx):

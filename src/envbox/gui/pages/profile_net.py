@@ -10,6 +10,7 @@ from ...core.system import pkg_hint
 from ...core.terminal import dry_run
 from ...core.upstream import probe_upstream, read_proxy_file, split_proxy_url
 from ...core.vpn import EXIT_MODES, exit_chain, exit_mode, list_vpns
+from ...core.vpncheck import check_exit, format_report
 from ..gtk import GLib, Gtk
 from ..widgets import alert, get_lines, hint, margins, prompt, set_text, show_all, to_home
 
@@ -133,6 +134,33 @@ class ProfileNetMixin:
             alert(self, "Прокси работает" if ok else "Прокси не работает", msg)
 
         self.run_async(lambda: probe_upstream(url, auth), done)
+
+    def on_proxy_check(self, *_):
+        """Проверка выхода прокси для Claude: адрес, страна, репутация, утечка, claude.ai и api.anthropic.com."""
+        if not self.current:
+            return
+        try:
+            url, auth = split_proxy_url(self.e_upstream.get_text())
+        except ValueError as e:
+            alert(self, "Адрес прокси неверен", str(e))
+            return
+        name, tz = self.current.name, self.e_tz.get_text().strip()
+        if not auth and self.current.upstream_auth and secret_tool_available():
+            try:
+                auth = secret_lookup(name, UPSTREAM_AUTH_VAR)
+            except (OSError, subprocess.SubprocessError):
+                auth = ""
+        self.status("Проверяю выход прокси для Claude…")
+
+        def done(res):
+            if isinstance(res, Exception):
+                alert(self, "Проверка не удалась", str(res))
+                return
+            self.status({"ok": "Для Claude подходит", "warn": "Для Claude: есть риски", "bad": "Для Claude не подходит"}
+                        [res["verdict"]] + " (прокси)")
+            self.show_report("Прокси для Claude", format_report(res, f"Прокси {url}"))
+
+        self.run_async(lambda: check_exit(url, auth, env_tz=tz), done)
 
     def on_proxy_auth(self, *_):
         if not self.current:

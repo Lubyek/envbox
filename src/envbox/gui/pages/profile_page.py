@@ -156,7 +156,7 @@ class ProfilePageMixin:
         up_box = Gtk.Box(spacing=6)
         up_box.append(self.e_upstream)
         for label, handler in (("Из файла…", self.on_proxy_file), ("Проверить", self.on_proxy_test),
-                               ("Логин и пароль…", self.on_proxy_auth)):
+                               ("Для Claude…", self.on_proxy_check), ("Логин и пароль…", self.on_proxy_auth)):
             bt = Gtk.Button(label=label)
             bt.connect("clicked", handler)
             up_box.append(bt)

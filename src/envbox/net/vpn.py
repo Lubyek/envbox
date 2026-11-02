@@ -378,6 +378,69 @@ def vpn_info(kind, text):
             "host": host, "port": port, "udp": False}
 
 
+def first_proxy_outbound(cfg):
+    """Первый прокси-выход конфигурации Xray или sing-box (словарь) или None."""
+    for o in cfg.get("outbounds") or []:
+        if isinstance(o, dict) and (o.get("protocol") or o.get("type")) in PROXY_PROTOCOLS:
+            return o
+    return None
+
+
+def transport_report(kind, text):
+    """Безопасность и «отпечаток» самого VPN-транспорта по конфигурации (без сети): [(уровень, текст)].
+
+    Уровни: ok, warn, bad. Это не то, что видит Anthropic (он видит выходной адрес), а то, что видит ваш провайдер и
+    тот, кто просматривает трафик до VPN-сервера."""
+    out = []
+    if kind == "wireguard":
+        out.append(("ok", "WireGuard: шифрование ChaCha20-Poly1305, ключи из вашей конфигурации"))
+        out.append(("warn", "WireGuard работает по UDP и легко опознаётся по рукопожатию: многие провайдеры и "
+                            "сети его блокируют или замедляют; для таких сетей надёжнее VLESS с Reality"))
+        return out
+    try:
+        if share_scheme(text):
+            cfg = {"outbounds": [parse_share_link(text)[0]]}
+        else:
+            cfg = json.loads(text)
+    except ValueError:
+        return [("bad", "конфигурация не читается")]
+    o = first_proxy_outbound(cfg)
+    if o is None:
+        return [("bad", "нет прокси-выхода: трафик пошёл бы напрямую")]
+    proto = o.get("protocol") or o.get("type")
+    st = o.get("streamSettings") or {}
+    tls = o.get("tls") or {}
+    net = st.get("network") or (o.get("transport") or {}).get("type") or "tcp"
+    sec = (st.get("security") or ("reality" if (tls.get("reality") or {}).get("enabled") else
+                                  "tls" if tls.get("enabled") else "none")).lower()
+    fp = ((st.get("realitySettings") or st.get("tlsSettings") or {}).get("fingerprint")
+          or (tls.get("utls") or {}).get("fingerprint") or "")
+    insecure = bool((st.get("tlsSettings") or {}).get("allowInsecure") or tls.get("insecure"))
+    sni = ((st.get("realitySettings") or st.get("tlsSettings") or {}).get("serverName") or tls.get("server_name") or "")
+    out.append(("ok", f"протокол {proto}, транспорт {net}, защита канала: {sec}" + (f", SNI {sni}" if sni else "")))
+    if sec == "none" and proto in ("vless", "trojan"):
+        out.append(("bad", f"{proto} без TLS/Reality: трафик до VPN-сервера идёт открыто, его видно провайдеру и "
+                           "каждому узлу по пути"))
+    elif sec == "none" and proto in ("vmess", "shadowsocks"):
+        out.append(("warn", f"{proto} без TLS: содержимое шифруется самим протоколом, но по виду трафика VPN легко "
+                            "опознать и заблокировать"))
+    elif sec == "reality":
+        out.append(("ok", "Reality: рукопожатие выглядит как обычный HTTPS к чужому сайту, сертификаты подделывать "
+                          "не нужно"))
+    if insecure:
+        out.append(("bad", "allowInsecure: сертификат сервера не проверяется, VPN-сервер можно подменить"))
+    if sec in ("tls", "reality"):
+        if not fp:
+            out.append(("warn", "не задан отпечаток TLS (fp): рукопожатие клиента отличается от браузера и легче "
+                                "опознаётся; задайте fp=chrome"))
+        elif fp.lower() in ("random", "randomized", "randomizednoalpn"):
+            out.append(("warn", f"отпечаток TLS {fp}: меняется от соединения к соединению; стабильный chrome "
+                                "обычно незаметнее"))
+        else:
+            out.append(("ok", f"отпечаток TLS (uTLS): {fp}"))
+    return out
+
+
 def split_links(text):
     """Ссылки на серверы из текста подписки -> (поддерживаемые ссылки, схемы остальных ссылок).
 

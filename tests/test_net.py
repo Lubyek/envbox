@@ -1541,6 +1541,172 @@ class VpnSubscriptions(unittest.TestCase):
             import_many("html", "<html>login</html>")
 
 
+class VpnCheck(unittest.TestCase):
+    """Проверка выхода для Claude: адрес, страна, репутация, утечка, доступность claude.ai/api, транспорт."""
+    UUID = VpnConfigs.UUID
+    GEO_A = {"ip": "203.0.113.5", "is_datacenter": True, "is_proxy": False, "is_vpn": True, "is_tor": False,
+             "is_abuser": False, "company": {"name": "Example Hosting", "type": "hosting"},
+             "asn": {"asn": 64500, "org": "Example AS"},
+             "location": {"country": "Germany", "country_code": "DE", "state": "Hesse", "city": "Frankfurt",
+                          "timezone": "Europe/Berlin"}}
+    GEO_B = {"status": "success", "query": "203.0.113.5", "country": "Germany", "countryCode": "DE",
+             "regionName": "Hesse", "city": "Frankfurt am Main", "timezone": "Europe/Berlin", "isp": "Example",
+             "org": "Example Hosting", "as": "AS64500 Example", "mobile": False, "proxy": False, "hosting": True}
+
+    def setUp(self):
+        import http.server
+        import json as _json
+        import threading
+        self.root = tempfile.mkdtemp(prefix="eb")
+        self.addCleanup(shutil.rmtree, self.root, True)
+        patcher = mock.patch("envbox.core.vpn.envbox_root", return_value=self.root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        outer = self
+        self.state = {"api": 401, "site_loc": "/login", "site_status": 302, "real": "198.51.100.7", "exit": "203.0.113.5"}
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def reply(self, status, body=b"", headers=()):
+                self.send_response(status)
+                for k, v in headers:
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                st = outer.state
+                if self.path.startswith("/geo"):
+                    self.reply(200, _json.dumps({**VpnCheck.GEO_A, "ip": st["exit"]}).encode())
+                elif self.path.startswith("/ipapi2"):
+                    self.reply(200, _json.dumps({**VpnCheck.GEO_B, "query": st["exit"]}).encode())
+                elif self.path.startswith("/real"):
+                    self.reply(200, _json.dumps({**VpnCheck.GEO_A, "ip": st["real"]}).encode())
+                elif self.path.startswith("/site"):
+                    self.reply(st["site_status"], b"", [("Location", st["site_loc"])])
+                elif self.path.startswith("/api"):
+                    self.reply(st["api"], b'{"error":{"type":"authentication_error"}}')
+                else:
+                    self.reply(404)
+
+            def log_message(self, *a):
+                pass
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.addCleanup(self.srv.shutdown)
+        self.port = self.srv.server_address[1]
+        import envbox.core.vpncheck as vc
+        self.vc = vc
+        base = f"http://geo.test:{self.port}"
+        for name, value in (("GEO_PROVIDERS", [(base + "/geo", vc._parse_ipapi_is), (base + "/ipapi2", vc._parse_ip_api)]),
+                            ("CLAUDE_SITE", base + "/site"), ("CLAUDE_API", base + "/api")):
+            p = mock.patch.object(vc, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def run_check(self, **kw):
+        proxy, _seen = VpnSubscriptions.connect_proxy({"geo.test": self.port})
+        self.addCleanup(proxy.shutdown)
+        return self.vc.check_exit(f"http://127.0.0.1:{proxy.server_address[1]}", real_url=f"http://127.0.0.1:{self.port}/real",
+                                  timeout=5, **kw)
+
+    def test_parsers_read_the_documented_fields(self):
+        a = self.vc._parse_ipapi_is(self.GEO_A)
+        self.assertEqual((a["ip"], a["code"], a["region"], a["city"], a["asn"], a["net_type"]),
+                         ("203.0.113.5", "DE", "Hesse", "Frankfurt", "AS64500", "hosting"))
+        self.assertTrue(a["flags"]["datacenter"] and a["flags"]["vpn"])
+        b = self.vc._parse_ip_api(self.GEO_B)
+        self.assertEqual((b["ip"], b["asn"], b["flags"]["datacenter"]), ("203.0.113.5", "AS64500", True))
+        w = self.vc._parse_ipwho({"success": True, "ip": "1.2.3.4", "country": "France", "country_code": "FR",
+                                  "region": "IDF", "city": "Paris", "timezone": {"id": "Europe/Paris"},
+                                  "connection": {"asn": 1, "org": "O"}})
+        self.assertEqual((w["code"], w["timezone"], w["flags"]), ("FR", "Europe/Paris", {}))
+        for bad in (None, {}, {"status": "fail"}, {"success": False}, []):
+            self.assertIsNone(self.vc._parse_ip_api(bad) or self.vc._parse_ipwho(bad) or self.vc._parse_ipapi_is(bad))
+
+    def test_claude_verdicts(self):
+        j, a = self.vc.judge_claude_site, self.vc.judge_claude_api
+        self.assertEqual(j(302, {"location": "/login"}, b"")[0], "ok")
+        self.assertEqual(j(302, {"location": "https://claude.ai/app-unavailable-in-region"}, b"")[0], "bad")
+        self.assertEqual(j(403, {"cf-mitigated": "challenge"}, b"")[0], "warn")                 # проверка Cloudflare
+        self.assertEqual(j(403, {}, b"<title>Just a moment...</title>")[0], "warn")
+        self.assertEqual(j(403, {}, b"denied")[0], "bad")
+        self.assertEqual(a(401, b"")[0], "ok")
+        self.assertEqual(a(403, b'{"error":"Request not allowed"}')[0], "bad")
+        self.assertEqual(a(429, b"")[0], "warn")
+
+    def test_transport_security(self):
+        from envbox.net.vpn import transport_report
+        def lv(kind, text):                                                  # noqa: E301
+            return {lvl for lvl, _t in transport_report(kind, text)}
+        good = f"vless://{self.UUID}@h.example:443?security=reality&pbk=K&fp=chrome&sni=a.example&flow=xtls-rprx-vision"
+        self.assertEqual(lv("xray", good), {"ok"})
+        self.assertIn("bad", lv("xray", f"vless://{self.UUID}@h.example:443"))                # без TLS: открыто
+        self.assertIn("bad", lv("xray", "trojan://pw@h.example:443?security=none"))
+        self.assertIn("warn", lv("xray", f"vmess://{self.UUID}@h.example:443"))
+        self.assertEqual(lv("xray", f"vless://{self.UUID}@h.example:443?security=tls"), {"ok"})   # в ссылке без fp envbox ставит chrome
+        no_fp = '{"outbounds":[{"protocol":"vless","streamSettings":{"security":"tls","tlsSettings":{"serverName":"a.example"}}}]}'
+        self.assertIn("warn", lv("xray", no_fp))                                              # а в готовом JSON отпечатка нет
+        self.assertIn("warn", lv("xray", f"vless://{self.UUID}@h.example:443?security=tls&fp=randomized"))
+        insecure = '{"outbounds":[{"protocol":"vless","streamSettings":{"security":"tls","tlsSettings":{"allowInsecure":true,"fingerprint":"chrome"}}}]}'
+        self.assertIn("bad", lv("xray", insecure))                                            # сертификат не проверяется
+        self.assertIn("warn", lv("wireguard", VpnConfigs.WG))                                 # UDP-рукопожатие заметно
+        self.assertEqual(lv("xray", '{"outbounds":[{"protocol":"freedom"}]}'), {"bad"})
+
+    def test_check_through_a_proxy_reports_location_reputation_and_claude(self):
+        r = self.run_check()
+        self.assertEqual((r["exit"]["ip"], r["exit"]["city"], r["exit"]["region"], r["exit"]["code"]),
+                         ("203.0.113.5", "Frankfurt", "Hesse", "DE"))
+        self.assertEqual(r["exit"]["sources"], 2)                              # ответили оба сервиса
+        self.assertEqual(r["real_ip"], "198.51.100.7")
+        self.assertIsInstance(r["latency_ms"], int)
+        text = " ".join(t for _l, t in r["findings"])
+        self.assertIn("отличается от настоящего", text)                         # утечки нет
+        self.assertIn("дата-центр / хостинг", text)                             # репутация: хостинг и VPN
+        self.assertIn("регион разрешён", text)
+        self.assertEqual(r["verdict"], "warn")
+        report = self.vc.format_report(r, "Проверка")
+        for part in ("203.0.113.5", "Frankfurt", "Hesse", "Example Hosting", "AS64500", "ИТОГ"):
+            self.assertIn(part, report)
+
+    def test_check_flags_a_leak_and_a_blocked_region(self):
+        self.state["real"] = self.state["exit"]                                 # выход = настоящий адрес
+        r = self.run_check()
+        self.assertEqual(r["verdict"], "bad")
+        self.assertIn("СОВПАДАЕТ С ВАШИМ НАСТОЯЩИМ АДРЕСОМ", " ".join(t for _l, t in r["findings"]))
+        self.state.update(real="198.51.100.7", api=403, site_loc="/app-unavailable-in-region")
+        r = self.run_check()
+        text = " ".join(t for _l, t in r["findings"])
+        self.assertEqual(r["verdict"], "bad")
+        self.assertIn("app-unavailable-in-region", text)
+        self.assertIn("HTTP 403", text)
+
+    def test_timezone_of_the_environment_is_compared_with_the_exit_region(self):
+        r = self.run_check(env_tz="Asia/Tokyo")
+        self.assertIn("не совпадает с регионом выхода", " ".join(t for _l, t in r["findings"]))
+        r = self.run_check(env_tz="Europe/Berlin")
+        self.assertIn("совпадает с регионом выхода", " ".join(t for _l, t in r["findings"]))
+
+    def test_check_vpn_starts_the_client_checks_and_stops_it(self):
+        from envbox.core.vpn import import_vpn
+        from envbox.core.vpncheck import check_vpn
+        fake = os.path.join(self.root, "wireproxy")
+        with open(fake, "w") as f:
+            f.write(FAKE_WIREPROXY)
+        os.chmod(fake, 0o755)
+        import_vpn("wg0", VpnConfigs.WG)
+        with mock.patch.dict(os.environ, {"ENVBOX_VPN_WIREPROXY": fake}):
+            with mock.patch.object(self.vc, "http_request", wraps=self.vc.http_request) as spy:
+                r = check_vpn("wg0", timeout=5, compare_real=False)
+        self.assertEqual(r["exit"]["ip"], "203.0.113.5")
+        self.assertTrue(any("WireGuard" in t for _l, t in r["transport"]))
+        self.assertTrue(spy.called)
+        self.assertTrue(all(c.args[1].startswith("socks5://127.0.0.1:") for c in spy.call_args_list))   # всё через VPN
+        with mock.patch.dict(os.environ, {"ENVBOX_VPN_WIREPROXY": "/нет/такой"}):
+            with self.assertRaises(ValueError) as cm:
+                check_vpn("wg0")
+        self.assertIn("wireproxy", str(cm.exception))
+
+
 class VpnStore(unittest.TestCase):
     WG = VpnConfigs.WG
 
