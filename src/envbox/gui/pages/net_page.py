@@ -1,6 +1,7 @@
 """Вкладка «Сеть»: журнал, фильтр, разрешение доменов, сеансы."""
 
 from ...core.consts import DOMAIN_RE, NET_LABELS, NET_MODES
+from ...core.diagnose import diagnose_claude
 from ...core.netlog import LogTail, NetSummary, clear_net_log, filter_net_log, format_event, human_size, net_log_path
 from ...core.sessions import list_sessions
 from ..gtk import Gtk
@@ -33,7 +34,9 @@ class NetPageMixin:
         b_clear_sel.connect("clicked", self.on_clear_selected)
         b_clear = Gtk.Button(label="Очистить весь журнал")
         b_clear.connect("clicked", self.on_clear_log)
-        for b in (b_all, b_none, b_allow, b_clear_sel, b_clear):
+        b_diag = Gtk.Button(label="Почему Claude зависает?")
+        b_diag.connect("clicked", self.on_claude_diag)
+        for b in (b_all, b_none, b_allow, b_clear_sel, b_clear, b_diag):
             buttons.append(b)
         self.tv_events, sw = text_area(editable=False, height=120)
         buf = self.tv_events.get_buffer()
@@ -133,6 +136,23 @@ class NetPageMixin:
                   ", ".join(valid[:12]) + (" …" if len(valid) > 12 else "") + more +
                   "\n\nРежим сети переключён на «только разрешённые домены». "
                   "Изменение вступит в силу при следующем запуске среды.")
+
+    def on_claude_diag(self, *_):
+        """Разбор журнала шлюза и записей Claude за последние часы: обрывы, зависшие туннели, лимит жизни туннеля."""
+        if not self.current:
+            alert(self, "Выберите среду")
+            return
+        name = self.current.name
+        self.status(f"Разбираю журнал среды «{name}»…")
+
+        def done(res):
+            if isinstance(res, Exception):
+                alert(self, "Не удалось разобрать журнал", str(res))
+                return
+            self.status("Диагностика готова")
+            self.show_report(f"Почему Claude зависает: «{name}»", res)
+
+        self.run_async(lambda: diagnose_claude(name), done)
 
     def on_clear_selected(self, *_):
         hosts = self.selected_hosts()

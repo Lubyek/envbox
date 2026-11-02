@@ -6,6 +6,8 @@
 проверки канал, у которого «остыл» таймер, снова стоил бы первому же соединению весь тайм-аут подключения.
 Уже открытые соединения не переносятся (TLS-поток нельзя пересадить на другой канал): они доживают на прежнем."""
 
+import time
+
 from ..lazy import asyncio
 
 
@@ -14,6 +16,11 @@ PROBE_EVERY = 5.0
 
 
 PROBE_TIMEOUT = 8.0
+
+
+# Упавший канал возвращается в строй не раньше чем через столько секунд: проба на example.com может проходить даже тогда,
+# когда рабочие соединения к Claude не идут, и без паузы канал «мигал» бы
+RESTORE_AFTER = 30.0
 
 
 PROBE_TARGET = ("example.com", 443)
@@ -32,6 +39,7 @@ class Channel:
         self.name, self.kind = name, kind
         self.upstream = upstream      # Upstream (для vpn появляется после запуска клиента); None у direct
         self.client = client          # VpnClient или None
+        self.down_at = 0.0            # когда упал (монотонное время)
         self.down = False             # упал: пропускается, пока проверка в фоне не подтвердит, что он снова отвечает
         self.error = ""               # почему упал последний раз
         self.broken = False           # не запустился совсем (нет программы, плохой конфиг): не пробуем
@@ -66,6 +74,8 @@ class Chain:
         """Канал не отвечает. Возвращает True, если до этого он считался исправным (стоит записать в журнал)."""
         was_up = not ch.down
         ch.down, ch.error = True, reason
+        if was_up:
+            ch.down_at = time.monotonic()
         return was_up
 
     @staticmethod

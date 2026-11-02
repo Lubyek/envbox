@@ -38,7 +38,7 @@ import time
 
 # ---- version.py: Версия envbox (строка читается регулярным выражением при установке — не менять формат).
 
-ENVBOX_VERSION = "2026.11.02.15"
+ENVBOX_VERSION = "2026.11.02.16"
 
 
 # ---- lazy.py: Ленивые модули стандартной библиотеки: настоящий import происходит при первом обращении к атрибуту.
@@ -104,7 +104,13 @@ MAX_SETUPS = 8
 # Клиент отправил запрос, а ответа нет столько секунд: туннель мёртв (прокси бросил соединение молча или сменил адрес).
 # Без этого приложение ждёт свой огромный тайм-аут (у Claude минуты), а на экране «думает» без конца. Применяется только
 # к «горячим» сайтам (Claude): у стриминговых ответов приходят хотя бы пинги, а ответ дольше этого срока — аномалия.
-STALL_TIMEOUT = 75
+STALL_TIMEOUT = 45
+
+
+# К «горячим» сайтам: и стрим, замолчавший посреди ответа (ни байта в обе стороны), мёртв. Сервер Claude присылает хотя бы
+# пинги; обычный лимит простоя (3 минуты) для этого слишком долог. Это не касается простаивающих keep-alive: их и так
+# закрывает сервер примерно через минуту.
+HOT_IDLE = 90
 
 
 BUF = 64 * 1024
@@ -594,6 +600,11 @@ PROBE_EVERY = 5.0
 PROBE_TIMEOUT = 8.0
 
 
+# Упавший канал возвращается в строй не раньше чем через столько секунд: проба на example.com может проходить даже тогда,
+# когда рабочие соединения к Claude не идут, и без паузы канал «мигал» бы
+RESTORE_AFTER = 30.0
+
+
 PROBE_TARGET = ("example.com", 443)
 
 
@@ -610,6 +621,7 @@ class Channel:
         self.name, self.kind = name, kind
         self.upstream = upstream      # Upstream (для vpn появляется после запуска клиента); None у direct
         self.client = client          # VpnClient или None
+        self.down_at = 0.0            # когда упал (монотонное время)
         self.down = False             # упал: пропускается, пока проверка в фоне не подтвердит, что он снова отвечает
         self.error = ""               # почему упал последний раз
         self.broken = False           # не запустился совсем (нет программы, плохой конфиг): не пробуем
@@ -644,6 +656,8 @@ class Chain:
         """Канал не отвечает. Возвращает True, если до этого он считался исправным (стоит записать в журнал)."""
         was_up = not ch.down
         ch.down, ch.error = True, reason
+        if was_up:
+            ch.down_at = time.monotonic()
         return was_up
 
     @staticmethod
@@ -1842,6 +1856,15 @@ class WarmPool:
                     continue
                 self.spawn(self.fill(key, make))
 
+    def flush(self, label, pause=WARM_RETRY * 3):
+        """Прокси `label` подвёл (запрос без ответа): запасные туннели к нему, скорее всего, тоже мёртвые. Закрываем их и на
+        `pause` секунд прекращаем пополнение: ближайшие соединения пойдут обычным путём и быстро покажут, жив ли прокси."""
+        for key in [k for k in self.pool if k[0] == label]:
+            for entry in self.pool.pop(key, []):
+                entry[2].close()
+        for key in [k for k in self.makers if k[0] == label]:
+            self.backoff[key] = self.clock() + pause
+
     def close_all(self):
         for task in list(self.tasks):
             task.cancel()
@@ -1950,7 +1973,7 @@ class OpenFailed(OSError):
 class Proxy:
     def __init__(self, log_path, allow, allow_private, upstream=None, dns=None, direct=None,
                  idle=IDLE_TIMEOUT, hedge=HEDGE_DELAY, max_hedges=MAX_HEDGES, max_setups=MAX_SETUPS, chain=None,
-                 accel=True, hot=(), stall=STALL_TIMEOUT):
+                 accel=True, hot=(), stall=STALL_TIMEOUT, hot_idle=HOT_IDLE):
         self.log_path = log_path
         self.setups = SetupGate(max_setups)   # одновременные установки туннеля к вышестоящему прокси (лимит подстраивается)
         self.max_hedges = max_hedges
@@ -1969,6 +1992,7 @@ class Proxy:
         self.warm = WarmPool() if accel else None
         self.hot = tuple(hot)
         self.stall = stall if accel else 0
+        self.hot_idle = (min(idle, hot_idle) if idle else 0) if accel else idle
         self.setup_ewma = None       # скользящее среднее времени установки туннеля, секунд
         # сайты, к которым прокси подключается сам, минуя вышестоящий прокси (некоторые сайты не пускают его адрес)
         self.direct = [a.lower().rstrip(".") for a in (direct or [])]
@@ -2073,9 +2097,10 @@ class Proxy:
             raise error
         return winner
 
-    async def pipe(self, cr, cw, ur, uw, first, stall=0):
+    async def pipe(self, cr, cw, ur, uw, first, stall=0, idle=None):
         """Пересылка в обе стороны. Возвращает (отправлено, получено, кто_закончил, метки времени в мс):
         кто_закончил — «client», «upstream» или «idle»."""
+        idle = self.idle if idle is None else idle
         counts = {"up": len(first), "down": 0}
         started = last_t = time.monotonic()
         last = [last_t]
@@ -2113,11 +2138,11 @@ class Proxy:
                     pass
 
         async def watch():
-            step = max(0.05, min(5.0, min(t for t in (self.idle, stall) if t) / 4))
+            step = max(0.05, min(5.0, min(t for t in (idle, stall) if t) / 4))
             while True:
                 await asyncio.sleep(step)
                 t = time.monotonic()
-                if self.idle and t - last[0] > self.idle:
+                if idle and t - last[0] > idle:
                     stalled[0] = "idle"
                 elif stall and mark["up"] > mark["down"] and t - mark["up"] > stall:
                     stalled[0] = "stall"          # клиент ждёт ответа, а его нет: туннель мёртв, пусть повторит запрос
@@ -2127,7 +2152,7 @@ class Proxy:
                     w.close()      # оба копировщика получат конец потока и завершатся
                 return
 
-        watcher = asyncio.ensure_future(watch()) if (self.idle or stall) else None
+        watcher = asyncio.ensure_future(watch()) if (idle or stall) else None
         try:
             # одна сторона упала неожиданной ошибкой — вторая всё равно доводится до конца, а не остаётся висеть
             await asyncio.gather(copy(cr, uw, "up"), copy(ur, cw, "down"), return_exceptions=True)
@@ -2243,6 +2268,16 @@ class Proxy:
                 up = ch.upstream
                 self.warm.want((up.label, host, 443), lambda up=up, host=host: self.warm_tunnel(up, host, 443))
 
+    def on_dead_tunnel(self, chan, up, host, port):
+        """Туннель к Claude замолчал (запрос без ответа или стрим оборвался тишиной). Запас готовых туннелей к этому
+        прокси сбрасывается, а при нескольких каналах цепочки новые соединения сразу идут через запасной."""
+        if self.warm is not None and up is not None:
+            self.warm.flush(up.label)
+        if chan is not None and len(self.chain.channels) > 1 and self.chain.failed(chan, "запрос без ответа"):
+            nxt = next((c for c in self.chain.order() if c is not chan), None)
+            self.write({"event": "channel", "state": "down", "channel": chan.label, "reason": "запрос без ответа",
+                        **({"next": nxt.label} if nxt else {})})
+
     async def warm_tunnel(self, up, host, port):
         """Запасной туннель для пула: открывается так же, как обычный, и занимает ту же очередь установок."""
         async with self.setups:
@@ -2264,7 +2299,8 @@ class Proxy:
         while True:
             await asyncio.sleep(PROBE_EVERY)
             for ch in self.chain.channels:
-                if ch.down and not ch.broken and await probe(ch) and self.chain.worked(ch):
+                if (ch.down and not ch.broken and time.monotonic() - ch.down_at >= RESTORE_AFTER
+                        and await probe(ch) and self.chain.worked(ch)):
                     self.write({"event": "channel", "state": "up", "channel": ch.label})
 
     def begin(self):
@@ -2340,6 +2376,7 @@ class Proxy:
                 await self.deny(writer, rec, 403, "not-in-allowlist", "Forbidden by envbox allowlist")
                 return
 
+            chan = None
             tunnel, used = True, None     # used — Upstream, через который идёт соединение (нужен для обычного HTTP)
             if self.via_upstream(host):
                 if not self.allow_private and is_private_name(host):
@@ -2403,8 +2440,11 @@ class Proxy:
                         headers.append(f"Proxy-Authorization: {used.basic()}")
                 req = f"{method} {target_line} HTTP/1.1\r\n" + "".join(h + "\r\n" for h in headers)
                 first = (req + ("" if websocket else "Connection: close\r\n") + "\r\n").encode("latin-1")
-            hot_stall = self.stall if (self.warm is not None and is_hot(host, self.hot)) else 0
-            up, down, end, timing = await self.pipe(reader, writer, ur, upstream, first, hot_stall)
+            hot = self.warm is not None and is_hot(host, self.hot)
+            up, down, end, timing = await self.pipe(reader, writer, ur, upstream, first, self.stall if hot else 0,
+                                                    self.hot_idle if hot else None)
+            if hot and (end == "stall" or (end == "idle" and up > 1000)):    # замолчал после того, как клиент что-то отправил
+                self.on_dead_tunnel(chan, used, host, port)
             self.write({"id": cid, "event": "close", "host": host, "port": port,
                         "up": up, "down": down, "ms": int((time.monotonic() - t0) * 1000), "end": end,
                         **timing, **({"idle": True} if end == "idle" else {})})
@@ -2798,6 +2838,7 @@ import urllib.parse
 from dataclasses import asdict
 from dataclasses import dataclass
 from dataclasses import dataclass, field, fields
+from datetime import datetime
 
 
 # ---- resources.py: Встроенные ресурсы (envbox.sh, значки, CSS…): файлы из resources/; в собранном envbox.py они вшиты строками.
@@ -8509,91 +8550,6 @@ def describe(p):
     return out
 
 
-# ---- core/diagnostics.py: Диагностика: что есть на компьютере для работы envbox.
-
-def diagnostics(settings=None):
-    """Список (статус, заголовок, подробности); статус: ok | warn | fail."""
-    res = []
-
-    def add(st, title, detail=""):
-        res.append((st, title, detail))
-
-    for path, label in ((ENVBOX_SH, "envbox.sh"), (ENVBOX_NET, "envbox.py")):
-        if os.path.isfile(path):
-            add("ok" if os.access(path, os.X_OK) or path == ENVBOX_NET else "fail",
-                f"{label} найден", path)
-        else:
-            add("fail", f"{label} не найден", "запустите: python3 envbox.py install")
-
-    bwrap = shutil.which("bwrap")
-    if not bwrap:
-        add("fail", "bwrap не установлен", pkg_hint("bubblewrap"))
-    else:
-        real = os.path.realpath(bwrap)
-        ver = subprocess.run([real, "--version"], capture_output=True, text=True).stdout.strip()
-        ver = ver.splitlines()[0] if ver else ""
-        add("ok", f"bwrap: {ver or 'версия неизвестна'}", real)
-        if os.stat(real).st_mode & 0o4000:
-            add("fail", "bwrap установлен с setuid-битом", "envbox работает только с bwrap без setuid")
-        helptext = subprocess.run([real, "--help"], capture_output=True, text=True)
-        helptext = helptext.stdout + helptext.stderr
-        if "--disable-userns" in helptext:
-            add("ok", "поддерживается --disable-userns")
-        else:
-            add("warn", "нет --disable-userns", "нужен bwrap >= 0.8: вложенные userns не запрещаются")
-        probe = subprocess.run([real, "--unshare-user", "--ro-bind", "/", "/", "--", "/usr/bin/true"],
-                               capture_output=True, text=True)
-        if probe.returncode == 0:
-            add("ok", "user namespaces работают")
-        else:
-            detail = probe.stderr.strip()
-            try:
-                with open("/proc/sys/kernel/apparmor_restrict_unprivileged_userns") as f:
-                    if f.read().strip() == "1":
-                        detail += ("\nAppArmor ограничивает userns. Запустите envbox.sh из терминала: "
-                                   "он напечатает профиль AppArmor только для bwrap.")
-            except OSError:
-                pass
-            add("fail", "bwrap не может создать user namespace", detail)
-
-    try:
-        with open("/proc/sys/dev/tty/legacy_tiocsti") as f:
-            v = f.read().strip()
-        add("ok", f"dev.tty.legacy_tiocsti = {v}",
-            "TIOCSTI запрещён ядром" if v == "0" else "защита от TIOCSTI — через --new-session")
-    except OSError:
-        add("ok", "legacy_tiocsti недоступен", "защита от TIOCSTI — через --new-session")
-
-    browser = find_browser()
-    if browser:
-        real = os.path.realpath(browser)
-        try:
-            ver = subprocess.run([browser, "--version"], capture_output=True, text=True,
-                                 stdin=subprocess.DEVNULL, timeout=15).stdout.strip()
-        except (OSError, subprocess.SubprocessError):
-            ver = ""
-        if real.startswith(("/snap/", "/var/lib/flatpak/")):
-            add("fail", f"браузер: {browser}", "snap/flatpak-версия не подходит для изолированной среды")
-        else:
-            add("ok", f"браузер: {ver or browser}", real)
-    else:
-        add("warn", "Chrome/Chromium не найден", "нужен только для сред-браузеров: "
-            + pkg_hint("chromium"))
-    add("ok" if os.access("/usr/bin/python3", os.X_OK) else "fail",
-        "/usr/bin/python3" + ("" if os.access("/usr/bin/python3", os.X_OK) else " не найден"),
-        "нужен для сетевого журнала")
-    if secret_tool_available():
-        add("ok", "secret-tool найден", "секреты хранятся в системном keyring")
-    else:
-        add("warn", "secret-tool не найден", "для секретов: " + pkg_hint("secret-tool"))
-    term = detect_terminal(settings)
-    if term:
-        add("ok", "терминал: " + shlex.join(term))
-    else:
-        add("fail", "терминал не найден", "укажите команду терминала в настройках, например 'xterm -e'")
-    return res
-
-
 # ---- core/netlog.py: Журнал сети среды: чтение с хвоста, сводка, очистка.
 
 # --------------------------------------------------------- сетевой журнал
@@ -8724,6 +8680,265 @@ def clear_net_log(name):
     if os.path.exists(p):
         with open(p, "w"):
             pass
+
+
+# ---- core/diagnose.py: Диагностика «Claude зависает»: что показывает сетевой журнал шлюза и записи самого Claude об ошибках.
+
+# Сколько секунд соединению разрешено «жить», чтобы считаться оборванным по лимиту поставщика
+CAP_RANGE = (58000, 66000)
+
+
+# Сколько соединений, оборванных в одну секунду, считается «разом»
+MASS_DROP = 4
+
+
+ERR_RE = re.compile(
+    r"(API Error: [^\"\\\n]{0,140}|Request timed out[^\"\\\n]{0,60}|Connection error[^\"\\\n]{0,60}|ECONNRESET|"
+    r"ETIMEDOUT|EPIPE|socket hang up|Premature close|overloaded_error|rate_limit_error|authentication_error|"
+    r"Unable to connect[^\"\\\n]{0,60}|[Rr]etrying in \d+ seconds[^\"\\\n]{0,40}|stream (?:ended|closed)[^\"\\\n]{0,60})")
+
+
+def parse_ts(text):
+    try:
+        return datetime.fromisoformat(text).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def read_events(path, since):
+    """События журнала не старше `since` (секунды с начала эпохи); битые строки пропускаются."""
+    import json
+    out = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if '"host"' not in line and '"channel"' not in line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                ts = parse_ts(e.get("ts"))
+                if ts is not None and ts >= since:
+                    e["_t"] = ts
+                    out.append(e)
+    except OSError:
+        pass
+    return out
+
+
+def pct(values, q):
+    values = sorted(values)
+    return values[min(len(values) - 1, int(len(values) * q))] if values else 0
+
+
+def analyze(events, hours):
+    """Выводы по событиям журнала: [(уровень, текст)] и числа для отчёта."""
+    hot_open = [e for e in events if e.get("event") == "open" and e.get("host") and is_hot(e["host"])]
+    hot_close = [e for e in events if e.get("event") == "close" and e.get("host") and is_hot(e["host"])]
+    out = []
+    if not hot_close and not hot_open:
+        return [("warn", f"в журнале за последние {hours:g} ч нет соединений с сайтами Claude. Проверьте, что среда "
+                         "запущена в режиме «через журнал» и приложение работало в это время")], {}
+    stats = {"connections": len(hot_open), "warm": sum(1 for e in hot_open if e.get("warm"))}
+    setups = [e["setup_ms"] for e in hot_open if e.get("setup_ms") is not None]
+    ends = {}
+    for e in hot_close:
+        ends[e.get("end", "?")] = ends.get(e.get("end", "?"), 0) + 1
+    stats["ends"] = ends
+    out.append(("ok" if hot_open else "warn",
+                f"соединений к сайтам Claude: {len(hot_open)}, из них взяли готовый туннель {stats['warm']}"
+                + (f"; обычная установка туннеля: медиана {pct(setups, 0.5)} мс, 95% — {pct(setups, 0.95)} мс" if setups else "")))
+    # 1) оборваны на ~60-й секунде посреди передачи (данные шли до самого обрыва)
+    capped = [e for e in hot_close if e.get("end") == "upstream" and CAP_RANGE[0] <= e.get("ms", 0) <= CAP_RANGE[1]]
+    active = [e for e in capped if e.get("ms", 0) - e.get("down_last", 0) < 4000 and e.get("down", 0) > 8000]
+    idle = [e for e in capped if e not in active]
+    if len(active) >= 2:
+        out.append(("bad", f"{len(active)} соединений оборваны вышестоящим прокси на {CAP_RANGE[0] // 1000}–{CAP_RANGE[1] // 1000}-й "
+                           "секунде прямо посреди передачи данных: у вашего прокси жёсткий лимит жизни туннеля (около минуты). "
+                           "Ответ Claude, идущий дольше этого срока, обрывается и запрашивается заново, поэтому «думает» без "
+                           "конца. Лечится у поставщика (долгие сессии, другой порт или протокол) или сменой прокси"))
+    if idle:
+        out.append(("ok", f"{len(idle)} соединений закрыты на ~60-й секунде, когда уже не было данных: это обычное закрытие "
+                          "простаивающих keep-alive-соединений, вреда нет"))
+    # 2) обрывы разом
+    by_sec = {}
+    for e in hot_close:
+        if e.get("end") == "upstream":
+            by_sec.setdefault(int(e["_t"]), []).append(e)
+    bursts = {s: v for s, v in by_sec.items() if len(v) >= MASS_DROP and any(x.get("ms", 0) < CAP_RANGE[0] or x.get("down", 0) > 8000 for x in v)}
+    if bursts:
+        worst = max(bursts.items(), key=lambda kv: len(kv[1]))
+        when = datetime.fromtimestamp(worst[0]).strftime("%H:%M:%S")
+        out.append(("bad", f"{len(bursts)} раз(а) прокси обрывал сразу много соединений в одну секунду (больше всего — "
+                           f"{len(worst[1])} в {when}). Так бывает, когда прокси или его выходной адрес «моргают» разом: "
+                           "тогда зависают все чаты одновременно. Сверьте время с зависаниями; лечится сменой прокси или "
+                           "цепочкой с запасным каналом (VPN)"))
+    # 3) запрос ушёл, ответа нет
+    silent = [e for e in hot_close if e.get("up", 0) >= 20000 and e.get("down", 0) <= 7000 and e.get("ms", 0) >= 30000]
+    if silent:
+        out.append(("bad", f"{len(silent)} запросов (от 20 КБ) отправлены, а ответа нет совсем ({sorted(e['ms'] for e in silent)[len(silent) // 2] // 1000} с "
+                           "ожидания в среднем): туннель принимает данные, но сервер или прокси не отвечает"))
+    stalls = ends.get("stall", 0)
+    if stalls:
+        out.append(("warn", f"шлюз сам оборвал {stalls} зависших туннелей (запрос без ответа дольше срока): приложение при этом "
+                            "повторяет запрос"))
+    # 4) долгие ответы
+    long_resp = [e.get("down_last", 0) - e.get("up_end", 0) for e in hot_close if e.get("down", 0) > 8000 and e.get("down_last") and e.get("up_end") is not None]
+    if long_resp:
+        longest = max(long_resp) / 1000
+        out.append(("warn" if longest > 55 else "ok",
+                    f"самый долгий ответ шёл {longest:.0f} с; дольше 20 с: {sum(1 for x in long_resp if x > 20000)} из {len(long_resp)}"
+                    + (" (это дольше лимита туннеля в минуту: такие ответы рискуют обрываться)" if longest > 55 else "")))
+    # 5) медленная отправка
+    slow_up = [e for e in hot_close if e.get("up", 0) >= 100000 and e.get("up_end", 0) > 0 and e["up"] / (e["up_end"] / 1000) < 100000]
+    if slow_up:
+        out.append(("warn", f"{len(slow_up)} крупных запросов (от 100 КБ) уходили медленнее 100 КБ/с: исходящий канал прокси "
+                            "узкий, большой контекст отправляется секундами"))
+    # 6) каналы
+    flips = [e for e in events if e.get("event") == "channel" and e.get("state") in ("down", "up")]
+    if flips:
+        out.append(("warn", f"каналы выхода переключались {len(flips)} раз(а): смотрите события «КАНАЛ» в журнале сети"))
+    if not any(lvl in ("bad", "warn") for lvl, _t in out[1:]):
+        out.append(("ok", "в журнале шлюза нет признаков зависших или оборванных туннелей за этот период: если Claude в это "
+                          "время зависал, смотрите записи самого Claude ниже"))
+    return out, stats
+
+
+def claude_errors(home, since, max_files=20, tail=1_500_000):
+    """Ошибки в записях Claude внутри среды: {текст: сколько раз}. Содержимое переписки не читается и не выводится."""
+    root = os.path.join(home, ".claude")
+    files = []
+    for base, _dirs, names in os.walk(root):
+        for n in names:
+            p = os.path.join(base, n)
+            if n.endswith((".jsonl", ".log")):
+                try:
+                    mt = os.path.getmtime(p)
+                except OSError:
+                    continue
+                if mt >= since:
+                    files.append((mt, p))
+    counts = {}
+    for _mt, p in sorted(files, reverse=True)[:max_files]:
+        try:
+            with open(p, "rb") as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - tail))
+                text = f.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        for m in ERR_RE.finditer(text):
+            key = re.sub(r"\d+", "N", m.group(1)).strip()[:120]
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def diagnose_claude(name, hours=3.0, now=None):
+    """Отчёт «почему Claude зависает» по среде `name` за последние `hours` часов (строка)."""
+    now = now or time.time()
+    since = now - hours * 3600
+    events = read_events(net_log_path(name), since)
+    findings, _stats = analyze(events, hours)
+    mark = {"ok": "✔", "warn": "⚠", "bad": "✖"}
+    lines = [f"Среда «{name}», последние {hours:g} ч", "", "Сетевой журнал шлюза:"]
+    lines += [f"  {mark[lvl]} {t}" for lvl, t in findings]
+    errs = claude_errors(os.path.join(box_dir(name), "home"), since)
+    lines += ["", "Записи самого Claude об ошибках (без содержимого переписки):"]
+    if errs:
+        top = sorted(errs.items(), key=lambda kv: -kv[1])[:8]
+        lines += [f"  ⚠ {n} × {t}" for t, n in top]
+    else:
+        lines.append("  ✔ ошибок связи в записях Claude не найдено (или записей нет: среда не запускалась, или Claude пишет их в другое место)")
+    lines += ["", "Что делать: воспроизведите зависание, затем откройте этот отчёт сразу и пришлите его. Если в журнале "
+                  "есть обрывы разом или на ~60-й секунде, причина в прокси; если обрывов нет, а чаты висят, "
+                  "дело не в сети шлюза."]
+    return "\n".join(lines)
+
+
+# ---- core/diagnostics.py: Диагностика: что есть на компьютере для работы envbox.
+
+def diagnostics(settings=None):
+    """Список (статус, заголовок, подробности); статус: ok | warn | fail."""
+    res = []
+
+    def add(st, title, detail=""):
+        res.append((st, title, detail))
+
+    for path, label in ((ENVBOX_SH, "envbox.sh"), (ENVBOX_NET, "envbox.py")):
+        if os.path.isfile(path):
+            add("ok" if os.access(path, os.X_OK) or path == ENVBOX_NET else "fail",
+                f"{label} найден", path)
+        else:
+            add("fail", f"{label} не найден", "запустите: python3 envbox.py install")
+
+    bwrap = shutil.which("bwrap")
+    if not bwrap:
+        add("fail", "bwrap не установлен", pkg_hint("bubblewrap"))
+    else:
+        real = os.path.realpath(bwrap)
+        ver = subprocess.run([real, "--version"], capture_output=True, text=True).stdout.strip()
+        ver = ver.splitlines()[0] if ver else ""
+        add("ok", f"bwrap: {ver or 'версия неизвестна'}", real)
+        if os.stat(real).st_mode & 0o4000:
+            add("fail", "bwrap установлен с setuid-битом", "envbox работает только с bwrap без setuid")
+        helptext = subprocess.run([real, "--help"], capture_output=True, text=True)
+        helptext = helptext.stdout + helptext.stderr
+        if "--disable-userns" in helptext:
+            add("ok", "поддерживается --disable-userns")
+        else:
+            add("warn", "нет --disable-userns", "нужен bwrap >= 0.8: вложенные userns не запрещаются")
+        probe = subprocess.run([real, "--unshare-user", "--ro-bind", "/", "/", "--", "/usr/bin/true"],
+                               capture_output=True, text=True)
+        if probe.returncode == 0:
+            add("ok", "user namespaces работают")
+        else:
+            detail = probe.stderr.strip()
+            try:
+                with open("/proc/sys/kernel/apparmor_restrict_unprivileged_userns") as f:
+                    if f.read().strip() == "1":
+                        detail += ("\nAppArmor ограничивает userns. Запустите envbox.sh из терминала: "
+                                   "он напечатает профиль AppArmor только для bwrap.")
+            except OSError:
+                pass
+            add("fail", "bwrap не может создать user namespace", detail)
+
+    try:
+        with open("/proc/sys/dev/tty/legacy_tiocsti") as f:
+            v = f.read().strip()
+        add("ok", f"dev.tty.legacy_tiocsti = {v}",
+            "TIOCSTI запрещён ядром" if v == "0" else "защита от TIOCSTI — через --new-session")
+    except OSError:
+        add("ok", "legacy_tiocsti недоступен", "защита от TIOCSTI — через --new-session")
+
+    browser = find_browser()
+    if browser:
+        real = os.path.realpath(browser)
+        try:
+            ver = subprocess.run([browser, "--version"], capture_output=True, text=True,
+                                 stdin=subprocess.DEVNULL, timeout=15).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            ver = ""
+        if real.startswith(("/snap/", "/var/lib/flatpak/")):
+            add("fail", f"браузер: {browser}", "snap/flatpak-версия не подходит для изолированной среды")
+        else:
+            add("ok", f"браузер: {ver or browser}", real)
+    else:
+        add("warn", "Chrome/Chromium не найден", "нужен только для сред-браузеров: "
+            + pkg_hint("chromium"))
+    add("ok" if os.access("/usr/bin/python3", os.X_OK) else "fail",
+        "/usr/bin/python3" + ("" if os.access("/usr/bin/python3", os.X_OK) else " не найден"),
+        "нужен для сетевого журнала")
+    if secret_tool_available():
+        add("ok", "secret-tool найден", "секреты хранятся в системном keyring")
+    else:
+        add("warn", "secret-tool не найден", "для секретов: " + pkg_hint("secret-tool"))
+    term = detect_terminal(settings)
+    if term:
+        add("ok", "терминал: " + shlex.join(term))
+    else:
+        add("fail", "терминал не найден", "укажите команду терминала в настройках, например 'xterm -e'")
+    return res
 
 
 # ---- core/vpncheck.py: Проверка выхода в интернет (VPN, прокси, этот компьютер) с точки зрения Claude.
@@ -11704,7 +11919,9 @@ def _build_gui():
             b_clear_sel.connect("clicked", self.on_clear_selected)
             b_clear = Gtk.Button(label="Очистить весь журнал")
             b_clear.connect("clicked", self.on_clear_log)
-            for b in (b_all, b_none, b_allow, b_clear_sel, b_clear):
+            b_diag = Gtk.Button(label="Почему Claude зависает?")
+            b_diag.connect("clicked", self.on_claude_diag)
+            for b in (b_all, b_none, b_allow, b_clear_sel, b_clear, b_diag):
                 buttons.append(b)
             self.tv_events, sw = text_area(editable=False, height=120)
             buf = self.tv_events.get_buffer()
@@ -11804,6 +12021,23 @@ def _build_gui():
                       ", ".join(valid[:12]) + (" …" if len(valid) > 12 else "") + more +
                       "\n\nРежим сети переключён на «только разрешённые домены». "
                       "Изменение вступит в силу при следующем запуске среды.")
+
+        def on_claude_diag(self, *_):
+            """Разбор журнала шлюза и записей Claude за последние часы: обрывы, зависшие туннели, лимит жизни туннеля."""
+            if not self.current:
+                alert(self, "Выберите среду")
+                return
+            name = self.current.name
+            self.status(f"Разбираю журнал среды «{name}»…")
+
+            def done(res):
+                if isinstance(res, Exception):
+                    alert(self, "Не удалось разобрать журнал", str(res))
+                    return
+                self.status("Диагностика готова")
+                self.show_report(f"Почему Claude зависает: «{name}»", res)
+
+            self.run_async(lambda: diagnose_claude(name), done)
 
         def on_clear_selected(self, *_):
             hosts = self.selected_hosts()

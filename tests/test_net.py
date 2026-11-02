@@ -1068,6 +1068,67 @@ class Acceleration(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(len(got), 6)                             # пинги шли дольше срока, а стрим не оборван
         w.close()
 
+    async def test_stream_that_goes_silent_is_cut_for_claude_only(self):
+        # ответ начался и замолчал посреди стрима (туннель замёрз): для Claude это 90 с, а не 3 минуты
+        pings = FakeUpstream(mode="pings")                              # шлёт точки 1,5 с, потом тишина
+        up = await pings.start()
+        self.addCleanup(pings.srv.close)
+        proxy, path = await self.start(up, hot=(self.HOT,), stall=0, idle=5.0, hot_idle=0.6)
+        _t, r, w = await self.connect(path, self.HOT)
+        w.write(b"q")
+        await w.drain()
+        got = b""
+        while True:
+            chunk = await asyncio.wait_for(r.read(100), 4)
+            if not chunk:
+                break
+            got += chunk
+        self.assertIn(b".", got)                                         # стрим шёл, потом замолчал и был закрыт шлюзом
+        w.close()
+
+    async def test_dead_claude_tunnel_flushes_the_pool_and_switches_channel(self):
+        from envbox.net.chain import Chain, Channel
+        silent = FakeUpstream(mode="silent")
+        good = FakeUpstream(mode="echo")
+        up_a, up_b = await silent.start(), await good.start()
+        self.addCleanup(silent.srv.close)
+        self.addCleanup(good.srv.close)
+        a, b = Channel("a", "proxy", up_a), Channel("b", "proxy", up_b)
+        proxy, server, path = await start_proxy(self.tmp, chain=Chain([a, b]), hot=(self.HOT,), stall=0.4, idle=0)
+        self.addCleanup(proxy.log.close)
+        self.addCleanup(server.close)
+        proxy.begin()
+        self.addCleanup(proxy.end)
+        _t, r, w = await self.connect(path, self.HOT)                    # идёт через первый канал, который молчит
+        w.write(b"request")
+        await w.drain()
+        self.assertEqual(await asyncio.wait_for(r.read(100), 3), b"")     # шлюз оборвал за ~0,4 с
+        w.close()
+        await asyncio.sleep(0.2)
+        self.assertTrue(a.down)                                          # канал помечен упавшим сразу, без ожидания
+        self.assertEqual(proxy.chain.order()[0], b)                      # новые соединения идут через запасной
+        _t, r, w = await self.connect(path, self.HOT)
+        w.write(b"hi")
+        await w.drain()
+        self.assertEqual(await asyncio.wait_for(r.read(100), 3), b"e:hi")
+        w.close()
+        states = [e for e in map(json.loads, open(os.path.join(self.tmp, "net.log"), encoding="utf-8"))
+                  if e.get("event") == "channel" and e.get("state") == "down"]
+        self.assertTrue(states and states[0]["reason"] == "запрос без ответа")
+        self.assertFalse(any(k[0] == up_a.label for k in proxy.warm.pool if proxy.warm.pool[k]))   # запас того канала сброшен
+
+    def test_channel_returns_only_after_a_pause(self):
+        from envbox.net.chain import Channel, Chain
+        import envbox.net.chain as chain_mod
+        ch = Channel("a", "proxy", Upstream("http://127.0.0.1:9"))
+        chain = Chain([ch])
+        self.assertTrue(chain.failed(ch, "x"))
+        self.assertGreater(ch.down_at, 0)
+        before = ch.down_at
+        self.assertFalse(chain.failed(ch, "y"))                          # повторный отказ время падения не сдвигает
+        self.assertEqual(ch.down_at, before)
+        self.assertGreater(chain_mod.RESTORE_AFTER, 5)                   # пауза есть: проба на example.com не должна мигать каналом
+
     def test_tcp_tuning_never_breaks_a_socket(self):
         from envbox.net.common import congestion_control, tune_socket
         self.assertTrue(congestion_control())
@@ -1141,6 +1202,9 @@ class ChainTests(unittest.IsolatedAsyncioTestCase):
         old = proxy_mod.PROBE_EVERY
         proxy_mod.PROBE_EVERY = 0.1
         self.addCleanup(setattr, proxy_mod, "PROBE_EVERY", old)
+        old_restore = proxy_mod.RESTORE_AFTER
+        proxy_mod.RESTORE_AFTER = 0.0                                    # пауза возврата проверяется отдельным тестом
+        self.addCleanup(setattr, proxy_mod, "RESTORE_AFTER", old_restore)
         proxy.begin()
         a_srv = None
         try:
@@ -2210,6 +2274,72 @@ class ProxyStore(unittest.TestCase):
         ok, text = test_proxy("proxy-1")                                         # 1.1.1.1:81 недоступен
         self.assertEqual(ok, False)
         self.assertFalse(test_proxy("нет-такого")[0])
+
+
+class ClaudeDiagnostics(unittest.TestCase):
+    def ev(self, t, **kw):
+        from datetime import datetime
+        return {"ts": datetime.fromtimestamp(t).astimezone().isoformat(timespec="seconds"), "_t": float(int(t)), **kw}
+
+    def close(self, t, host="api.anthropic.com", **kw):
+        return self.ev(t, event="close", host=host, port=443, **{"up": 6000, "down": 5400, "ms": 1000, "end": "client", **kw})
+
+    def test_every_symptom_is_recognised_and_named(self):
+        from envbox.core.diagnose import analyze
+        now = 1_800_000_000
+        events = [self.ev(now - 100, event="open", host="api.anthropic.com", port=443, warm=True),
+                  self.ev(now - 100, event="open", host="api.anthropic.com", port=443, setup_ms=420)]
+        # лимит жизни туннеля: оборваны на 60-й секунде, пока данные ещё шли
+        events += [self.close(now - 50 + i * 7, up=9000, down=300000, ms=60400, down_last=60100, end="upstream") for i in range(3)]
+        # простаивающие keep-alive на той же секунде: не вред
+        events += [self.close(now - 40 + i * 7, ms=63300, down_last=1300, end="upstream") for i in range(3)]
+        # обрыв разом: шесть соединений в одну секунду, часть недолгих
+        events += [self.close(now - 20, ms=12000, down=40000, end="upstream", down_last=11000) for _ in range(6)]
+        # запрос ушёл, ответа нет
+        events += [self.close(now - 10, up=400009, down=4864, ms=63000, end="upstream", up_end=500, down_last=1800)]
+        events += [self.close(now - 9, end="stall", ms=45000, up=5000, down=100)]
+        findings, stats = analyze(events, 3)
+        text = "\n".join(t for _l, t in findings)
+        for part in ("лимит жизни туннеля", "keep-alive", "сразу много соединений в одну секунду", "ответа нет совсем",
+                     "оборвал 1 зависших", "из них взяли готовый туннель 1", "медиана 420"):
+            self.assertIn(part, text)
+        self.assertEqual(sum(1 for lvl, _t in findings if lvl == "bad"), 3)
+        self.assertEqual(stats["ends"]["stall"], 1)
+
+    def test_a_quiet_log_says_so_and_no_events_is_explained(self):
+        from envbox.core.diagnose import analyze
+        now = 1_800_000_000
+        findings, _s = analyze([self.ev(now, event="open", host="api.anthropic.com", port=443, setup_ms=300),
+                                self.close(now, host="api.anthropic.com")], 3)
+        self.assertEqual(findings[-1][0], "ok")
+        self.assertIn("нет признаков", findings[-1][1])
+        findings, _s = analyze([self.close(now, host="example.org")], 3)    # не Claude
+        self.assertIn("нет соединений с сайтами Claude", findings[0][1])
+
+    def test_report_reads_the_log_and_claude_error_records(self):
+        import json as _json
+        from envbox.core.diagnose import diagnose_claude
+        d = tempfile.mkdtemp(prefix="eb")
+        self.addCleanup(shutil.rmtree, d, True)
+        now = time.time()
+        home = os.path.join(d, "x", "home", ".claude", "projects", "p")
+        os.makedirs(home)
+        os.makedirs(os.path.join(d, "x"), exist_ok=True)
+        with open(os.path.join(d, "x", "net.log"), "w", encoding="utf-8") as f:
+            for e in (self.ev(now - 60, event="open", host="api.anthropic.com", port=443),
+                      self.close(now - 30, end="upstream", ms=60500, up=9000, down=200000, down_last=60200)) * 2:
+                e = {k: v for k, v in e.items() if k != "_t"}
+                f.write(_json.dumps(e) + "\n")
+        with open(os.path.join(home, "s.jsonl"), "w", encoding="utf-8") as f:
+            f.write('{"type":"system","content":"API Error: Request timed out after 600 seconds"}\n' * 2 +
+                    '{"type":"user","message":"секретный текст переписки ECONNRESET в коде"}\n')
+        with mock.patch("envbox.core.diagnose.box_dir", side_effect=lambda n: os.path.join(d, n)), \
+                mock.patch("envbox.core.diagnose.net_log_path", side_effect=lambda n: os.path.join(d, n, "net.log")):
+            text = diagnose_claude("x", hours=1, now=now)
+        self.assertIn("лимит жизни туннеля", text)
+        self.assertIn("2 × API Error: Request timed out after N seconds", text)       # цифры сведены, текст ошибки виден
+        self.assertNotIn("секретный текст", text)                                      # переписка не выводится
+        self.assertIn("ECONNRESET", text)
 
 
 class VpnStore(unittest.TestCase):

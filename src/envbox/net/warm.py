@@ -118,6 +118,15 @@ class WarmPool:
                     continue
                 self.spawn(self.fill(key, make))
 
+    def flush(self, label, pause=WARM_RETRY * 3):
+        """Прокси `label` подвёл (запрос без ответа): запасные туннели к нему, скорее всего, тоже мёртвые. Закрываем их и на
+        `pause` секунд прекращаем пополнение: ближайшие соединения пойдут обычным путём и быстро покажут, жив ли прокси."""
+        for key in [k for k in self.pool if k[0] == label]:
+            for entry in self.pool.pop(key, []):
+                entry[2].close()
+        for key in [k for k in self.makers if k[0] == label]:
+            self.backoff[key] = self.clock() + pause
+
     def close_all(self):
         for task in list(self.tasks):
             task.cancel()

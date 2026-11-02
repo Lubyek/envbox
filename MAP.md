@@ -23,6 +23,8 @@
   describe()
 - `src/envbox/core/desktop.py` (43 стр.) — Ярлык и значок envbox в меню приложений.
   install_desktop_entry()
+- `src/envbox/core/diagnose.py` (189 стр.) — Диагностика «Claude зависает»: что показывает сетевой журнал шлюза и записи самого Claude об ошибках.
+  parse_ts(), read_events(), pct(), analyze(), claude_errors(), diagnose_claude()
 - `src/envbox/core/diagnostics.py` (95 стр.) — Диагностика: что есть на компьютере для работы envbox.
   diagnostics()
 - `src/envbox/core/fsutil.py` (50 стр.) — Файловые помощники: приватная запись, надёжное удаление, проверка вложенности путей.
@@ -75,8 +77,8 @@
   LaunchMixin (7 методов)
 - `src/envbox/gui/pages/links.py` (502 стр.) — Ссылки: очередь запросов, выбор браузера, привязка схем.
   LinksMixin (16 методов)
-- `src/envbox/gui/pages/net_page.py` (200 стр.) — Вкладка «Сеть»: журнал, фильтр, разрешение доменов, сеансы.
-  NetPageMixin (13 методов)
+- `src/envbox/gui/pages/net_page.py` (220 стр.) — Вкладка «Сеть»: журнал, фильтр, разрешение доменов, сеансы.
+  NetPageMixin (14 методов)
 - `src/envbox/gui/pages/overview.py` (162 стр.) — Страницы «Добро пожаловать» и «Обзор».
   OverviewMixin (3 методов)
 - `src/envbox/gui/pages/profile_net.py` (359 стр.) — Настройки сети среды: секрет, прокси, подключение приложений, CDP.
@@ -105,9 +107,9 @@
   _LazyModule (2 методов)
 - `src/envbox/net/bridge.py` (255 стр.) — Сетевой шлюз: мосты unix-сокет <-> localhost, канал ссылок (команды wrap, probe).
   pump(), dial_unix(), dial_tcp(), parse_port(), inbox_handle(), inbox_loop(), cmd_wrap(), cmd_probe()
-- `src/envbox/net/chain.py` (109 стр.) — Сетевой шлюз: цепочка каналов выхода (прокси, VPN-клиент, прямой выход) с переключением на запасной.
+- `src/envbox/net/chain.py` (119 стр.) — Сетевой шлюз: цепочка каналов выхода (прокси, VPN-клиент, прямой выход) с переключением на запасной.
   Channel (2 методов), Chain (8 методов), parse_chain_spec(), probe()
-- `src/envbox/net/common.py` (155 стр.) — Сетевой шлюз: общие константы и мелкие помощники (время, host:port, публичные адреса, имена хостов).
+- `src/envbox/net/common.py` (161 стр.) — Сетевой шлюз: общие константы и мелкие помощники (время, host:port, публичные адреса, имена хостов).
   now(), split_hostport(), is_public(), canon_host(), congestion_control(), tune_socket()
 - `src/envbox/net/connect.py` (73 стр.) — Сетевой шлюз: подключение к одному из адресов хоста (Happy Eyeballs).
   interleave(), connect_race()
@@ -117,8 +119,8 @@
   NetArgs (1 методов), net_usage(), net_parse(), net_main()
 - `src/envbox/net/gitcheck.py` (112 стр.) — Проверка Git после работы среды: хуки и config проекта не должны меняться незаметно.
   git_state(), cmd_gitcheck()
-- `src/envbox/net/proxy.py` (622 стр.) — Сетевой шлюз: журналирующий прокси (команда proxy).
-  host_matches(), err_text(), PrivateAddress (1 методов), OpenFailed (1 методов), Proxy (10 методов), build_chain(), cmd_proxy()
+- `src/envbox/net/proxy.py` (640 стр.) — Сетевой шлюз: журналирующий прокси (команда proxy).
+  host_matches(), err_text(), PrivateAddress (1 методов), OpenFailed (1 методов), Proxy (11 методов), build_chain(), cmd_proxy()
 - `src/envbox/net/report.py` (117 стр.) — Сетевой шлюз: чтение и вывод журнала соединений (команда report).
   human(), clean(), events(), fmt_event(), cmd_report()
 - `src/envbox/net/seccomp.py` (52 стр.) — seccomp-фильтр для bwrap (команда seccomp).
@@ -127,8 +129,8 @@
   UpstreamError (0 методов), Upstream (2 методов)
 - `src/envbox/net/vpn.py` (633 стр.) — Сетевой шлюз: VPN-клиенты как локальные SOCKS-прокси.
   detect_kind(), wg_sections(), wg_validate(), wg_runtime(), share_scheme(), b64decode(), stream_settings(), check_server(), parse_vmess_json(), parse_shadowsocks(), parse_share_link(), link_server(), is_stub_link(), stub_remark() …
-- `src/envbox/net/warm.py` (179 стр.) — Сетевой шлюз: заранее открытые туннели к «горячим» сайтам (Claude), чтобы новое соединение не ждало подключения.
-  is_hot(), WarmPool (6 методов), SetupGate (4 методов)
+- `src/envbox/net/warm.py` (187 стр.) — Сетевой шлюз: заранее открытые туннели к «горячим» сайтам (Claude), чтобы новое соединение не ждало подключения.
+  is_hot(), WarmPool (7 методов), SetupGate (4 методов)
 - `src/envbox/resources.py` (9 стр.) — Встроенные ресурсы (envbox.sh, значки, CSS…): файлы из resources/; в собранном envbox.py они вшиты строками.
   resource_text()
 - `src/envbox/selfpath.py` (21 стр.) — Пути к самому envbox: точка запуска (SELF) и единый файл для установки (bundle_path).

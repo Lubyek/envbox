@@ -14,6 +14,7 @@ from .common import (
     IDLE_TIMEOUT,
     MAX_HEDGES,
     MAX_SETUPS,
+    HOT_IDLE,
     STALL_TIMEOUT,
     canon_host,
     congestion_control,
@@ -21,7 +22,7 @@ from .common import (
     now,
     split_hostport,
 )
-from .chain import PROBE_EVERY, Channel, Chain, parse_chain_spec, probe
+from .chain import PROBE_EVERY, RESTORE_AFTER, Channel, Chain, parse_chain_spec, probe
 from .connect import connect_race
 from .dns import Resolver, is_ip_literal, is_private_name
 from .upstream import Upstream
@@ -75,7 +76,7 @@ class OpenFailed(OSError):
 class Proxy:
     def __init__(self, log_path, allow, allow_private, upstream=None, dns=None, direct=None,
                  idle=IDLE_TIMEOUT, hedge=HEDGE_DELAY, max_hedges=MAX_HEDGES, max_setups=MAX_SETUPS, chain=None,
-                 accel=True, hot=(), stall=STALL_TIMEOUT):
+                 accel=True, hot=(), stall=STALL_TIMEOUT, hot_idle=HOT_IDLE):
         self.log_path = log_path
         self.setups = SetupGate(max_setups)   # одновременные установки туннеля к вышестоящему прокси (лимит подстраивается)
         self.max_hedges = max_hedges
@@ -94,6 +95,7 @@ class Proxy:
         self.warm = WarmPool() if accel else None
         self.hot = tuple(hot)
         self.stall = stall if accel else 0
+        self.hot_idle = (min(idle, hot_idle) if idle else 0) if accel else idle
         self.setup_ewma = None       # скользящее среднее времени установки туннеля, секунд
         # сайты, к которым прокси подключается сам, минуя вышестоящий прокси (некоторые сайты не пускают его адрес)
         self.direct = [a.lower().rstrip(".") for a in (direct or [])]
@@ -198,9 +200,10 @@ class Proxy:
             raise error
         return winner
 
-    async def pipe(self, cr, cw, ur, uw, first, stall=0):
+    async def pipe(self, cr, cw, ur, uw, first, stall=0, idle=None):
         """Пересылка в обе стороны. Возвращает (отправлено, получено, кто_закончил, метки времени в мс):
         кто_закончил — «client», «upstream» или «idle»."""
+        idle = self.idle if idle is None else idle
         counts = {"up": len(first), "down": 0}
         started = last_t = time.monotonic()
         last = [last_t]
@@ -238,11 +241,11 @@ class Proxy:
                     pass
 
         async def watch():
-            step = max(0.05, min(5.0, min(t for t in (self.idle, stall) if t) / 4))
+            step = max(0.05, min(5.0, min(t for t in (idle, stall) if t) / 4))
             while True:
                 await asyncio.sleep(step)
                 t = time.monotonic()
-                if self.idle and t - last[0] > self.idle:
+                if idle and t - last[0] > idle:
                     stalled[0] = "idle"
                 elif stall and mark["up"] > mark["down"] and t - mark["up"] > stall:
                     stalled[0] = "stall"          # клиент ждёт ответа, а его нет: туннель мёртв, пусть повторит запрос
@@ -252,7 +255,7 @@ class Proxy:
                     w.close()      # оба копировщика получат конец потока и завершатся
                 return
 
-        watcher = asyncio.ensure_future(watch()) if (self.idle or stall) else None
+        watcher = asyncio.ensure_future(watch()) if (idle or stall) else None
         try:
             # одна сторона упала неожиданной ошибкой — вторая всё равно доводится до конца, а не остаётся висеть
             await asyncio.gather(copy(cr, uw, "up"), copy(ur, cw, "down"), return_exceptions=True)
@@ -368,6 +371,16 @@ class Proxy:
                 up = ch.upstream
                 self.warm.want((up.label, host, 443), lambda up=up, host=host: self.warm_tunnel(up, host, 443))
 
+    def on_dead_tunnel(self, chan, up, host, port):
+        """Туннель к Claude замолчал (запрос без ответа или стрим оборвался тишиной). Запас готовых туннелей к этому
+        прокси сбрасывается, а при нескольких каналах цепочки новые соединения сразу идут через запасной."""
+        if self.warm is not None and up is not None:
+            self.warm.flush(up.label)
+        if chan is not None and len(self.chain.channels) > 1 and self.chain.failed(chan, "запрос без ответа"):
+            nxt = next((c for c in self.chain.order() if c is not chan), None)
+            self.write({"event": "channel", "state": "down", "channel": chan.label, "reason": "запрос без ответа",
+                        **({"next": nxt.label} if nxt else {})})
+
     async def warm_tunnel(self, up, host, port):
         """Запасной туннель для пула: открывается так же, как обычный, и занимает ту же очередь установок."""
         async with self.setups:
@@ -389,7 +402,8 @@ class Proxy:
         while True:
             await asyncio.sleep(PROBE_EVERY)
             for ch in self.chain.channels:
-                if ch.down and not ch.broken and await probe(ch) and self.chain.worked(ch):
+                if (ch.down and not ch.broken and time.monotonic() - ch.down_at >= RESTORE_AFTER
+                        and await probe(ch) and self.chain.worked(ch)):
                     self.write({"event": "channel", "state": "up", "channel": ch.label})
 
     def begin(self):
@@ -465,6 +479,7 @@ class Proxy:
                 await self.deny(writer, rec, 403, "not-in-allowlist", "Forbidden by envbox allowlist")
                 return
 
+            chan = None
             tunnel, used = True, None     # used — Upstream, через который идёт соединение (нужен для обычного HTTP)
             if self.via_upstream(host):
                 if not self.allow_private and is_private_name(host):
@@ -528,8 +543,11 @@ class Proxy:
                         headers.append(f"Proxy-Authorization: {used.basic()}")
                 req = f"{method} {target_line} HTTP/1.1\r\n" + "".join(h + "\r\n" for h in headers)
                 first = (req + ("" if websocket else "Connection: close\r\n") + "\r\n").encode("latin-1")
-            hot_stall = self.stall if (self.warm is not None and is_hot(host, self.hot)) else 0
-            up, down, end, timing = await self.pipe(reader, writer, ur, upstream, first, hot_stall)
+            hot = self.warm is not None and is_hot(host, self.hot)
+            up, down, end, timing = await self.pipe(reader, writer, ur, upstream, first, self.stall if hot else 0,
+                                                    self.hot_idle if hot else None)
+            if hot and (end == "stall" or (end == "idle" and up > 1000)):    # замолчал после того, как клиент что-то отправил
+                self.on_dead_tunnel(chan, used, host, port)
             self.write({"id": cid, "event": "close", "host": host, "port": port,
                         "up": up, "down": down, "ms": int((time.monotonic() - t0) * 1000), "end": end,
                         **timing, **({"idle": True} if end == "idle" else {})})
