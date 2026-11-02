@@ -409,6 +409,33 @@ class ProxyTests(unittest.IsolatedAsyncioTestCase):
         closes = [e for e in self.read_log() if e.get("event") == "close"]
         self.assertEqual(closes[-1].get("end"), "upstream")
 
+    async def test_close_event_has_timing_marks_for_stuck_connections(self):
+        # «запрос ушёл, а ответа нет»: по меткам видно, когда клиент договорил и пришёл ли хоть один байт ответа
+        async def slow(r, w):
+            await r.read(100)
+            await asyncio.sleep(0.4)
+            w.write(b"late")
+            await w.drain()
+            await asyncio.sleep(0.2)
+            w.close()
+        srv = await asyncio.start_server(slow, "127.0.0.1", 0)
+        port = srv.sockets[0].getsockname()[1]
+        proxy, server, path = await self.start()
+        try:
+            data, r, w = await ask(path, f"CONNECT 127.0.0.1:{port} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+            w.write(b"hi")
+            await w.drain()
+            await asyncio.wait_for(r.read(100), 5)
+            w.close()
+        finally:
+            server.close()
+            srv.close()
+        await asyncio.sleep(0.3)
+        close = [e for e in self.read_log() if e.get("event") == "close"][-1]
+        self.assertLess(close["up_end"], 300)                        # клиент договорил сразу
+        self.assertGreaterEqual(close["down_first"], 350)            # ответ пришёл только через 0.4 с
+        self.assertGreaterEqual(close["down_last"], close["down_first"])
+
     async def test_hedging_reports_the_error_when_every_tunnel_fails(self):
         async def refuse(r, w):
             await r.readuntil(b"\r\n\r\n")

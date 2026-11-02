@@ -125,7 +125,7 @@ unix-сокет run/proxy.sock → net/proxy.py Proxy.handle (на хосте) �
 
 Формат `net.log` (JSON по строке): `ts`, `run` (id запуска прокси), `id` (номер соединения), `event`
 (`open|close|deny|error|proxy-start|proxy-stop`), `kind` (`CONNECT|HTTP`), `host`, `port`, `method`, `url`
-(без userinfo), `ip`, `via`, `reason`, `resolved`, при `close`: `up`, `down`, `ms`. Хранится в
+(без userinfo), `ip`, `via`, `reason`, `resolved`, при `close`: `up`, `down`, `ms`, метки от начала пересылки в мс `up_end` (клиент договорил запрос), `down_first` и `down_last` (первый и последний байт ответа; нет `down_first` — ответа не было вовсе: у зависшего соединения это сразу показывает, молчит сервер или клиент не дослал запрос). Хранится в
 `<корень>/<имя>/net.log`, ротация >20 МБ → `net.log.1` (и при старте, и по ходу работы).
 
 ### 2.3. Ссылки из среды наружу и обратно

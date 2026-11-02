@@ -38,7 +38,7 @@ import time
 
 # ---- version.py: Версия envbox (строка читается регулярным выражением при установке — не менять формат).
 
-ENVBOX_VERSION = "2026.11.02.3"
+ENVBOX_VERSION = "2026.11.02.4"
 
 
 # ---- lazy.py: Ленивые модули стандартной библиотеки: настоящий import происходит при первом обращении к атрибуту.
@@ -1109,9 +1109,12 @@ class Proxy:
         return winner
 
     async def pipe(self, cr, cw, ur, uw, first):
-        """Пересылка в обе стороны. Возвращает (отправлено, получено, кто_закончил): «client», «upstream» или «idle»."""
+        """Пересылка в обе стороны. Возвращает (отправлено, получено, кто_закончил, метки времени в мс):
+        кто_закончил — «client», «upstream» или «idle»."""
         counts = {"up": len(first), "down": 0}
-        last = [time.monotonic()]
+        started = last_t = time.monotonic()
+        last = [last_t]
+        stamps = {}       # моменты (от начала пересылки): последний байт от клиента, первый и последний байт ответа
         stalled = [False]
         ended = []        # какая сторона закончила первой: по этому видно, кто рвёт соединения (клиент или прокси)
         if first:
@@ -1124,8 +1127,13 @@ class Proxy:
                     data = await src.read(BUF)
                     if not data:
                         break
-                    last[0] = time.monotonic()
+                    now = last[0] = time.monotonic()
                     counts[key] += len(data)
+                    if key == "up":
+                        stamps["up_end"] = now
+                    else:
+                        stamps.setdefault("down_first", now)
+                        stamps["down_last"] = now
                     dst.write(data)
                     await dst.drain()
             except (ConnectionError, OSError):
@@ -1156,7 +1164,9 @@ class Proxy:
             if watcher is not None:
                 watcher.cancel()
         end = "idle" if stalled[0] else "client" if ended[:1] == ["up"] else "upstream"
-        return counts["up"], counts["down"], end
+        # по этим меткам видно, кто молчит у зависшего соединения: клиент не договорил запрос или сервер не ответил
+        timing = {k: int((t - started) * 1000) for k, t in stamps.items()}
+        return counts["up"], counts["down"], end, timing
 
     async def deny(self, writer, rec, code, reason, text, **extra):
         """Отказ: запись в журнал и быстрый ответ клиенту (с названием хоста: понятно, что именно закрыто)."""
@@ -1286,10 +1296,10 @@ class Proxy:
                         headers.append(f"Proxy-Authorization: {self.upstream.basic()}")
                 req = f"{method} {target_line} HTTP/1.1\r\n" + "".join(h + "\r\n" for h in headers)
                 first = (req + ("" if websocket else "Connection: close\r\n") + "\r\n").encode("latin-1")
-            up, down, end = await self.pipe(reader, writer, ur, upstream, first)
+            up, down, end, timing = await self.pipe(reader, writer, ur, upstream, first)
             self.write({"id": cid, "event": "close", "host": host, "port": port,
                         "up": up, "down": down, "ms": int((time.monotonic() - t0) * 1000), "end": end,
-                        **({"idle": True} if end == "idle" else {})})
+                        **timing, **({"idle": True} if end == "idle" else {})})
         except Exception as e:  # журнал не должен ронять прокси
             self.write({**rec, "event": "error", "reason": f"internal: {e!r}"})
         finally:
