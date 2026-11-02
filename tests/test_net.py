@@ -1576,7 +1576,8 @@ class VpnCheck(unittest.TestCase):
             def do_GET(self):
                 st = outer.state
                 if self.path.startswith("/geo"):
-                    self.reply(200, _json.dumps({**VpnCheck.GEO_A, "ip": st["exit"]}).encode())
+                    self.reply(200, st["geo_raw"] if "geo_raw" in st else
+                               _json.dumps({**VpnCheck.GEO_A, "ip": st["exit"]}).encode())
                 elif self.path.startswith("/ipapi2"):
                     self.reply(200, _json.dumps({**VpnCheck.GEO_B, "query": st["exit"]}).encode())
                 elif self.path.startswith("/real"):
@@ -1622,6 +1623,34 @@ class VpnCheck(unittest.TestCase):
         self.assertEqual((w["code"], w["timezone"], w["flags"]), ("FR", "Europe/Paris", {}))
         for bad in (None, {}, {"status": "fail"}, {"success": False}, []):
             self.assertIsNone(self.vc._parse_ip_api(bad) or self.vc._parse_ipwho(bad) or self.vc._parse_ipapi_is(bad))
+
+    def test_one_broken_service_does_not_break_the_check(self):
+        # «'str' object has no attribute 'get'»: сервис отдал поле другого вида, и вся проверка падала
+        weird = (b'{"ip":"203.0.113.5","location":"Germany","company":"X","asn":5,"is_vpn":"yes"}',
+                 b'{"ip":"203.0.113.5","location":null,"company":[],"asn":"AS5"}', b"[1,2,3]", b'"just a string"',
+                 b"not json at all", b"")
+        for raw in weird:
+            self.state["geo_raw"] = raw
+            r = self.run_check()                                           # не должно быть исключения
+            self.assertIn(r["verdict"], ("ok", "warn", "bad"))
+            self.assertTrue(r["exit"], raw)                                # второй сервис ответил: адрес известен
+            self.assertEqual(r["exit"]["ip"], "203.0.113.5")
+        self.state["geo_raw"] = b"not json at all"
+        r = self.run_check()
+        self.assertTrue(r["sources_failed"])                               # кто не ответил — видно в отчёте
+        self.assertIn("не разобран", " ".join(w for _h, w in r["sources_failed"]))
+        self.assertIn("Сервисы без ответа", self.vc.format_report(r))
+        w = self.vc._parse_ipwho({"success": True, "ip": "1.2.3.4", "timezone": "Europe/Paris", "connection": "x"})
+        self.assertEqual(w["timezone"], "Europe/Paris")                    # пояс бывает и строкой
+
+    def test_odd_vpn_configs_are_analysed_not_crashed(self):
+        from envbox.net.vpn import transport_report
+        for cfg in ('{"outbounds":[{"protocol":"vless","streamSettings":"x","tls":"y","transport":"tcp"}]}',
+                    '{"outbounds":[{"type":"vless","tls":{"reality":"yes","utls":[]},"transport":[]}]}',
+                    '{"outbounds":[{"protocol":"trojan","streamSettings":{"security":null,"tlsSettings":"s"}}]}',
+                    '{"outbounds":["freedom",null,{"protocol":"vmess","streamSettings":[]}]}'):
+            report = transport_report("xray", cfg)
+            self.assertTrue(report and all(lvl in ("ok", "warn", "bad") for lvl, _t in report), cfg)
 
     def test_claude_verdicts(self):
         j, a = self.vc.judge_claude_site, self.vc.judge_claude_api

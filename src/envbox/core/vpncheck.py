@@ -16,14 +16,24 @@ from .vpn import http_errors, http_request, vpn_binary_problem, vpn_dir, vpn_sou
 
 # Сервисы определения адреса: (адрес запроса, разбор ответа). Берём ответы всех, кто ответил: у одних есть пометки
 # «дата-центр/VPN», у других точнее город. Порядок — важность для основных полей.
+def _dict(x):
+    """Поле, которое должно быть словарём; если сервис отдал другое (строку, список), считаем его пустым."""
+    return x if isinstance(x, dict) else {}
+
+
+def _text(x):
+    return x if isinstance(x, str) else ""
+
+
 def _parse_ipapi_is(d):
     if not isinstance(d, dict) or not d.get("ip"):
         return None
-    loc, comp, asn = d.get("location") or {}, d.get("company") or {}, d.get("asn") or {}
-    return {"ip": d["ip"], "country": loc.get("country", ""), "code": loc.get("country_code", ""),
-            "region": loc.get("state", ""), "city": loc.get("city", ""), "timezone": loc.get("timezone", ""),
-            "org": comp.get("name") or asn.get("org", ""), "asn": f"AS{asn['asn']}" if asn.get("asn") else "",
-            "net_type": comp.get("type") or asn.get("type") or "",
+    loc, comp, asn = _dict(d.get("location")), _dict(d.get("company")), _dict(d.get("asn"))
+    return {"ip": _text(d["ip"]), "country": _text(loc.get("country")), "code": _text(loc.get("country_code")),
+            "region": _text(loc.get("state")), "city": _text(loc.get("city")), "timezone": _text(loc.get("timezone")),
+            "org": _text(comp.get("name")) or _text(asn.get("org")),
+            "asn": f"AS{asn['asn']}" if asn.get("asn") else "",
+            "net_type": _text(comp.get("type")) or _text(asn.get("type")),
             "flags": {"datacenter": bool(d.get("is_datacenter")), "proxy": bool(d.get("is_proxy")),
                       "vpn": bool(d.get("is_vpn")), "tor": bool(d.get("is_tor")), "abuser": bool(d.get("is_abuser")),
                       "mobile": bool(d.get("is_mobile"))}}
@@ -32,9 +42,9 @@ def _parse_ipapi_is(d):
 def _parse_ip_api(d):
     if not isinstance(d, dict) or d.get("status") != "success":
         return None
-    return {"ip": d.get("query", ""), "country": d.get("country", ""), "code": d.get("countryCode", ""),
-            "region": d.get("regionName", ""), "city": d.get("city", ""), "timezone": d.get("timezone", ""),
-            "org": d.get("org") or d.get("isp", ""), "asn": (d.get("as") or "").split(" ")[0], "net_type": "",
+    return {"ip": _text(d.get("query")), "country": _text(d.get("country")), "code": _text(d.get("countryCode")),
+            "region": _text(d.get("regionName")), "city": _text(d.get("city")), "timezone": _text(d.get("timezone")),
+            "org": _text(d.get("org")) or _text(d.get("isp")), "asn": _text(d.get("as")).split(" ")[0], "net_type": "",
             "flags": {"datacenter": bool(d.get("hosting")), "proxy": bool(d.get("proxy")),
                       "mobile": bool(d.get("mobile"))}}
 
@@ -42,10 +52,11 @@ def _parse_ip_api(d):
 def _parse_ipwho(d):
     if not isinstance(d, dict) or not d.get("success", True) or not d.get("ip"):
         return None
-    conn = d.get("connection") or {}
-    return {"ip": d["ip"], "country": d.get("country", ""), "code": d.get("country_code", ""),
-            "region": d.get("region", ""), "city": d.get("city", ""),
-            "timezone": (d.get("timezone") or {}).get("id", ""), "org": conn.get("org") or conn.get("isp", ""),
+    conn, tz = _dict(d.get("connection")), d.get("timezone")
+    return {"ip": _text(d["ip"]), "country": _text(d.get("country")), "code": _text(d.get("country_code")),
+            "region": _text(d.get("region")), "city": _text(d.get("city")),
+            "timezone": _text(tz.get("id")) if isinstance(tz, dict) else _text(tz),
+            "org": _text(conn.get("org")) or _text(conn.get("isp")),
             "asn": f"AS{conn['asn']}" if conn.get("asn") else "", "net_type": "", "flags": {}}
 
 
@@ -188,15 +199,29 @@ def check_exit(proxy="", auth="", timeout=15, real_url=None, compare_real=True, 
     определения адреса идут параллельно; сбой одного сервиса не мешает остальным."""
     from concurrent.futures import ThreadPoolExecutor
 
+    failed = []        # (сервис, причина): видно в отчёте, чтобы сбой одного сервиса не оставался загадкой
+
     def geo(provider, via=None):
         url, parse = provider
+        host = url.split("/")[2] if "//" in url else url
         try:
             # via: None — через проверяемый выход; "" — напрямую (настоящий адрес для сравнения)
             status, _h, body, _ms = (http_request(url, proxy, auth, timeout) if via is None
                                      else http_request(url, via, "", timeout))
-            return parse(json.loads(body.decode("utf-8", "replace"))) if status == 200 else None
-        except http_errors():
+        except http_errors() as e:
+            failed.append((host, f"не ответил: {e or type(e).__name__}"))
             return None
+        if status != 200:
+            failed.append((host, f"HTTP {status}"))
+            return None
+        try:
+            got = parse(json.loads(body.decode("utf-8", "replace")))
+        except Exception as e:  # noqa: BLE001  чужой ответ может быть любым: разбор не должен валить проверку
+            failed.append((host, f"ответ не разобран ({type(e).__name__})"))
+            return None
+        if got is None:
+            failed.append((host, "в ответе нет адреса"))
+        return got
 
     def claude_get(url):
         try:
@@ -228,7 +253,7 @@ def check_exit(proxy="", auth="", timeout=15, real_url=None, compare_real=True, 
     if compare_real and proxy and not real:
         findings.append(("warn", "настоящий адрес определить не удалось: сравнить выход с ним нельзя"))
     return {"exit": exit_info, "real_ip": (real or {}).get("ip", ""), "claude": claude, "latency_ms": latency,
-            "findings": findings, "verdict": verdict(findings)}
+            "findings": findings, "verdict": verdict(findings), "sources_failed": failed}
 
 
 def check_vpn(name, timeout=15, compare_real=True, env_tz=""):
@@ -272,6 +297,8 @@ def format_report(report, title=""):
         lines.append(f"Настоящий:     {report['real_ip']}")
     if report.get("latency_ms") is not None:
         lines.append(f"Задержка до api.anthropic.com через выход: {report['latency_ms']} мс")
+    if report.get("sources_failed"):
+        lines.append("Сервисы без ответа: " + "; ".join(f"{h} ({why})" for h, why in report["sources_failed"]))
     lines += ["", "Выводы:"] + [f"  {mark[lvl]} {t}" for lvl, t in report["findings"]]
     if report.get("transport"):
         lines += ["", "Безопасность и отпечаток VPN-транспорта:"] + [f"  {mark[lvl]} {t}" for lvl, t in report["transport"]]

@@ -407,16 +407,20 @@ def transport_report(kind, text):
     o = first_proxy_outbound(cfg)
     if o is None:
         return [("bad", "нет прокси-выхода: трафик пошёл бы напрямую")]
-    proto = o.get("protocol") or o.get("type")
-    st = o.get("streamSettings") or {}
-    tls = o.get("tls") or {}
-    net = st.get("network") or (o.get("transport") or {}).get("type") or "tcp"
-    sec = (st.get("security") or ("reality" if (tls.get("reality") or {}).get("enabled") else
-                                  "tls" if tls.get("enabled") else "none")).lower()
-    fp = ((st.get("realitySettings") or st.get("tlsSettings") or {}).get("fingerprint")
-          or (tls.get("utls") or {}).get("fingerprint") or "")
-    insecure = bool((st.get("tlsSettings") or {}).get("allowInsecure") or tls.get("insecure"))
-    sni = ((st.get("realitySettings") or st.get("tlsSettings") or {}).get("serverName") or tls.get("server_name") or "")
+    def d(x):      # поле, которое должно быть словарём (в чужих конфигурациях бывает строкой, списком, null)
+        return x if isinstance(x, dict) else {}
+
+    def t(x):
+        return x if isinstance(x, str) else ""
+    proto = t(o.get("protocol") or o.get("type"))
+    st, tls = d(o.get("streamSettings")), d(o.get("tls"))
+    net = t(st.get("network")) or t(d(o.get("transport")).get("type")) or "tcp"
+    sec = (t(st.get("security")) or ("reality" if d(tls.get("reality")).get("enabled") else
+                                     "tls" if tls.get("enabled") else "none")).lower()
+    sec_cfg = d(st.get("realitySettings")) or d(st.get("tlsSettings"))
+    fp = t(sec_cfg.get("fingerprint")) or t(d(tls.get("utls")).get("fingerprint"))
+    insecure = bool(d(st.get("tlsSettings")).get("allowInsecure") or tls.get("insecure"))
+    sni = t(sec_cfg.get("serverName")) or t(tls.get("server_name"))
     out.append(("ok", f"протокол {proto}, транспорт {net}, защита канала: {sec}" + (f", SNI {sni}" if sni else "")))
     if sec == "none" and proto in ("vless", "trojan"):
         out.append(("bad", f"{proto} без TLS/Reality: трафик до VPN-сервера идёт открыто, его видно провайдеру и "
