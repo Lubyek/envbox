@@ -19,7 +19,7 @@
 - `src/envbox/core/browser.py` (124 стр.) — Среды-браузеры: поиск Chrome/Chromium, монтирование, команда запуска, CDP-сокет.
   find_browser(), browser_mounts(), host_program_in_home(), browser_display_flag(), browser_command(), cdp_socket_path(), attach_snippets()
 - `src/envbox/core/consts.py` (113 стр.) — Общие константы ядра: регулярные выражения, режимы сети, подписи, пути установки.
-- `src/envbox/core/describe.py` (173 стр.) — Человеческое описание того, что получит среда (для вкладки «Обзор»).
+- `src/envbox/core/describe.py` (176 стр.) — Человеческое описание того, что получит среда (для вкладки «Обзор»).
   describe()
 - `src/envbox/core/desktop.py` (43 стр.) — Ярлык и значок envbox в меню приложений.
   install_desktop_entry()
@@ -37,7 +37,7 @@
   parse_link(), link_spool_dir(), read_link_spool(), link_spool_pending(), cdp_open_url(), browser_profiles_names(), url_scheme(), parse_inbound(), inbox_dir(), send_link(), inbox_result(), env_running(), find_env_for_url(), open_link_in_env() …
 - `src/envbox/core/netlog.py` (137 стр.) — Журнал сети среды: чтение с хвоста, сводка, очистка.
   net_log_path(), LogTail (2 методов), NetSummary (3 методов), summarize(), filter_net_log(), clear_net_log()
-- `src/envbox/core/profile.py` (572 стр.) — Профиль среды (dataclass Profile) и его проверка.
+- `src/envbox/core/profile.py` (576 стр.) — Профиль среды (dataclass Profile) и его проверка.
   Profile (20 методов), locale_available(), timezone_exists(), new_profile()
 - `src/envbox/core/proxies.py` (325 стр.) — Хранилище прокси: список, папки (сервисы), поиск, пинг, проверка и проверка «для Claude».
   px_path(), load_px(), save_px(), parse_proxy_line(), proxy_lines(), is_proxy_list_url(), px_name_free(), import_proxies(), list_proxies(), proxy_credentials(), proxy_url_with_auth(), delete_proxies(), clear_proxies(), set_px_folder() …
@@ -81,7 +81,7 @@
   OverviewMixin (3 методов)
 - `src/envbox/gui/pages/profile_net.py` (359 стр.) — Настройки сети среды: секрет, прокси, подключение приложений, CDP.
   ProfileNetMixin (19 методов)
-- `src/envbox/gui/pages/profile_page.py` (570 стр.) — Страница настроек среды: сбор формы, сохранение.
+- `src/envbox/gui/pages/profile_page.py` (578 стр.) — Страница настроек среды: сбор формы, сохранение.
   ProfilePageMixin (10 методов)
 - `src/envbox/gui/pages/proxies.py` (476 стр.) — Вкладка «Прокси»: список прокси по папкам (сервисам), поиск, пинг, проверка, проверка для Claude, выделение.
   ProxyPageMixin (27 методов)
@@ -107,19 +107,19 @@
   pump(), dial_unix(), dial_tcp(), parse_port(), inbox_handle(), inbox_loop(), cmd_wrap(), cmd_probe()
 - `src/envbox/net/chain.py` (109 стр.) — Сетевой шлюз: цепочка каналов выхода (прокси, VPN-клиент, прямой выход) с переключением на запасной.
   Channel (2 методов), Chain (8 методов), parse_chain_spec(), probe()
-- `src/envbox/net/common.py` (122 стр.) — Сетевой шлюз: общие константы и мелкие помощники (время, host:port, публичные адреса, имена хостов).
-  now(), split_hostport(), is_public(), canon_host(), tune_socket()
+- `src/envbox/net/common.py` (155 стр.) — Сетевой шлюз: общие константы и мелкие помощники (время, host:port, публичные адреса, имена хостов).
+  now(), split_hostport(), is_public(), canon_host(), congestion_control(), tune_socket()
 - `src/envbox/net/connect.py` (73 стр.) — Сетевой шлюз: подключение к одному из адресов хоста (Happy Eyeballs).
   interleave(), connect_race()
 - `src/envbox/net/dns.py` (253 стр.) — Сетевой шлюз: свой DNS-клиент и проверки имён/адресов.
   dns_lookup(), dns_resolve_blocking(), Resolver (3 методов), is_private_name(), is_ip_literal()
-- `src/envbox/net/entry.py` (124 стр.) — Диспетчер служебных команд envbox.py, вызываемых из envbox.sh и из песочницы.
+- `src/envbox/net/entry.py` (125 стр.) — Диспетчер служебных команд envbox.py, вызываемых из envbox.sh и из песочницы.
   NetArgs (1 методов), net_usage(), net_parse(), net_main()
 - `src/envbox/net/gitcheck.py` (112 стр.) — Проверка Git после работы среды: хуки и config проекта не должны меняться незаметно.
   git_state(), cmd_gitcheck()
-- `src/envbox/net/proxy.py` (551 стр.) — Сетевой шлюз: журналирующий прокси (команда proxy).
-  host_matches(), err_text(), PrivateAddress (1 методов), OpenFailed (1 методов), Proxy (7 методов), build_chain(), cmd_proxy()
-- `src/envbox/net/report.py` (112 стр.) — Сетевой шлюз: чтение и вывод журнала соединений (команда report).
+- `src/envbox/net/proxy.py` (622 стр.) — Сетевой шлюз: журналирующий прокси (команда proxy).
+  host_matches(), err_text(), PrivateAddress (1 методов), OpenFailed (1 методов), Proxy (10 методов), build_chain(), cmd_proxy()
+- `src/envbox/net/report.py` (117 стр.) — Сетевой шлюз: чтение и вывод журнала соединений (команда report).
   human(), clean(), events(), fmt_event(), cmd_report()
 - `src/envbox/net/seccomp.py` (52 стр.) — seccomp-фильтр для bwrap (команда seccomp).
   seccomp_program_x86_64(), cmd_seccomp()
@@ -127,6 +127,8 @@
   UpstreamError (0 методов), Upstream (2 методов)
 - `src/envbox/net/vpn.py` (633 стр.) — Сетевой шлюз: VPN-клиенты как локальные SOCKS-прокси.
   detect_kind(), wg_sections(), wg_validate(), wg_runtime(), share_scheme(), b64decode(), stream_settings(), check_server(), parse_vmess_json(), parse_shadowsocks(), parse_share_link(), link_server(), is_stub_link(), stub_remark() …
+- `src/envbox/net/warm.py` (179 стр.) — Сетевой шлюз: заранее открытые туннели к «горячим» сайтам (Claude), чтобы новое соединение не ждало подключения.
+  is_hot(), WarmPool (6 методов), SetupGate (4 методов)
 - `src/envbox/resources.py` (9 стр.) — Встроенные ресурсы (envbox.sh, значки, CSS…): файлы из resources/; в собранном envbox.py они вшиты строками.
   resource_text()
 - `src/envbox/selfpath.py` (21 стр.) — Пути к самому envbox: точка запуска (SELF) и единый файл для установки (bundle_path).

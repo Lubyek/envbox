@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -773,6 +774,313 @@ async def main():
     await srv.serve_forever()
 asyncio.run(main())
 """
+
+
+class FakeUpstream:
+    """Подставной вышестоящий прокси: считает CONNECT, отвечает с задержкой, потом ведёт себя по режиму."""
+
+    def __init__(self, delay=0.0, mode="echo"):
+        self.delay, self.mode, self.connects = delay, mode, []
+
+    async def start(self):
+        self.srv = await asyncio.start_server(self.handle, "127.0.0.1", 0)
+        return Upstream(f"http://127.0.0.1:{self.srv.sockets[0].getsockname()[1]}")
+
+    async def handle(self, r, w):
+        try:
+            head = await r.readuntil(b"\r\n\r\n")
+            self.connects.append(head.split()[1].decode())
+            await asyncio.sleep(self.delay)
+            w.write(b"HTTP/1.1 200 OK\r\n\r\n")
+            await w.drain()
+            if self.mode == "echo":
+                w.write(b"e:" + await r.read(100))
+                await w.drain()
+            elif self.mode == "silent":
+                await r.read()
+            elif self.mode == "pings":
+                await r.read(1)
+                for _ in range(10):
+                    w.write(b".")
+                    await w.drain()
+                    await asyncio.sleep(0.15)
+        except (ConnectionError, asyncio.IncompleteReadError):
+            pass
+        finally:
+            w.close()
+
+
+class Acceleration(unittest.IsolatedAsyncioTestCase):
+    """Ускорение шлюза: заготовленные туннели, очередь установок, быстрый обрыв мёртвого туннеля."""
+    HOT = "93.184.216.34"
+
+    def setUp(self):
+        import logging
+        self.tmp = tempfile.mkdtemp(prefix="eb")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        # при закрытии подставных серверов asyncio жалуется на недопринятые соединения: к шлюзу это не относится
+        log = logging.getLogger("asyncio")
+        level = log.level
+        log.setLevel(logging.CRITICAL)
+        self.addCleanup(log.setLevel, level)
+
+    async def start(self, up, **kw):
+        proxy, server, path = await start_proxy(self.tmp, upstream=up, **kw)
+        self.addCleanup(proxy.log.close)
+        proxy.begin()
+        self.addCleanup(proxy.end)
+        self.addCleanup(server.close)
+        return proxy, path
+
+    async def connect(self, path, host):
+        """Время до ответа 200 на CONNECT, секунд, и поток для дальнейшего обмена."""
+        t = time.monotonic()
+        data, r, w = await ask(path, f"CONNECT {host}:443 HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+        self.assertTrue(data.startswith(b"HTTP/1.1 200"), data)
+        return time.monotonic() - t, r, w
+
+    def opens(self):
+        with open(os.path.join(self.tmp, "net.log"), encoding="utf-8") as f:
+            return [json.loads(line) for line in f if '"open"' in line]
+
+    async def test_hot_site_gets_a_ready_tunnel_and_others_do_not(self):
+        fake = FakeUpstream(delay=0.25)
+        up = await fake.start()
+        self.addCleanup(fake.srv.close)
+        proxy, path = await self.start(up, hot=(self.HOT,))
+        cold, r, w = await self.connect(path, self.HOT)
+        self.assertGreaterEqual(cold, 0.24)                              # первое соединение ждёт прокси
+        w.close()
+        await asyncio.sleep(0.9)                                         # запас пополнился в фоне
+        warm, r, w = await self.connect(path, self.HOT)
+        self.assertLess(warm, 0.1)                                       # туннель уже готов: ответ почти мгновенный
+        w.write(b"hi")
+        await w.drain()
+        self.assertEqual(await asyncio.wait_for(r.read(100), 3), b"e:hi")   # и по нему идут данные
+        w.close()
+        other, _r, w2 = await self.connect(path, "93.184.216.35")
+        self.assertGreaterEqual(other, 0.24)                             # обычный сайт запаса не получает
+        w2.close()
+        await asyncio.sleep(0.2)
+        opens = self.opens()
+        self.assertTrue(any(e.get("warm") for e in opens if e["host"] == self.HOT))
+        self.assertFalse(any(e.get("warm") for e in opens if e["host"] == "93.184.216.35"))
+        self.assertTrue(all(e.get("setup_ms", 0) >= 200 for e in opens if not e.get("warm")))   # время туннеля в журнале
+        self.assertGreaterEqual(proxy.warm.hits, 1)
+
+    async def test_acceleration_can_be_switched_off(self):
+        fake = FakeUpstream(delay=0.2)
+        up = await fake.start()
+        self.addCleanup(fake.srv.close)
+        proxy, path = await self.start(up, hot=(self.HOT,), accel=False)
+        self.assertIsNone(proxy.warm)
+        for _ in range(2):
+            took, _r, w = await self.connect(path, self.HOT)
+            self.assertGreaterEqual(took, 0.19)                          # каждый раз ждём подключения прокси, как раньше
+            w.close()
+            await asyncio.sleep(0.6)
+        self.assertFalse(any(e.get("warm") for e in self.opens()))
+
+    async def test_main_claude_hosts_are_prewarmed_at_start_if_allowed(self):
+        fake = FakeUpstream()
+        up = await fake.start()
+        self.addCleanup(fake.srv.close)
+        await self.start(up)                                             # сеть «через журнал»: всё разрешено
+        await asyncio.sleep(0.5)
+        self.assertIn("api.anthropic.com:443", fake.connects)            # туннели открыты ещё до первого клиента
+        self.assertIn("claude.ai:443", fake.connects)
+        fake2 = FakeUpstream()
+        up2 = await fake2.start()
+        self.addCleanup(fake2.srv.close)
+        tmp = tempfile.mkdtemp(prefix="eb")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        proxy, server, _path = await start_proxy(tmp, allow=["example.com"], upstream=up2)
+        self.addCleanup(proxy.log.close)
+        self.addCleanup(server.close)
+        proxy.begin()
+        self.addCleanup(proxy.end)
+        await asyncio.sleep(0.4)
+        self.assertEqual(fake2.connects, [])                             # сайта нет в списке разрешённых: запаса нет
+
+    async def test_dead_tunnels_are_never_handed_out(self):
+        from envbox.net.warm import WarmPool
+
+        class W:
+            def __init__(self, closing=False):
+                self.closing = closing
+                self.closed = False
+
+            def is_closing(self):
+                return self.closing
+
+            def close(self):
+                self.closed = True
+
+        class R:
+            def __init__(self, eof=False):
+                self.eof = eof
+
+            def at_eof(self):
+                return self.eof
+        now = [100.0]
+        pool = WarmPool(size=2, ttl=20.0, clock=lambda: now[0])
+        good, closing, eof, old = (W(), R()), (W(True), R()), (W(), R(True)), (W(), R())
+        pool.pool["k"] = [(now[0] - 30, *old[::-1]), (now[0], closing[1], closing[0]), (now[0], eof[1], eof[0]),
+                          (now[0], good[1], good[0])]
+        self.assertEqual(pool.take("k"), (good[1], good[0]))               # просроченный, закрытый и с EOF пропущены
+        self.assertTrue(all(w.closed for w in (old[0], closing[0], eof[0])))
+        self.assertIsNone(pool.take("k"))
+        self.assertEqual((pool.hits, pool.misses), (1, 1))
+
+    async def test_pool_refills_backs_off_and_stops_when_unused(self):
+        from envbox.net.warm import WarmPool
+        now = [0.0]
+        made = []
+
+        class W:
+            closing = False
+
+            def is_closing(self):
+                return self.closing
+
+            def close(self):
+                self.closing = True
+
+        class R:
+            def at_eof(self):
+                return False
+
+        async def make():
+            made.append(now[0])
+            return R(), W()
+        pool = WarmPool(size=2, ttl=20.0, keep=100.0, clock=lambda: now[0])
+        pool.want("k", make)
+        await asyncio.sleep(0.05)
+        self.assertEqual(len(pool.pool["k"]), 2)                         # доливается до размера запаса
+        self.assertTrue(pool.take("k"))
+        await pool.fill("k", make)
+        self.assertEqual(len(pool.pool["k"]), 2)
+        now[0] = 200.0                                                   # сайтом давно не пользуются
+        made.clear()
+        await pool.fill("k", make)
+        self.assertEqual(made, [])                                       # запас больше не пополняется
+        failing = WarmPool(size=2, clock=lambda: now[0])
+
+        async def boom():
+            raise OSError("прокси отказал")
+        failing.used["x"] = now[0]
+        await failing.fill("x", boom)
+        self.assertGreater(failing.backoff["x"], now[0])                 # после отказа пауза: перегруженный прокси не долбим
+
+    async def test_setup_gate_limits_and_adapts(self):
+        from envbox.net.warm import SetupGate
+        gate = SetupGate(2)
+        peak = [0]
+        active = [0]
+
+        async def job():
+            async with gate:
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+                await asyncio.sleep(0.02)
+                active[0] -= 1
+        await asyncio.gather(*(job() for _ in range(10)))
+        self.assertEqual(peak[0], 2)                                     # больше лимита одновременно не бывает
+        self.assertEqual(gate.active, 0)
+        gate.fast(took=0.3, waited=0.5)                                  # быстро открылось, а клиент стоял в очереди
+        self.assertEqual(gate.limit, 3)
+        for _ in range(20):
+            gate.fast(took=0.3, waited=0.5)
+        self.assertEqual(gate.limit, gate.ceiling)                       # потолок: втрое
+        gate.fast(took=0.3, waited=0.0)                                  # в очереди не стояли: лимит не растёт
+        self.assertEqual(gate.limit, gate.ceiling)
+        for _ in range(10):
+            gate.slow()
+        self.assertEqual(gate.limit, gate.floor)                         # отказы прокси: лимит падает до нижнего
+        slow = SetupGate(2)
+        slow.fast(took=2.0, waited=1.0)
+        self.assertEqual(slow.limit, 2)                                  # прокси медленный: лимит не раздуваем
+
+    async def test_queue_wait_shrinks_during_a_burst(self):
+        fake = FakeUpstream(delay=0.1)
+        up = await fake.start()
+        self.addCleanup(fake.srv.close)
+        proxy, path = await self.start(up, max_setups=4)
+        res = await asyncio.gather(*(self.connect(path, f"93.184.216.{i}") for i in range(3, 33)))
+        for _t, _r, w in res:
+            w.close()
+        self.assertGreater(proxy.setups.limit, 4)                        # очередь стояла, прокси успевал: лимит вырос
+
+    async def test_hedge_delay_follows_the_usual_setup_time(self):
+        fake = FakeUpstream()
+        up = await fake.start()
+        self.addCleanup(fake.srv.close)
+        proxy, _path = await self.start(up, hedge=2.0)
+        self.assertEqual(proxy.hedge_delay(), 2.0)                       # пока замеров нет
+        proxy.note_setup(0.2)
+        self.assertAlmostEqual(proxy.hedge_delay(), 0.6)                 # втрое дольше обычного, не 2 с
+        proxy.note_setup(0.01)
+        self.assertGreaterEqual(proxy.hedge_delay(), 0.4)                # но не нервно быстро
+        proxy.note_setup(9.0)
+        self.assertEqual(proxy.hedge_delay(), 2.0)                       # и не дольше заданного
+        off, _p = await self.start(up, hedge=2.0, accel=False)
+        off.note_setup(0.1)
+        self.assertEqual(off.hedge_delay(), 2.0)                         # без ускорения всё как раньше
+
+    async def test_request_without_a_response_is_cut_fast_for_claude_hosts_only(self):
+        # прокси бросил туннель молча: приложение ждало бы минуты, пока Claude «думает» без конца
+        silent = FakeUpstream(mode="silent")
+        up = await silent.start()
+        self.addCleanup(silent.srv.close)
+        proxy, path = await self.start(up, hot=(self.HOT,), stall=0.4, idle=0)
+        _t, r, w = await self.connect(path, self.HOT)
+        w.write(b"request")
+        await w.drain()
+        t0 = time.monotonic()
+        self.assertEqual(await asyncio.wait_for(r.read(100), 3), b"")    # соединение закрыто шлюзом
+        self.assertLess(time.monotonic() - t0, 1.5)
+        w.close()
+        await asyncio.sleep(0.2)
+        with open(os.path.join(self.tmp, "net.log"), encoding="utf-8") as f:
+            closes = [json.loads(line) for line in f if '"close"' in line]
+        self.assertEqual(closes[-1]["end"], "stall")
+        # обычный сайт этим правилом не затронут
+        _t, r, w = await self.connect(path, "93.184.216.35")
+        w.write(b"request")
+        await w.drain()
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(r.read(100), 1.0)                     # тишина, но соединение живо
+        w.close()
+        # а живой стрим с пингами не рвётся даже у Claude
+        pings = FakeUpstream(mode="pings")
+        up2 = await pings.start()
+        self.addCleanup(pings.srv.close)
+        proxy2, path2 = await self.start(up2, hot=(self.HOT,), stall=0.4, idle=0)
+        _t, r, w = await self.connect(path2, self.HOT)
+        w.write(b"q")
+        await w.drain()
+        got = b""
+        while len(got) < 6:
+            chunk = await asyncio.wait_for(r.read(100), 2)
+            if not chunk:
+                break
+            got += chunk
+        self.assertGreaterEqual(len(got), 6)                             # пинги шли дольше срока, а стрим не оборван
+        w.close()
+
+    def test_tcp_tuning_never_breaks_a_socket(self):
+        from envbox.net.common import congestion_control, tune_socket
+        self.assertTrue(congestion_control())
+        s = socket.socket()
+        self.addCleanup(s.close)
+        tune_socket(s)
+
+        class Refusing:                                                   # ядро отказывает во всех настройках
+            family = socket.AF_INET
+
+            def setsockopt(self, *a):
+                raise OSError("нельзя")
+        tune_socket(Refusing())                                           # не падаем: остаёмся на стандартном
 
 
 class ChainTests(unittest.IsolatedAsyncioTestCase):

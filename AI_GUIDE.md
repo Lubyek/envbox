@@ -172,6 +172,27 @@ claude.ai и api.anthropic.com без ключа (401 — регион разр�
 `PR_SET_PDEATHSIG`: клиент умирает вместе со шлюзом. Программы клиентов ищутся в PATH или в `ENVBOX_VPN_WIREPROXY`,
 `ENVBOX_VPN_XRAY`, `ENVBOX_VPN_SINGBOX`. Реального VPN-сервера в песочнице Claude нет: клиенты проверены заглушкой.
 
+### 2.2в. Ускорение прокси (`net/warm.py`, `Proxy`, профиль `accelerate`, `--no-accel`)
+
+Где реально теряется время: локальный путь данных (мост → прокси envbox) даёт сотни МБ/с и меньше 1 мс на соединение (замер
+`bench`: 650–1300 МБ/с), то есть узкое место не он, а установка туннеля через вышестоящий прокси (0,3–1 с на КАЖДОЕ соединение)
+и очередь установок. Поэтому ускорено именно это:
+- **Запас готовых туннелей** (`WarmPool`): к `api.anthropic.com`, `claude.ai`, `claude.com` (и `Proxy(hot=…)`) держится по 2 открытых
+  `CONNECT`, живут 20 с (прокси режут долгие и простаивающие), пополняются в фоне, поддерживаются 120 с после последнего
+  использования; при старте шлюза (`prewarm`) открываются сразу для разрешённых сайтов. Туннель открывается только к сайту, куда
+  клиент уже прошёл политику (список разрешённых, частные адреса), поэтому пул политику не обходит. Замер на «дальнем» прокси
+  (0,3 с на подключение к сайту): новое соединение к Claude 304 мс → 2 мс.
+- **`SetupGate`** вместо семафора: лимит одновременных установок растёт (до 3× от 8), если клиенты стоят в очереди, а прокси
+  открывает туннели быстро (< 1 с), и вдвое падает при отказах. Всплеск из 40 соединений 1527 → 1220 мс.
+- **Адаптивный повтор** (`hedge_delay`): второй туннель стартует через 3× обычной установки (0,4…2 с), а не всегда через 2 с.
+- **Быстрый обрыв мёртвого туннеля** (`pipe(stall=…)`, `STALL_TIMEOUT` 75 с): клиент отправил запрос, а байтов ответа нет — шлюз
+  закрывает соединение, `end: "stall"`; приложение повторяет запрос сразу, а не ждёт свой тайм-аут (у Claude минуты: «думает»
+  без конца). Только для «горячих» сайтов: у стриминга приходят хотя бы пинги.
+- **BBR** на сокетах к вышестоящему прокси (`tune_socket`), если ядро разрешает (`net.ipv4.tcp_allowed_congestion_control`); в
+  `proxy-start` поля `accel` и `congestion`. В журнале: `warm`/`setup_ms` у `open`, `end: stall` у `close`.
+Выключатель: профиль `accelerate`, флаг `--no-accel` у `envbox.sh` и шлюза. Что НЕ лечится: потолок скорости и жёсткий лимит жизни
+туннеля (60 с) у самого поставщика прокси.
+
 ### 2.2б. Списки VPN и прокси, массовые действия, журнал сети
 
 Вкладки «VPN» (`gui/pages/vpn.py`, ядро `core/vpn.py`) и «Прокси» (`gui/pages/proxies.py`, ядро `core/proxies.py`) устроены
@@ -257,7 +278,7 @@ tests/test_structure.py       сборка, версия, импорты без 
 tests/test_net.py             шлюз, прокси, DNS, Git, быстрый вход, GUI-логика, установка, пресеты
 src/envbox/
   version.py lazy.py resources.py selfpath.py        самые нижние модули
-  net/        common dns connect upstream chain vpn proxy bridge gitcheck report seccomp entry   (шлюз, БЫСТРЫЙ ВХОД)
+  net/        common dns connect upstream chain vpn warm proxy bridge gitcheck report seccomp entry   (шлюз, БЫСТРЫЙ ВХОД)
   core/       consts fsutil isolation root rootops store profile sessions keyring system browser
               upstream vpn vpncheck proxies terminal netlog describe diagnostics desktop links link_handler
   cdp/        http client keys browser viewer

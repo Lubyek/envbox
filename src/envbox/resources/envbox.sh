@@ -49,6 +49,9 @@ usage() {
                           proxy (это --upstream), direct (выход этого компьютера, в том числе его
                           системный VPN), vpn:<wireguard|xray|singbox>:/путь/к/конфигурации (клиент
                           запускается и останавливается вместе со средой, без root)
+  --no-accel              отключить ускорение прокси: по умолчанию к сайтам Claude шлюз держит наготове открытые
+                          туннели (новое соединение не ждёт подключения прокси), подстраивает повторы и очередь и
+                          быстро рвёт мёртвый туннель, чтобы приложение повторило запрос, а не «думало» без конца
   --direct-domain <домен> с --upstream: подключаться к этому сайту напрямую, мимо вышестоящего
                           прокси (сайт видит ваш настоящий адрес, а не адрес прокси). Среда по-прежнему
                           выходит только через прокси envbox. Формат как у --allow-domain; в режиме
@@ -160,6 +163,7 @@ report_mode=""
 upstream=""
 chain_specs=()
 chain_remote=0
+accel=1
 iso_seccomp=1 iso_pid=1 iso_ipc=1 iso_uts=1 iso_cgroup=1 iso_session=1 iso_die_parent=1
 iso_caps=1 iso_ro_root=1 iso_clean_env=1 iso_neutral_dns=1 iso_net_forced=1 iso_home_real=0
 host_files=""
@@ -219,6 +223,7 @@ while (( $# )); do
     --direct-domain)  need_arg "$1" $#; direct_domains+=("$2"); shift 2 ;;
     --upstream)      need_arg "$1" $#; upstream=$2; net_log=1; shift 2 ;;
     --chain)         need_arg "$1" $#; chain_specs+=("$2"); net_log=1; shift 2 ;;
+    --no-accel)      accel=0; shift ;;
     --iso)            need_arg "$1" $#; set_iso "$2"; shift 2 ;;
     --relaxed)        iso_seccomp=0; iso_neutral_dns=0; iso_net_forced=0; shift ;;
     --host-files)     need_arg "$1" $#; host_files=$2; shift 2 ;;
@@ -724,6 +729,7 @@ if (( net_log )); then
     (( net_allow_private )) && proxy_args+=(--allow-private)
     [[ -z "$upstream" ]] || proxy_args+=(--upstream "$upstream")
     for c in "${chain_specs[@]}"; do proxy_args+=(--chain "$c"); done
+    (( accel )) || proxy_args+=(--no-accel)
     for d in "${direct_domains[@]}"; do proxy_args+=(--direct "$d"); done
     for d in "${dns_servers[@]}"; do proxy_args+=(--dns "$d"); done
     rm -f -- "$sock"

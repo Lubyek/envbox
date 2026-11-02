@@ -146,6 +146,12 @@ class ProfilePageMixin:
             "Пускать на частные адреса",
             "Открывает среде localhost и локальную сеть через прокси. Обычно не нужно.")
         self.private_widgets = rows.add(None, line)
+        line, self.cb_accel = toggle(
+            "Ускорение прокси",
+            "К сайтам Claude шлюз держит наготове открытые туннели: новое соединение не ждёт, пока прокси подключится "
+            "к сайту (на дальних прокси это 0,3–1 с на каждое). Заодно подстраиваются повторы и очередь, а мёртвый "
+            "туннель обрывается за 75 с, чтобы приложение повторило запрос, а не «думало» без конца. Включено по умолчанию.")
+        self.private_widgets += rows.add(None, line)
         page.append(box)
 
         box, grid = section("Свой прокси",
@@ -411,6 +417,7 @@ class ProfilePageMixin:
         self.dd_net.set_selected(NET_MODES.index(p.net))
         set_text(self.tv_domains, "\n".join(p.allow_domains))
         self.cb_private.set_active(p.net_allow_private)
+        self.cb_accel.set_active(p.accelerate)
         self.e_upstream.set_text(p.upstream)
         set_text(self.tv_chain, "\n".join(p.upstream_chain))
         self.refresh_vpn_choices()
@@ -464,6 +471,7 @@ class ProfilePageMixin:
             net=NET_MODES[self.dd_net.get_selected()],
             allow_domains=get_lines(self.tv_domains),
             net_allow_private=self.cb_private.get_active(),
+            accelerate=self.cb_accel.get_active(),
             upstream=self.e_upstream.get_text().strip(),
             upstream_auth=self.current.upstream_auth,
             upstream_chain=get_lines(self.tv_chain),

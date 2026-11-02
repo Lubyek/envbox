@@ -114,6 +114,9 @@ def describe(p):
         who = "логином и паролем из keyring" if p.upstream_auth else "без логина"
         out.append(("info", f"Дальше трафик идёт через ваш прокси {p.upstream} ({who}); "
                             "имена сайтов разрешает он."))
+    if p.has_remote and p.net in ("log", "allowlist"):
+        out.append(("info", "Ускорение прокси " + ("включено: к сайтам Claude заранее открыты туннели, мёртвый туннель "
+                                                  "обрывается за 75 с." if p.accelerate else "выключено.")))
     if p.direct_domains and p.has_remote and p.net in ("log", "allowlist"):
         out.append(("warn", "Напрямую, мимо прокси и VPN, пойдут: " + ", ".join(p.direct_domains) +
                     ". Эти сайты увидят ваш настоящий адрес. Программа в среде по-прежнему видит только "

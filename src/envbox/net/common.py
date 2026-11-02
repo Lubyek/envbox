@@ -34,6 +34,12 @@ MAX_HEDGES = 4
 MAX_SETUPS = 8
 
 
+# Клиент отправил запрос, а ответа нет столько секунд: туннель мёртв (прокси бросил соединение молча или сменил адрес).
+# Без этого приложение ждёт свой огромный тайм-аут (у Claude минуты), а на экране «думает» без конца. Применяется только
+# к «горячим» сайтам (Claude): у стриминговых ответов приходят хотя бы пинги, а ответ дольше этого срока — аномалия.
+STALL_TIMEOUT = 75
+
+
 BUF = 64 * 1024
 
 
@@ -107,6 +113,28 @@ def canon_host(host):
     return name
 
 
+# Управление перегрузкой для соединений шлюза (вышестоящий прокси): BBR заметно быстрее CUBIC на длинных каналах с потерями,
+# где обычно и работают платные прокси: исходящие данные (отправка запросов, загрузка) не «проседают» после каждой потери.
+# Ядро разрешает выбирать BBR обычному пользователю только если он есть в net.ipv4.tcp_allowed_congestion_control.
+CONGESTION_CHOICE = b"bbr"
+
+
+_CC_STATE = {"name": None}
+
+
+def congestion_control():
+    """Какое управление перегрузкой получат соединения шлюза: 'bbr' или системное (например 'cubic')."""
+    if _CC_STATE["name"] is None:
+        try:
+            with open("/proc/sys/net/ipv4/tcp_allowed_congestion_control", encoding="ascii") as f:
+                allowed = f.read().split()
+            default = open("/proc/sys/net/ipv4/tcp_congestion_control", encoding="ascii").read().strip()
+        except OSError:
+            allowed, default = [], "?"
+        _CC_STATE["name"] = CONGESTION_CHOICE.decode() if CONGESTION_CHOICE.decode() in allowed else default
+    return _CC_STATE["name"]
+
+
 def tune_socket(sock):
     """Живые соединения не должны зависать насовсем: после сна компьютера, смены сети или перезапуска VPN
     мёртвый сокет обнаруживается за пару минут, а не остаётся «открытым» навсегда. Мелкие записи не ждут."""
@@ -120,3 +148,8 @@ def tune_socket(sock):
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 4)
     except (OSError, AttributeError):
         pass
+    if congestion_control() == CONGESTION_CHOICE.decode():
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_CONGESTION, CONGESTION_CHOICE)
+        except (OSError, AttributeError):
+            pass

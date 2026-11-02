@@ -48,6 +48,10 @@ def _fmt_event(e):
         tail = f" ({e.get('ip') or 'через ' + str(e.get('via', '?'))}{', напрямую' if e.get('direct') else ''})"
         if e.get("chan"):
             tail += f" [канал: {e['chan']}]"
+        if e.get("warm"):
+            tail += " [готовый туннель]"
+        elif e.get("setup_ms") is not None:
+            tail += f" [туннель {e['setup_ms']} мс]"
         if e.get("url"):
             tail += f" {e.get('method', '')} {e['url']}"
     elif ev == "close":
@@ -55,7 +59,8 @@ def _fmt_event(e):
         if e.get("idle"):
             tail += " (закрыто: не было данных)"
         elif e.get("end"):
-            tail += " (закрыл " + {"client": "клиент", "upstream": "сервер или прокси"}.get(e["end"], e["end"]) + ")"
+            tail += " (закрыл " + {"client": "клиент", "upstream": "сервер или прокси",
+                                   "stall": "шлюз: запрос без ответа, туннель мёртв"}.get(e["end"], e["end"]) + ")"
     elif ev in ("deny", "error"):
         tail = f" {e.get('reason', '')}"
     return f"{e.get('ts', '')}  {label:<8} {target}{tail}"

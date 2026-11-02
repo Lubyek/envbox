@@ -59,6 +59,8 @@ class Profile:
     kind: str = "app"
     upstream: str = ""
     upstream_auth: bool = False
+    # Ускорение прокси: готовые туннели к сайтам Claude, адаптивные повторы и очередь, быстрый обрыв мёртвого туннеля
+    accelerate: bool = True
     # Каналы выхода по порядку: «proxy» (поле upstream), «vpn:<имя>» (вкладка VPN), «direct» (выход этого компьютера,
     # в том числе через его системный VPN). Пусто — как раньше: один прокси или прямой выход.
     upstream_chain: list = field(default_factory=list)
@@ -446,6 +448,8 @@ class Profile:
         if self.chain_on:
             for spec in self.chain_specs():
                 a += ["--chain", spec]
+        if not self.accelerate and self.net in ("log", "allowlist"):
+            a.append("--no-accel")
         if self.has_remote and self.net in ("log", "allowlist"):
             for d in self.direct_domains:
                 a += ["--direct-domain", d]

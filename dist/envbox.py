@@ -38,7 +38,7 @@ import time
 
 # ---- version.py: Версия envbox (строка читается регулярным выражением при установке — не менять формат).
 
-ENVBOX_VERSION = "2026.11.02.14"
+ENVBOX_VERSION = "2026.11.02.15"
 
 
 # ---- lazy.py: Ленивые модули стандартной библиотеки: настоящий import происходит при первом обращении к атрибуту.
@@ -99,6 +99,12 @@ MAX_HEDGES = 4
 # десятки соединений за секунду; платные прокси такой всплеск часто принимают, но не обслуживают (соединения висят
 # до тайм-аута клиента). Лишние ждут своей очереди: установка занимает около полусекунды, всплеск рассасывается за секунды.
 MAX_SETUPS = 8
+
+
+# Клиент отправил запрос, а ответа нет столько секунд: туннель мёртв (прокси бросил соединение молча или сменил адрес).
+# Без этого приложение ждёт свой огромный тайм-аут (у Claude минуты), а на экране «думает» без конца. Применяется только
+# к «горячим» сайтам (Claude): у стриминговых ответов приходят хотя бы пинги, а ответ дольше этого срока — аномалия.
+STALL_TIMEOUT = 75
 
 
 BUF = 64 * 1024
@@ -174,6 +180,28 @@ def canon_host(host):
     return name
 
 
+# Управление перегрузкой для соединений шлюза (вышестоящий прокси): BBR заметно быстрее CUBIC на длинных каналах с потерями,
+# где обычно и работают платные прокси: исходящие данные (отправка запросов, загрузка) не «проседают» после каждой потери.
+# Ядро разрешает выбирать BBR обычному пользователю только если он есть в net.ipv4.tcp_allowed_congestion_control.
+CONGESTION_CHOICE = b"bbr"
+
+
+_CC_STATE = {"name": None}
+
+
+def congestion_control():
+    """Какое управление перегрузкой получат соединения шлюза: 'bbr' или системное (например 'cubic')."""
+    if _CC_STATE["name"] is None:
+        try:
+            with open("/proc/sys/net/ipv4/tcp_allowed_congestion_control", encoding="ascii") as f:
+                allowed = f.read().split()
+            default = open("/proc/sys/net/ipv4/tcp_congestion_control", encoding="ascii").read().strip()
+        except OSError:
+            allowed, default = [], "?"
+        _CC_STATE["name"] = CONGESTION_CHOICE.decode() if CONGESTION_CHOICE.decode() in allowed else default
+    return _CC_STATE["name"]
+
+
 def tune_socket(sock):
     """Живые соединения не должны зависать насовсем: после сна компьютера, смены сети или перезапуска VPN
     мёртвый сокет обнаруживается за пару минут, а не остаётся «открытым» навсегда. Мелкие записи не ждут."""
@@ -187,6 +215,11 @@ def tune_socket(sock):
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 4)
     except (OSError, AttributeError):
         pass
+    if congestion_control() == CONGESTION_CHOICE.decode():
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_CONGESTION, CONGESTION_CHOICE)
+        except (OSError, AttributeError):
+            pass
 
 
 # ---- net/upstream.py: Сетевой шлюз: вышестоящий прокси (http / socks5 / socks5h).
@@ -1701,7 +1734,179 @@ class VpnClient:
             self.dir = None
 
 
+# ---- net/warm.py: Сетевой шлюз: заранее открытые туннели к «горячим» сайтам (Claude), чтобы новое соединение не ждало подключения.
+
+# Сайты, к которым запас держится сразу (остальные можно добавить при создании шлюза)
+HOT_SUFFIXES = ("anthropic.com", "claude.ai", "claude.com")
+
+
+# Сколько готовых туннелей на сайт и сколько секунд один живёт: прокси режут простаивающие туннели, а у части поставщиков
+# туннель живёт не дольше минуты, поэтому запас обновляется заметно чаще
+WARM_SIZE = 2
+
+
+WARM_TTL = 20.0
+
+
+# Сколько секунд после последнего использования сайта запас ещё поддерживается
+WARM_KEEP = 120.0
+
+
+# Пауза после неудачной попытки открыть запасной туннель (не долбить перегруженный прокси)
+WARM_RETRY = 5.0
+
+
+def is_hot(host, extra=()):
+    """Относится ли сайт к «горячим»: host равен суффиксу или его поддомен."""
+    h = host.lower().rstrip(".")
+    return any(h == s or h.endswith("." + s) for s in tuple(HOT_SUFFIXES) + tuple(extra))
+
+
+class WarmPool:
+    """Запас готовых туннелей по ключу (прокси, хост, порт)."""
+
+    def __init__(self, size=WARM_SIZE, ttl=WARM_TTL, keep=WARM_KEEP, clock=time.monotonic):
+        self.size, self.ttl, self.keep, self.clock = size, ttl, keep, clock
+        self.pool = {}        # ключ -> [(когда открыт, reader, writer)]
+        self.used = {}        # ключ -> когда последний раз брали или просили запас
+        self.makers = {}      # ключ -> корутина-фабрика нового туннеля
+        self.backoff = {}     # ключ -> до какого момента не пробуем снова
+        self.filling = set()
+        self.tasks = set()    # фоновые пополнения: при остановке отменяются, а не висят до сборщика мусора
+        self.hits = 0
+        self.misses = 0
+
+    def stale(self, entry, now):
+        created, reader, writer = entry
+        return now - created > self.ttl or writer.is_closing() or reader.at_eof()
+
+    def take(self, key):
+        """Готовый туннель (reader, writer) или None. Просроченные и закрытые прокси выбрасываются."""
+        now = self.clock()
+        self.used[key] = now
+        items = self.pool.get(key, [])
+        while items:
+            entry = items.pop(0)
+            if self.stale(entry, now):
+                entry[2].close()
+                continue
+            self.hits += 1
+            return entry[1], entry[2]
+        self.misses += 1
+        return None
+
+    def want(self, key, make):
+        """Сайтом пользуются: поддерживать запас. make() — корутина, открывающая новый туннель."""
+        self.used[key] = self.clock()
+        self.makers[key] = make
+        if key not in self.filling:
+            self.spawn(self.fill(key, make))
+
+    def spawn(self, coro):
+        task = asyncio.ensure_future(coro)
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+
+    async def fill(self, key, make):
+        if key in self.filling or self.clock() < self.backoff.get(key, 0.0):
+            return
+        self.filling.add(key)
+        try:
+            while self.clock() - self.used.get(key, 0.0) < self.keep:
+                items = self.pool.setdefault(key, [])
+                now = self.clock()
+                for entry in [e for e in items if self.stale(e, now)]:
+                    items.remove(entry)
+                    entry[2].close()
+                if len(items) >= self.size:
+                    break
+                try:
+                    reader, writer = await make()
+                except (OSError, asyncio.TimeoutError):
+                    self.backoff[key] = self.clock() + WARM_RETRY
+                    break
+                items.append((self.clock(), reader, writer))
+        finally:
+            self.filling.discard(key)
+
+    async def maintain(self):
+        """Фоновое обновление: устаревшие туннели заменяются, запас неиспользуемых сайтов закрывается."""
+        while True:
+            await asyncio.sleep(self.ttl / 2)
+            now = self.clock()
+            for key, make in list(self.makers.items()):
+                if now - self.used.get(key, 0.0) >= self.keep:
+                    for entry in self.pool.pop(key, []):
+                        entry[2].close()
+                    self.makers.pop(key, None)
+                    continue
+                self.spawn(self.fill(key, make))
+
+    def close_all(self):
+        for task in list(self.tasks):
+            task.cancel()
+        for items in self.pool.values():
+            for entry in items:
+                entry[2].close()
+        self.pool.clear()
+        self.makers.clear()
+
+
+class SetupGate:
+    """Сколько туннелей к вышестоящему прокси можно открывать одновременно; лимит подстраивается.
+
+    Платные прокси плохо переносят всплеск соединений, поэтому лимит ограничен (по умолчанию 8). Но когда прокси
+    отвечает быстро, а соединения всё равно стоят в очереди, лимит растёт по одному (до тройного): очередь стоит клиенту
+    секунд. Сбой или тайм-аут установки вдвое сжимает лимит: прокси перегружен, давить на него не нужно."""
+
+    def __init__(self, base):
+        self.limit = self.base = base
+        self.ceiling = base * 3
+        self.floor = max(2, base // 2)
+        self.active = 0
+        self.waiters = []         # короткая очередь ожидающих: список не дороже deque, а импорт collections не нужен
+
+    async def acquire(self):
+        while self.active >= self.limit:
+            fut = asyncio.get_running_loop().create_future()
+            self.waiters.append(fut)
+            try:
+                await fut
+            except BaseException:
+                if fut in self.waiters:
+                    self.waiters.remove(fut)
+                raise
+        self.active += 1
+
+    def release(self):
+        self.active -= 1
+        for _ in range(max(0, self.limit - self.active)):
+            while self.waiters:
+                fut = self.waiters.pop(0)
+                if not fut.done():
+                    fut.set_result(None)
+                    break
+
+    async def __aenter__(self):
+        await self.acquire()
+
+    async def __aexit__(self, *exc):
+        self.release()
+
+    def fast(self, took, waited):
+        """Туннель открылся быстро, но клиент стоял в очереди: можно пускать больше."""
+        if waited > 0.2 and took < 1.0:
+            self.limit = min(self.ceiling, self.limit + 1)
+
+    def slow(self):
+        self.limit = max(self.floor, self.limit // 2)
+
+
 # ---- net/proxy.py: Сетевой шлюз: журналирующий прокси (команда proxy).
+
+# Туннели к этим сайтам открываются сразу при старте шлюза (если сайт разрешён)
+PREWARM_HOSTS = ("api.anthropic.com", "claude.ai")
+
 
 LOG_LIMIT = 20 * 1024 * 1024        # больше этого размера журнал уходит в .1
 LOG_CHECK_EVERY = 500               # как часто (в записях) проверять размер во время работы
@@ -1744,9 +1949,10 @@ class OpenFailed(OSError):
 
 class Proxy:
     def __init__(self, log_path, allow, allow_private, upstream=None, dns=None, direct=None,
-                 idle=IDLE_TIMEOUT, hedge=HEDGE_DELAY, max_hedges=MAX_HEDGES, max_setups=MAX_SETUPS, chain=None):
+                 idle=IDLE_TIMEOUT, hedge=HEDGE_DELAY, max_hedges=MAX_HEDGES, max_setups=MAX_SETUPS, chain=None,
+                 accel=True, hot=(), stall=STALL_TIMEOUT):
         self.log_path = log_path
-        self.setups = asyncio.Semaphore(max_setups)   # одновременные установки туннеля к вышестоящему прокси
+        self.setups = SetupGate(max_setups)   # одновременные установки туннеля к вышестоящему прокси (лимит подстраивается)
         self.max_hedges = max_hedges
         self.hedging = 0          # сколько вторых туннелей строится прямо сейчас
         self.idle = idle          # секунд без единого байта до закрытия соединения (0 — не закрывать)
@@ -1759,6 +1965,11 @@ class Proxy:
         self.chain = chain if chain is not None else Chain(
             [Channel("proxy", "proxy", upstream)] if upstream is not None else [])
         self.tasks = []
+        # ускорение: запас готовых туннелей к «горячим» сайтам, адаптивный повтор, быстрый обрыв мёртвых туннелей
+        self.warm = WarmPool() if accel else None
+        self.hot = tuple(hot)
+        self.stall = stall if accel else 0
+        self.setup_ewma = None       # скользящее среднее времени установки туннеля, секунд
         # сайты, к которым прокси подключается сам, минуя вышестоящий прокси (некоторые сайты не пускают его адрес)
         self.direct = [a.lower().rstrip(".") for a in (direct or [])]
         self.dns = list(dns or [])
@@ -1818,11 +2029,21 @@ class Proxy:
         except (ConnectionError, OSError):
             pass
 
+    def hedge_delay(self):
+        """Через сколько секунд начинать второй туннель: втрое дольше обычной установки, но не больше заданного.
+        Потерянный первый пакет стоит секунду; ждать фиксированные 2 с, когда прокси обычно отвечает за 0,3 с, незачем."""
+        if self.setup_ewma is None or not self.warm:
+            return self.hedge
+        return min(self.hedge, max(0.4, 3 * self.setup_ewma))
+
+    def note_setup(self, seconds):
+        self.setup_ewma = seconds if self.setup_ewma is None else 0.8 * self.setup_ewma + 0.2 * seconds
+
     async def hedged_tunnel(self, up, host, port):
         """Туннель через вышестоящий прокси `up`. Если первая попытка не готова за `hedge` секунд, стартует вторая;
         берётся первая удавшаяся, остальные закрываются. Ошибка — только если не удалась ни одна."""
         first = asyncio.ensure_future(up.tunnel(host, port))
-        done, _ = await asyncio.wait({first}, timeout=self.hedge)
+        done, _ = await asyncio.wait({first}, timeout=self.hedge_delay())
         if done:
             return first.result()
         if self.hedging >= self.max_hedges:
@@ -1852,14 +2073,15 @@ class Proxy:
             raise error
         return winner
 
-    async def pipe(self, cr, cw, ur, uw, first):
+    async def pipe(self, cr, cw, ur, uw, first, stall=0):
         """Пересылка в обе стороны. Возвращает (отправлено, получено, кто_закончил, метки времени в мс):
         кто_закончил — «client», «upstream» или «idle»."""
         counts = {"up": len(first), "down": 0}
         started = last_t = time.monotonic()
         last = [last_t]
         stamps = {}       # моменты (от начала пересылки): последний байт от клиента, первый и последний байт ответа
-        stalled = [False]
+        stalled = [""]       # почему шлюз закрыл соединение сам: «idle» (нет данных) или «stall» (запрос без ответа)
+        mark = {"up": started + (1e-6 if first else 0), "down": started}   # когда в последний раз шли данные от клиента и к клиенту
         ended = []        # какая сторона закончила первой: по этому видно, кто рвёт соединения (клиент или прокси)
         if first:
             uw.write(first)
@@ -1871,7 +2093,7 @@ class Proxy:
                     data = await src.read(BUF)
                     if not data:
                         break
-                    now = last[0] = time.monotonic()
+                    now = last[0] = mark[key] = time.monotonic()
                     counts[key] += len(data)
                     if key == "up":
                         stamps["up_end"] = now
@@ -1891,23 +2113,28 @@ class Proxy:
                     pass
 
         async def watch():
-            step = max(0.05, min(5.0, self.idle / 4))
+            step = max(0.05, min(5.0, min(t for t in (self.idle, stall) if t) / 4))
             while True:
                 await asyncio.sleep(step)
-                if time.monotonic() - last[0] > self.idle:
-                    stalled[0] = True
-                    for w in (cw, uw):
-                        w.close()      # оба копировщика получат конец потока и завершатся
-                    return
+                t = time.monotonic()
+                if self.idle and t - last[0] > self.idle:
+                    stalled[0] = "idle"
+                elif stall and mark["up"] > mark["down"] and t - mark["up"] > stall:
+                    stalled[0] = "stall"          # клиент ждёт ответа, а его нет: туннель мёртв, пусть повторит запрос
+                else:
+                    continue
+                for w in (cw, uw):
+                    w.close()      # оба копировщика получат конец потока и завершатся
+                return
 
-        watcher = asyncio.ensure_future(watch()) if self.idle else None
+        watcher = asyncio.ensure_future(watch()) if (self.idle or stall) else None
         try:
             # одна сторона упала неожиданной ошибкой — вторая всё равно доводится до конца, а не остаётся висеть
             await asyncio.gather(copy(cr, uw, "up"), copy(ur, cw, "down"), return_exceptions=True)
         finally:
             if watcher is not None:
                 watcher.cancel()
-        end = "idle" if stalled[0] else "client" if ended[:1] == ["up"] else "upstream"
+        end = stalled[0] or ("client" if ended[:1] == ["up"] else "upstream")
         # по этим меткам видно, кто молчит у зависшего соединения: клиент не договорил запрос или сервер не ответил
         timing = {k: int((t - started) * 1000) for k, t in stamps.items()}
         return counts["up"], counts["down"], end, timing
@@ -1946,12 +2173,31 @@ class Proxy:
             return ur, uw, True, None, ip
         up = await self.channel_upstream(ch)
         if method == "CONNECT" or up.kind == "socks5":
+            key = (up.label, host, port)
+            hot = self.warm is not None and is_hot(host, self.hot)
+            if hot:
+                got = self.warm.take(key)
+                if got:       # туннель уже открыт заранее: клиент не ждёт подключения прокси к сайту
+                    rec["warm"] = True
+                    self.warm.want(key, lambda: self.warm_tunnel(up, host, port))
+                    return got[0], got[1], True, up, None
             queued = time.monotonic()
             async with self.setups:
                 waited = time.monotonic() - queued
-                ur, uw = await self.hedged_tunnel(up, host, port)
+                t0 = time.monotonic()
+                try:
+                    ur, uw = await self.hedged_tunnel(up, host, port)
+                except (OSError, asyncio.TimeoutError):
+                    self.setups.slow()          # прокси не справляется: давить на него не нужно
+                    raise
+                took = time.monotonic() - t0
+            self.setups.fast(took, waited)
+            self.note_setup(took)
+            rec["setup_ms"] = int(took * 1000)
             if waited > 0.2:
                 rec["wait_ms"] = int(waited * 1000)   # всплеск соединений: ждали своей очереди
+            if hot:
+                self.warm.want(key, lambda: self.warm_tunnel(up, host, port))
             return ur, uw, True, up, None
         ur, uw = await up.open()      # обычный HTTP: запрос в абсолютной форме самому прокси
         return ur, uw, False, up, None
@@ -1986,6 +2232,22 @@ class Proxy:
         via = ch.upstream.label if ch.upstream is not None and ch.kind == "proxy" else None
         raise OpenFailed(why, text, via)
 
+    def prewarm(self):
+        """Первый всплеск соединений приложения (Claude открывает десятки сразу) не ждёт прокси: туннели к главным сайтам
+        открываются при старте. Только разрешённые сайты и только через первый прокси цепочки."""
+        for host in PREWARM_HOSTS:
+            if not self.allowed(host) or host_matches(self.direct, host):
+                continue
+            ch = next((c for c in self.chain.channels if c.kind == "proxy" and c.upstream is not None), None)
+            if ch is not None:
+                up = ch.upstream
+                self.warm.want((up.label, host, 443), lambda up=up, host=host: self.warm_tunnel(up, host, 443))
+
+    async def warm_tunnel(self, up, host, port):
+        """Запасной туннель для пула: открывается так же, как обычный, и занимает ту же очередь установок."""
+        async with self.setups:
+            return await up.tunnel(host, port)
+
     async def start_client(self, ch):
         try:
             await ch.client.start()
@@ -2013,10 +2275,15 @@ class Proxy:
                 self.tasks.append(asyncio.ensure_future(self.start_client(ch)))
         if len(self.chain.channels) > 1:
             self.tasks.append(asyncio.ensure_future(self.probe_loop()))
+        if self.warm is not None:
+            self.tasks.append(asyncio.ensure_future(self.warm.maintain()))
+            self.prewarm()
 
     def end(self):
         for t in self.tasks:
             t.cancel()
+        if self.warm is not None:
+            self.warm.close_all()
         for ch in self.chain.channels:
             if ch.client is not None:
                 ch.client.stop()
@@ -2136,7 +2403,8 @@ class Proxy:
                         headers.append(f"Proxy-Authorization: {used.basic()}")
                 req = f"{method} {target_line} HTTP/1.1\r\n" + "".join(h + "\r\n" for h in headers)
                 first = (req + ("" if websocket else "Connection: close\r\n") + "\r\n").encode("latin-1")
-            up, down, end, timing = await self.pipe(reader, writer, ur, upstream, first)
+            hot_stall = self.stall if (self.warm is not None and is_hot(host, self.hot)) else 0
+            up, down, end, timing = await self.pipe(reader, writer, ur, upstream, first, hot_stall)
             self.write({"id": cid, "event": "close", "host": host, "port": port,
                         "up": up, "down": down, "ms": int((time.monotonic() - t0) * 1000), "end": end,
                         **timing, **({"idle": True} if end == "idle" else {})})
@@ -2189,7 +2457,7 @@ def cmd_proxy(a):
         except ValueError:
             sys.exit(f"envbox-net: недопустимый DNS-сервер: {d}")
     chain = build_chain(a.chain, upstream, os.path.dirname(os.path.abspath(a.log))) if a.chain else None
-    proxy = Proxy(a.log, a.allow, a.allow_private, upstream, a.dns, a.direct, chain=chain)
+    proxy = Proxy(a.log, a.allow, a.allow_private, upstream, a.dns, a.direct, chain=chain, accel=not a.no_accel)
 
     async def main():
         if os.path.lexists(a.socket):
@@ -2203,6 +2471,7 @@ def cmd_proxy(a):
                      "allow_private": proxy.allow_private,
                      "upstream": upstream.label if upstream else None,
                      "chain": proxy.chain.describe() if chain is not None else None,
+                     "accel": proxy.warm is not None, "congestion": congestion_control(),
                      "dns": proxy.dns or None, "direct": proxy.direct or None})
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -2273,6 +2542,10 @@ def _fmt_event(e):
         tail = f" ({e.get('ip') or 'через ' + str(e.get('via', '?'))}{', напрямую' if e.get('direct') else ''})"
         if e.get("chan"):
             tail += f" [канал: {e['chan']}]"
+        if e.get("warm"):
+            tail += " [готовый туннель]"
+        elif e.get("setup_ms") is not None:
+            tail += f" [туннель {e['setup_ms']} мс]"
         if e.get("url"):
             tail += f" {e.get('method', '')} {e['url']}"
     elif ev == "close":
@@ -2280,7 +2553,8 @@ def _fmt_event(e):
         if e.get("idle"):
             tail += " (закрыто: не было данных)"
         elif e.get("end"):
-            tail += " (закрыл " + {"client": "клиент", "upstream": "сервер или прокси"}.get(e["end"], e["end"]) + ")"
+            tail += " (закрыл " + {"client": "клиент", "upstream": "сервер или прокси",
+                                   "stall": "шлюз: запрос без ответа, туннель мёртв"}.get(e["end"], e["end"]) + ")"
     elif ev in ("deny", "error"):
         tail = f" {e.get('reason', '')}"
     return f"{e.get('ts', '')}  {label:<8} {target}{tail}"
@@ -2393,7 +2667,8 @@ def cmd_seccomp(a):
 # Вид: команда -> {параметр: вид}, где вид: str, int, list (повторяемый) или flag.
 NET_OPTIONS = {
     "proxy": {"--socket": "str", "--log": "str", "--allow": "list", "--allow-private": "flag",
-              "--parent-pid": "int", "--upstream": "str", "--dns": "list", "--direct": "list", "--chain": "list"},
+              "--parent-pid": "int", "--upstream": "str", "--dns": "list", "--direct": "list", "--chain": "list",
+              "--no-accel": "flag"},
     "wrap": {"--map": "list", "--serve": "list", "--inbox": "str", "--inbox-cmd": "str",
              "--inbox-scheme": "list", "--inbox-callback": "flag"},
     "seccomp": {"--allow": "list"},
@@ -2593,6 +2868,9 @@ usage() {
                           proxy (это --upstream), direct (выход этого компьютера, в том числе его
                           системный VPN), vpn:<wireguard|xray|singbox>:/путь/к/конфигурации (клиент
                           запускается и останавливается вместе со средой, без root)
+  --no-accel              отключить ускорение прокси: по умолчанию к сайтам Claude шлюз держит наготове открытые
+                          туннели (новое соединение не ждёт подключения прокси), подстраивает повторы и очередь и
+                          быстро рвёт мёртвый туннель, чтобы приложение повторило запрос, а не «думало» без конца
   --direct-domain <домен> с --upstream: подключаться к этому сайту напрямую, мимо вышестоящего
                           прокси (сайт видит ваш настоящий адрес, а не адрес прокси). Среда по-прежнему
                           выходит только через прокси envbox. Формат как у --allow-domain; в режиме
@@ -2704,6 +2982,7 @@ report_mode=""
 upstream=""
 chain_specs=()
 chain_remote=0
+accel=1
 iso_seccomp=1 iso_pid=1 iso_ipc=1 iso_uts=1 iso_cgroup=1 iso_session=1 iso_die_parent=1
 iso_caps=1 iso_ro_root=1 iso_clean_env=1 iso_neutral_dns=1 iso_net_forced=1 iso_home_real=0
 host_files=""
@@ -2763,6 +3042,7 @@ while (( $# )); do
     --direct-domain)  need_arg "$1" $#; direct_domains+=("$2"); shift 2 ;;
     --upstream)      need_arg "$1" $#; upstream=$2; net_log=1; shift 2 ;;
     --chain)         need_arg "$1" $#; chain_specs+=("$2"); net_log=1; shift 2 ;;
+    --no-accel)      accel=0; shift ;;
     --iso)            need_arg "$1" $#; set_iso "$2"; shift 2 ;;
     --relaxed)        iso_seccomp=0; iso_neutral_dns=0; iso_net_forced=0; shift ;;
     --host-files)     need_arg "$1" $#; host_files=$2; shift 2 ;;
@@ -3268,6 +3548,7 @@ if (( net_log )); then
     (( net_allow_private )) && proxy_args+=(--allow-private)
     [[ -z "$upstream" ]] || proxy_args+=(--upstream "$upstream")
     for c in "${chain_specs[@]}"; do proxy_args+=(--chain "$c"); done
+    (( accel )) || proxy_args+=(--no-accel)
     for d in "${direct_domains[@]}"; do proxy_args+=(--direct "$d"); done
     for d in "${dns_servers[@]}"; do proxy_args+=(--dns "$d"); done
     rm -f -- "$sock"
@@ -6617,6 +6898,8 @@ class Profile:
     kind: str = "app"
     upstream: str = ""
     upstream_auth: bool = False
+    # Ускорение прокси: готовые туннели к сайтам Claude, адаптивные повторы и очередь, быстрый обрыв мёртвого туннеля
+    accelerate: bool = True
     # Каналы выхода по порядку: «proxy» (поле upstream), «vpn:<имя>» (вкладка VPN), «direct» (выход этого компьютера,
     # в том числе через его системный VPN). Пусто — как раньше: один прокси или прямой выход.
     upstream_chain: list = field(default_factory=list)
@@ -7004,6 +7287,8 @@ class Profile:
         if self.chain_on:
             for spec in self.chain_specs():
                 a += ["--chain", spec]
+        if not self.accelerate and self.net in ("log", "allowlist"):
+            a.append("--no-accel")
         if self.has_remote and self.net in ("log", "allowlist"):
             for d in self.direct_domains:
                 a += ["--direct-domain", d]
@@ -8162,6 +8447,9 @@ def describe(p):
         who = "логином и паролем из keyring" if p.upstream_auth else "без логина"
         out.append(("info", f"Дальше трафик идёт через ваш прокси {p.upstream} ({who}); "
                             "имена сайтов разрешает он."))
+    if p.has_remote and p.net in ("log", "allowlist"):
+        out.append(("info", "Ускорение прокси " + ("включено: к сайтам Claude заранее открыты туннели, мёртвый туннель "
+                                                  "обрывается за 75 с." if p.accelerate else "выключено.")))
     if p.direct_domains and p.has_remote and p.net in ("log", "allowlist"):
         out.append(("warn", "Напрямую, мимо прокси и VPN, пойдут: " + ", ".join(p.direct_domains) +
                     ". Эти сайты увидят ваш настоящий адрес. Программа в среде по-прежнему видит только "
@@ -12202,6 +12490,12 @@ def _build_gui():
                 "Пускать на частные адреса",
                 "Открывает среде localhost и локальную сеть через прокси. Обычно не нужно.")
             self.private_widgets = rows.add(None, line)
+            line, self.cb_accel = toggle(
+                "Ускорение прокси",
+                "К сайтам Claude шлюз держит наготове открытые туннели: новое соединение не ждёт, пока прокси подключится "
+                "к сайту (на дальних прокси это 0,3–1 с на каждое). Заодно подстраиваются повторы и очередь, а мёртвый "
+                "туннель обрывается за 75 с, чтобы приложение повторило запрос, а не «думало» без конца. Включено по умолчанию.")
+            self.private_widgets += rows.add(None, line)
             page.append(box)
 
             box, grid = section("Свой прокси",
@@ -12467,6 +12761,7 @@ def _build_gui():
             self.dd_net.set_selected(NET_MODES.index(p.net))
             set_text(self.tv_domains, "\n".join(p.allow_domains))
             self.cb_private.set_active(p.net_allow_private)
+            self.cb_accel.set_active(p.accelerate)
             self.e_upstream.set_text(p.upstream)
             set_text(self.tv_chain, "\n".join(p.upstream_chain))
             self.refresh_vpn_choices()
@@ -12520,6 +12815,7 @@ def _build_gui():
                 net=NET_MODES[self.dd_net.get_selected()],
                 allow_domains=get_lines(self.tv_domains),
                 net_allow_private=self.cb_private.get_active(),
+                accelerate=self.cb_accel.get_active(),
                 upstream=self.e_upstream.get_text().strip(),
                 upstream_auth=self.current.upstream_auth,
                 upstream_chain=get_lines(self.tv_chain),

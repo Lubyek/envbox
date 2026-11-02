@@ -14,7 +14,9 @@ from .common import (
     IDLE_TIMEOUT,
     MAX_HEDGES,
     MAX_SETUPS,
+    STALL_TIMEOUT,
     canon_host,
+    congestion_control,
     is_public,
     now,
     split_hostport,
@@ -24,6 +26,11 @@ from .connect import connect_race
 from .dns import Resolver, is_ip_literal, is_private_name
 from .upstream import Upstream
 from .vpn import START_TIMEOUT, VpnClient
+from .warm import SetupGate, WarmPool, is_hot
+
+
+# Туннели к этим сайтам открываются сразу при старте шлюза (если сайт разрешён)
+PREWARM_HOSTS = ("api.anthropic.com", "claude.ai")
 
 
 LOG_LIMIT = 20 * 1024 * 1024        # больше этого размера журнал уходит в .1
@@ -67,9 +74,10 @@ class OpenFailed(OSError):
 
 class Proxy:
     def __init__(self, log_path, allow, allow_private, upstream=None, dns=None, direct=None,
-                 idle=IDLE_TIMEOUT, hedge=HEDGE_DELAY, max_hedges=MAX_HEDGES, max_setups=MAX_SETUPS, chain=None):
+                 idle=IDLE_TIMEOUT, hedge=HEDGE_DELAY, max_hedges=MAX_HEDGES, max_setups=MAX_SETUPS, chain=None,
+                 accel=True, hot=(), stall=STALL_TIMEOUT):
         self.log_path = log_path
-        self.setups = asyncio.Semaphore(max_setups)   # одновременные установки туннеля к вышестоящему прокси
+        self.setups = SetupGate(max_setups)   # одновременные установки туннеля к вышестоящему прокси (лимит подстраивается)
         self.max_hedges = max_hedges
         self.hedging = 0          # сколько вторых туннелей строится прямо сейчас
         self.idle = idle          # секунд без единого байта до закрытия соединения (0 — не закрывать)
@@ -82,6 +90,11 @@ class Proxy:
         self.chain = chain if chain is not None else Chain(
             [Channel("proxy", "proxy", upstream)] if upstream is not None else [])
         self.tasks = []
+        # ускорение: запас готовых туннелей к «горячим» сайтам, адаптивный повтор, быстрый обрыв мёртвых туннелей
+        self.warm = WarmPool() if accel else None
+        self.hot = tuple(hot)
+        self.stall = stall if accel else 0
+        self.setup_ewma = None       # скользящее среднее времени установки туннеля, секунд
         # сайты, к которым прокси подключается сам, минуя вышестоящий прокси (некоторые сайты не пускают его адрес)
         self.direct = [a.lower().rstrip(".") for a in (direct or [])]
         self.dns = list(dns or [])
@@ -141,11 +154,21 @@ class Proxy:
         except (ConnectionError, OSError):
             pass
 
+    def hedge_delay(self):
+        """Через сколько секунд начинать второй туннель: втрое дольше обычной установки, но не больше заданного.
+        Потерянный первый пакет стоит секунду; ждать фиксированные 2 с, когда прокси обычно отвечает за 0,3 с, незачем."""
+        if self.setup_ewma is None or not self.warm:
+            return self.hedge
+        return min(self.hedge, max(0.4, 3 * self.setup_ewma))
+
+    def note_setup(self, seconds):
+        self.setup_ewma = seconds if self.setup_ewma is None else 0.8 * self.setup_ewma + 0.2 * seconds
+
     async def hedged_tunnel(self, up, host, port):
         """Туннель через вышестоящий прокси `up`. Если первая попытка не готова за `hedge` секунд, стартует вторая;
         берётся первая удавшаяся, остальные закрываются. Ошибка — только если не удалась ни одна."""
         first = asyncio.ensure_future(up.tunnel(host, port))
-        done, _ = await asyncio.wait({first}, timeout=self.hedge)
+        done, _ = await asyncio.wait({first}, timeout=self.hedge_delay())
         if done:
             return first.result()
         if self.hedging >= self.max_hedges:
@@ -175,14 +198,15 @@ class Proxy:
             raise error
         return winner
 
-    async def pipe(self, cr, cw, ur, uw, first):
+    async def pipe(self, cr, cw, ur, uw, first, stall=0):
         """Пересылка в обе стороны. Возвращает (отправлено, получено, кто_закончил, метки времени в мс):
         кто_закончил — «client», «upstream» или «idle»."""
         counts = {"up": len(first), "down": 0}
         started = last_t = time.monotonic()
         last = [last_t]
         stamps = {}       # моменты (от начала пересылки): последний байт от клиента, первый и последний байт ответа
-        stalled = [False]
+        stalled = [""]       # почему шлюз закрыл соединение сам: «idle» (нет данных) или «stall» (запрос без ответа)
+        mark = {"up": started + (1e-6 if first else 0), "down": started}   # когда в последний раз шли данные от клиента и к клиенту
         ended = []        # какая сторона закончила первой: по этому видно, кто рвёт соединения (клиент или прокси)
         if first:
             uw.write(first)
@@ -194,7 +218,7 @@ class Proxy:
                     data = await src.read(BUF)
                     if not data:
                         break
-                    now = last[0] = time.monotonic()
+                    now = last[0] = mark[key] = time.monotonic()
                     counts[key] += len(data)
                     if key == "up":
                         stamps["up_end"] = now
@@ -214,23 +238,28 @@ class Proxy:
                     pass
 
         async def watch():
-            step = max(0.05, min(5.0, self.idle / 4))
+            step = max(0.05, min(5.0, min(t for t in (self.idle, stall) if t) / 4))
             while True:
                 await asyncio.sleep(step)
-                if time.monotonic() - last[0] > self.idle:
-                    stalled[0] = True
-                    for w in (cw, uw):
-                        w.close()      # оба копировщика получат конец потока и завершатся
-                    return
+                t = time.monotonic()
+                if self.idle and t - last[0] > self.idle:
+                    stalled[0] = "idle"
+                elif stall and mark["up"] > mark["down"] and t - mark["up"] > stall:
+                    stalled[0] = "stall"          # клиент ждёт ответа, а его нет: туннель мёртв, пусть повторит запрос
+                else:
+                    continue
+                for w in (cw, uw):
+                    w.close()      # оба копировщика получат конец потока и завершатся
+                return
 
-        watcher = asyncio.ensure_future(watch()) if self.idle else None
+        watcher = asyncio.ensure_future(watch()) if (self.idle or stall) else None
         try:
             # одна сторона упала неожиданной ошибкой — вторая всё равно доводится до конца, а не остаётся висеть
             await asyncio.gather(copy(cr, uw, "up"), copy(ur, cw, "down"), return_exceptions=True)
         finally:
             if watcher is not None:
                 watcher.cancel()
-        end = "idle" if stalled[0] else "client" if ended[:1] == ["up"] else "upstream"
+        end = stalled[0] or ("client" if ended[:1] == ["up"] else "upstream")
         # по этим меткам видно, кто молчит у зависшего соединения: клиент не договорил запрос или сервер не ответил
         timing = {k: int((t - started) * 1000) for k, t in stamps.items()}
         return counts["up"], counts["down"], end, timing
@@ -269,12 +298,31 @@ class Proxy:
             return ur, uw, True, None, ip
         up = await self.channel_upstream(ch)
         if method == "CONNECT" or up.kind == "socks5":
+            key = (up.label, host, port)
+            hot = self.warm is not None and is_hot(host, self.hot)
+            if hot:
+                got = self.warm.take(key)
+                if got:       # туннель уже открыт заранее: клиент не ждёт подключения прокси к сайту
+                    rec["warm"] = True
+                    self.warm.want(key, lambda: self.warm_tunnel(up, host, port))
+                    return got[0], got[1], True, up, None
             queued = time.monotonic()
             async with self.setups:
                 waited = time.monotonic() - queued
-                ur, uw = await self.hedged_tunnel(up, host, port)
+                t0 = time.monotonic()
+                try:
+                    ur, uw = await self.hedged_tunnel(up, host, port)
+                except (OSError, asyncio.TimeoutError):
+                    self.setups.slow()          # прокси не справляется: давить на него не нужно
+                    raise
+                took = time.monotonic() - t0
+            self.setups.fast(took, waited)
+            self.note_setup(took)
+            rec["setup_ms"] = int(took * 1000)
             if waited > 0.2:
                 rec["wait_ms"] = int(waited * 1000)   # всплеск соединений: ждали своей очереди
+            if hot:
+                self.warm.want(key, lambda: self.warm_tunnel(up, host, port))
             return ur, uw, True, up, None
         ur, uw = await up.open()      # обычный HTTP: запрос в абсолютной форме самому прокси
         return ur, uw, False, up, None
@@ -309,6 +357,22 @@ class Proxy:
         via = ch.upstream.label if ch.upstream is not None and ch.kind == "proxy" else None
         raise OpenFailed(why, text, via)
 
+    def prewarm(self):
+        """Первый всплеск соединений приложения (Claude открывает десятки сразу) не ждёт прокси: туннели к главным сайтам
+        открываются при старте. Только разрешённые сайты и только через первый прокси цепочки."""
+        for host in PREWARM_HOSTS:
+            if not self.allowed(host) or host_matches(self.direct, host):
+                continue
+            ch = next((c for c in self.chain.channels if c.kind == "proxy" and c.upstream is not None), None)
+            if ch is not None:
+                up = ch.upstream
+                self.warm.want((up.label, host, 443), lambda up=up, host=host: self.warm_tunnel(up, host, 443))
+
+    async def warm_tunnel(self, up, host, port):
+        """Запасной туннель для пула: открывается так же, как обычный, и занимает ту же очередь установок."""
+        async with self.setups:
+            return await up.tunnel(host, port)
+
     async def start_client(self, ch):
         try:
             await ch.client.start()
@@ -336,10 +400,15 @@ class Proxy:
                 self.tasks.append(asyncio.ensure_future(self.start_client(ch)))
         if len(self.chain.channels) > 1:
             self.tasks.append(asyncio.ensure_future(self.probe_loop()))
+        if self.warm is not None:
+            self.tasks.append(asyncio.ensure_future(self.warm.maintain()))
+            self.prewarm()
 
     def end(self):
         for t in self.tasks:
             t.cancel()
+        if self.warm is not None:
+            self.warm.close_all()
         for ch in self.chain.channels:
             if ch.client is not None:
                 ch.client.stop()
@@ -459,7 +528,8 @@ class Proxy:
                         headers.append(f"Proxy-Authorization: {used.basic()}")
                 req = f"{method} {target_line} HTTP/1.1\r\n" + "".join(h + "\r\n" for h in headers)
                 first = (req + ("" if websocket else "Connection: close\r\n") + "\r\n").encode("latin-1")
-            up, down, end, timing = await self.pipe(reader, writer, ur, upstream, first)
+            hot_stall = self.stall if (self.warm is not None and is_hot(host, self.hot)) else 0
+            up, down, end, timing = await self.pipe(reader, writer, ur, upstream, first, hot_stall)
             self.write({"id": cid, "event": "close", "host": host, "port": port,
                         "up": up, "down": down, "ms": int((time.monotonic() - t0) * 1000), "end": end,
                         **timing, **({"idle": True} if end == "idle" else {})})
@@ -512,7 +582,7 @@ def cmd_proxy(a):
         except ValueError:
             sys.exit(f"envbox-net: недопустимый DNS-сервер: {d}")
     chain = build_chain(a.chain, upstream, os.path.dirname(os.path.abspath(a.log))) if a.chain else None
-    proxy = Proxy(a.log, a.allow, a.allow_private, upstream, a.dns, a.direct, chain=chain)
+    proxy = Proxy(a.log, a.allow, a.allow_private, upstream, a.dns, a.direct, chain=chain, accel=not a.no_accel)
 
     async def main():
         if os.path.lexists(a.socket):
@@ -526,6 +596,7 @@ def cmd_proxy(a):
                      "allow_private": proxy.allow_private,
                      "upstream": upstream.label if upstream else None,
                      "chain": proxy.chain.describe() if chain is not None else None,
+                     "accel": proxy.warm is not None, "congestion": congestion_control(),
                      "dns": proxy.dns or None, "direct": proxy.direct or None})
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
