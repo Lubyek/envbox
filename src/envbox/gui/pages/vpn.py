@@ -1,13 +1,13 @@
 """Вкладка «VPN»: загрузка конфигураций (WireGuard, VLESS/Xray, sing-box), проверка и удаление."""
 
-import re
-
 from ...core.vpn import (
     VPN_MAX_BYTES,
     delete_vpn,
     import_many,
     import_subscription,
+    is_subscription_url,
     list_vpns,
+    looks_like_source,
     test_vpn,
     vpn_binary_problem,
     vpn_name_from_file,
@@ -138,7 +138,9 @@ class VpnPageMixin:
 
     def add_vpn(self, name, text, replace=False):
         text = (text or "").strip()
-        if re.match(r"^https?://\S+$", text):   # ссылка-подписка: серверы скачиваются, а не вставлены
+        if not text and looks_like_source(name):
+            name, text = "", name.strip()      # ссылку вставили в поле имени: это не имя, а источник
+        if is_subscription_url(text):          # ссылка-подписка: серверы скачиваются, а не вставлены
             self.add_subscription((name or "").strip(), text)
             return
         try:

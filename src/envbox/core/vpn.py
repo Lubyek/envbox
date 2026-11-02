@@ -5,6 +5,7 @@
 старте среды и останавливает при её остановке (см. net/vpn.py)."""
 
 import os
+import re
 
 from ..net.vpn import (VPN_BINARIES, VPN_HINTS, VPN_KINDS, VPN_LABELS, VpnClient, detect_kind, find_binary,
                        split_links, vpn_validate)
@@ -41,6 +42,36 @@ def vpn_name_from_file(filename):
     stem = os.path.splitext(os.path.basename(filename))[0]
     stem = "".join(c if c.isalnum() and c.isascii() or c in "._-" else "-" for c in stem).strip("-._")
     return stem[:48] or "vpn"
+
+
+SOURCE_RE = re.compile(r"^(https?://|vless://|vmess://|trojan://|ss://|\[interface\]|\{)", re.I)
+
+
+def normalize_name(name, fallback="vpn"):
+    """Допустимое имя VPN из чего угодно: лишние знаки заменяются дефисом, пустое — запасное имя."""
+    out = "".join(c if (c.isalnum() and c.isascii()) or c in "._-" else "-" for c in (name or "").strip())
+    out = re.sub(r"-{2,}", "-", out).strip("-._")[:40]
+    return out or fallback
+
+
+def free_name(base):
+    """Имя, которого ещё нет среди сохранённых: vpn, vpn-2, vpn-3…"""
+    taken = {v["name"] for v in list_vpns()}
+    name, i = base, 2
+    while name in taken:
+        name, i = f"{base}-{i}", i + 1
+    return name
+
+
+def looks_like_source(text):
+    """Похоже ли на саму конфигурацию или ссылку (а не на имя): так понимаем, что её вставили не в то поле."""
+    return bool(SOURCE_RE.match((text or "").strip()))
+
+
+def is_subscription_url(text):
+    """Одна ссылка http(s):// — это подписка, которую нужно скачать, а не конфигурация."""
+    t = (text or "").strip().strip("\"'<>")
+    return bool(re.match(r"^https?://\S+$", t))
 
 
 def list_vpns():
@@ -189,6 +220,9 @@ def import_many(base, text, replace=False):
     Возвращает ([(имя, вид, описание)], [причины пропуска]). Из подписки каждый сервер сохраняется отдельным VPN
     с именем <основа>-1, <основа>-2…; повторный импорт заменяет одноимённые. Ссылки других видов
     (hysteria2, tuic…) пропускаются с пояснением."""
+    base = normalize_name(base, "")
+    if not base:
+        base = free_name("vpn")     # имя не задано или целиком из недопустимых знаков: не затираем то, что уже есть
     links, other = split_links(text)
     if not links:
         if other:
@@ -214,4 +248,5 @@ def import_many(base, text, replace=False):
 
 def import_subscription(base, url):
     """Скачать подписку и добавить серверы из неё (см. import_many)."""
+    url = (url or "").strip().strip("\"'<>")
     return import_many(base or base_name_from_url(url), fetch_subscription(url), replace=True)

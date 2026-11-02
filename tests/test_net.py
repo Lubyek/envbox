@@ -1169,6 +1169,36 @@ class VpnSubscriptions(unittest.TestCase):
                 fetch_subscription(url, timeout=3)
             self.assertIn(part, str(cm.exception))
 
+    def test_name_is_optional_and_forgiving(self):
+        # «имя VPN: латинские буквы…» мешало добавить ссылку: имя пустое, с кириллицей или в него вставили ссылку
+        from envbox.core.vpn import (free_name, import_many, is_subscription_url, list_vpns, looks_like_source,
+                                     normalize_name)
+        self.assertEqual(normalize_name("Мой VPN №1!"), "VPN-1")
+        self.assertEqual(normalize_name("тест"), "vpn")
+        self.assertEqual(normalize_name("  ok.name_1 "), "ok.name_1")
+        self.assertEqual(len(normalize_name("a" * 100)), 40)
+        link = f"vless://{self.UUID}@a.example:443"
+        a, _ = import_many("", link)
+        b, _ = import_many("   ", link)
+        c, _ = import_many("Мой сервер", link)
+        self.assertEqual([x[0][0] for x in (a, b, c)], ["vpn", "vpn-2", "vpn-3"])    # пустое имя ничего не затирает
+        self.assertEqual(free_name("vpn"), "vpn-4")
+        self.assertEqual(len(list_vpns()), 3)
+        for text in ("https://x.example/tok", ' "https://x.example/tok" ', "<https://x.example/tok>"):
+            self.assertTrue(is_subscription_url(text), text)
+        for text in ("https://x.example/a b", "vless://u@h:1", "просто имя", ""):
+            self.assertFalse(is_subscription_url(text), text)
+        for text in ("https://x.example/t", "vmess://x", "trojan://x", "ss://x", "[Interface]\nA=1", "{ }"):
+            self.assertTrue(looks_like_source(text), text)
+        self.assertFalse(looks_like_source("vpn1"))
+
+    def test_subscription_with_a_cyrillic_name_still_works(self):
+        from envbox.core.vpn import import_subscription
+        done, _ = import_subscription("Провайдер", self.url + "/token")
+        self.assertEqual([n for n, _k, _s in done], ["vpn-1", "vpn-2"])               # имя заменено, а не отвергнуто
+        done, _ = import_subscription("", ' "' + self.url + '/token" ')              # кавычки и пробелы вокруг ссылки
+        self.assertEqual([n[:9] for n, _k, _s in done], ["127-0-0-1", "127-0-0-1"])
+
     def test_single_link_and_pasted_list(self):
         from envbox.core.vpn import import_many, list_vpns
         done, _ = import_many("one", f"vless://{self.UUID}@a.example:443")
