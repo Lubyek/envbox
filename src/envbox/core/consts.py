@@ -59,14 +59,20 @@ CLAUDE_DOMAINS = ("*.anthropic.com", "*.claude.ai", "*.claude.com")
 
 
 # Claude Desktop дополнительно держит соединение с bridge.claudeusercontent.com. Если его закрыть, приложение
-# повторяет попытку каждые несколько секунд и показывает «Connection problem». Вход проверяется через hCaptcha
-# (js.hcaptcha.com и соседи): без него страница входа пишет «Couldn't verify your browser». Телеметрия
-# (Sentry, Datadog) и GitHub не нужны для работы и остаются закрытыми.
-CLAUDE_DESKTOP_DOMAINS = CLAUDE_DOMAINS + ("bridge.claudeusercontent.com", "*.hcaptcha.com")
+# повторяет попытку каждые несколько секунд и показывает «Connection problem». Окна предпросмотра и артефактов
+# грузятся с <случайное>.frame.claudeusercontent.com. Вход проверяется через hCaptcha (js.hcaptcha.com и соседи): без
+# него страница входа пишет «Couldn't verify your browser». «Войти через Google» открывается окном внутри самого
+# приложения (claude.ai/login/popup-google-auth): нужны accounts.google.com, www.google.com (капча) и статика
+# gstatic. Телеметрия (Sentry, Datadog) и GitHub не нужны для работы и остаются закрытыми.
+CLAUDE_DESKTOP_DOMAINS = CLAUDE_DOMAINS + ("bridge.claudeusercontent.com", "*.claudeusercontent.com", "*.hcaptcha.com",
+                                           "accounts.google.com", "www.google.com", "*.gstatic.com")
 
 
-# Прежний список пресета Claude Desktop (без hCaptcha): профили с ровно таким списком обновляются при загрузке.
+# Прежние списки пресета Claude Desktop: профили с ровно таким списком обновляются при загрузке.
 OLD_CLAUDE_DESKTOP_DOMAINS = list(CLAUDE_DOMAINS) + ["bridge.claudeusercontent.com"]
+
+
+OLD_CLAUDE_DESKTOP_DOMAINS_V2 = OLD_CLAUDE_DESKTOP_DOMAINS + ["*.hcaptcha.com"]
 
 
 # Прежний список пресета «Claude CLI»: профили с ровно таким списком обновляются при загрузке.

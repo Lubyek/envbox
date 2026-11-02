@@ -38,7 +38,7 @@ import time
 
 # ---- version.py: Версия envbox (строка читается регулярным выражением при установке — не менять формат).
 
-ENVBOX_VERSION = "2026.11.02.2"
+ENVBOX_VERSION = "2026.11.02.3"
 
 
 # ---- lazy.py: Ленивые модули стандартной библиотеки: настоящий import происходит при первом обращении к атрибуту.
@@ -3289,14 +3289,20 @@ CLAUDE_DOMAINS = ("*.anthropic.com", "*.claude.ai", "*.claude.com")
 
 
 # Claude Desktop дополнительно держит соединение с bridge.claudeusercontent.com. Если его закрыть, приложение
-# повторяет попытку каждые несколько секунд и показывает «Connection problem». Вход проверяется через hCaptcha
-# (js.hcaptcha.com и соседи): без него страница входа пишет «Couldn't verify your browser». Телеметрия
-# (Sentry, Datadog) и GitHub не нужны для работы и остаются закрытыми.
-CLAUDE_DESKTOP_DOMAINS = CLAUDE_DOMAINS + ("bridge.claudeusercontent.com", "*.hcaptcha.com")
+# повторяет попытку каждые несколько секунд и показывает «Connection problem». Окна предпросмотра и артефактов
+# грузятся с <случайное>.frame.claudeusercontent.com. Вход проверяется через hCaptcha (js.hcaptcha.com и соседи): без
+# него страница входа пишет «Couldn't verify your browser». «Войти через Google» открывается окном внутри самого
+# приложения (claude.ai/login/popup-google-auth): нужны accounts.google.com, www.google.com (капча) и статика
+# gstatic. Телеметрия (Sentry, Datadog) и GitHub не нужны для работы и остаются закрытыми.
+CLAUDE_DESKTOP_DOMAINS = CLAUDE_DOMAINS + ("bridge.claudeusercontent.com", "*.claudeusercontent.com", "*.hcaptcha.com",
+                                           "accounts.google.com", "www.google.com", "*.gstatic.com")
 
 
-# Прежний список пресета Claude Desktop (без hCaptcha): профили с ровно таким списком обновляются при загрузке.
+# Прежние списки пресета Claude Desktop: профили с ровно таким списком обновляются при загрузке.
 OLD_CLAUDE_DESKTOP_DOMAINS = list(CLAUDE_DOMAINS) + ["bridge.claudeusercontent.com"]
+
+
+OLD_CLAUDE_DESKTOP_DOMAINS_V2 = OLD_CLAUDE_DESKTOP_DOMAINS + ["*.hcaptcha.com"]
 
 
 # Прежний список пресета «Claude CLI»: профили с ровно таким списком обновляются при загрузке.
@@ -5123,8 +5129,9 @@ class Profile:
         if p.net == "allowlist" and p.allow_domains == OLD_CLAUDE_DOMAINS:
             p.allow_domains = list(CLAUDE_DOMAINS)   # старый пресет не пускал обновление токена на claude.com
         if (p.net == "allowlist" and p.link_handler == "claude-desktop"
-                and p.allow_domains in (list(CLAUDE_DOMAINS), OLD_CLAUDE_DOMAINS, OLD_CLAUDE_DESKTOP_DOMAINS)):
-            p.allow_domains = list(CLAUDE_DESKTOP_DOMAINS)   # пресет Claude Desktop без bridge и hCaptcha
+                and p.allow_domains in (list(CLAUDE_DOMAINS), OLD_CLAUDE_DOMAINS, OLD_CLAUDE_DESKTOP_DOMAINS,
+                                        OLD_CLAUDE_DESKTOP_DOMAINS_V2)):
+            p.allow_domains = list(CLAUDE_DESKTOP_DOMAINS)   # пресет Claude Desktop без bridge, hCaptcha, Google
         if p.kind not in KINDS:
             p.kind = "app"
         return p

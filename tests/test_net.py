@@ -673,6 +673,21 @@ class Presets(unittest.TestCase):
                                     "allow_domains": OLD_CLAUDE_DESKTOP_DOMAINS + ["example.com"]})
         self.assertNotIn("*.hcaptcha.com", custom.allow_domains)               # свои списки не трогаем
 
+    def test_desktop_preset_allows_google_login_and_frames(self):
+        # «Войти через Google» — окно внутри приложения; предпросмотр грузится с <случайное>.frame.claudeusercontent.com
+        from envbox.core.consts import OLD_CLAUDE_DESKTOP_DOMAINS_V2
+        from envbox.core.profile import Profile
+        from envbox.net.proxy import host_matches
+        p = Profile.claude_desktop_preset("d")
+        for host in ("accounts.google.com", "www.google.com", "ssl.gstatic.com",
+                     "a2f0cfb4-a34b-49df-8ef7-6c32556880c2.frame.claudeusercontent.com"):
+            self.assertTrue(host_matches(p.allow_domains, host), host)
+        for host in ("mail.google.com", "drive.google.com", "api.github.com", "o1.ingest.us.sentry.io"):
+            self.assertFalse(host_matches(p.allow_domains, host), host)     # лишнего не открываем
+        q = Profile.from_dict({"name": "d", "net": "allowlist", "link_handler": "claude-desktop",
+                               "allow_domains": list(OLD_CLAUDE_DESKTOP_DOMAINS_V2)})
+        self.assertTrue(host_matches(q.allow_domains, "accounts.google.com"))   # прежний пресет обновляется
+
     def test_timeout_errors_are_not_logged_with_an_empty_reason(self):
         from envbox.net.proxy import err_text
         self.assertEqual(err_text(asyncio.TimeoutError()), "TimeoutError")
