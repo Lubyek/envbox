@@ -298,6 +298,9 @@ src/envbox/
   закрытие вкладки: безоконный Chrome показывает запрос «открыть программу?», который нельзя закрыть, и вкладка
   перестаёт принимать ввод (reload, навигация, Escape не помогают, помогает только закрытие). GUI спрашивает
   пользователя и передаёт ссылку в среду (`gui/browser/page.py browser_ask_external` → `send_link_to_env`).
+  Вход в Claude CLI: сайт ведёт на `http://127.0.0.1:порт/callback…`, порт слушает CLI в ДРУГОЙ среде, у браузера-среды свой
+  localhost. По `Page.frameNavigated` с `unreachableUrl` (`local_callback_url`) адрес уходит туда же (`on_external`, вкладка
+  остаётся); среда выбирается `find_env_for_url` (нужен `link_callback`), запрос делает внутри неё `net/bridge.py inbox_handle`.
 
 ### 4.5. `gui/` — GTK 4
 
@@ -676,6 +679,8 @@ python3 -I dist/envbox.py wrap --map 3999:/tmp/ebp/p.sock -- curl --noproxy '' -
 | Вход в Claude Desktop: «Couldn't verify your browser. Try again.» | allowlist среды без hCaptcha: в журнале `deny not-in-allowlist` для `js.hcaptcha.com` | `CLAUDE_DESKTOP_DOMAINS` (`*.hcaptcha.com`; миграция прежнего пресета — `OLD_CLAUDE_DESKTOP_DOMAINS`). У профиля со своим списком разрешить `*.hcaptcha.com` вручную (вкладка «Сеть»). Список всех отказов: `grep -h deny net.log`, поле `host` |
 | В просмотре браузера страница не реагирует на клики, прокрутку, выделение (особенно «Finish sign-in in the Claude app») | страница перешла на `claude://…`: безоконный Chrome показал запрос о запуске программы, вкладка заблокирована | `cdp/viewer.py _page_event` (`Page.frameRequestedNavigation`) закрывает такую вкладку и отдаёт ссылку GUI (`browser_ask_external`); у среды-приложения в «Схемах ссылок» должна быть `claude` |
 | Страница пишет «окно слишком маленькое» (`Authorize isn't available in a window this small`); масштаб страницу не меняет | безоконный Chrome сообщал `outerWidth/Height` 500x87 и `screen` 1x1; масштаб был CSS-зумом | `CdpViewer._apply_metrics` (экран, окно, `deviceScaleFactor`); проверка на настоящем Chrome: страница с `outerWidth`, `screen.width`, `devicePixelRatio` |
+| Вход в Claude CLI: после капчи в браузере-среде «127.0.0.1 refused to connect» (`/callback?code=…`) | порт слушает CLI в другой среде, браузер до него не дотягивается | `CdpViewer` ловит `unreachableUrl` → GUI спрашивает и вызывает `send_link_to_env`; у среды CLI включено «Принимать вход по ссылке localhost» (`link_callback`) |
+| Ссылка из письма (https://claude.ai/magic-link…) не передаётся Claude Desktop | кнопка «Передать приложению» отдаёт приложению https-ссылку, а оно понимает `claude://`; «В браузере компьютера» работает только со связанной схемой | диалог «Ссылка…» (`gui/pages/links.py on_open_link`): «В браузере envbox» открывает ссылку в среде-браузере, `claude://` перехватывается и передаётся приложению |
 | 403 «Private address forbidden» на обычных сайтах | локальный DNS отдаёт частные/нулевые адреса (fake-ip 198.18/15 уже разрешён; `0.0.0.0` от блокировщиков, split-DNS, Tailscale `100.64/10`) | `net.log`: `deny private-address`, поле `resolved`; `--dns`, `--net-allow-private` или чинить DNS |
 | 502 «Upstream proxy failed» | вышестоящий прокси (VPN-клиент) не запущен/не отвечает/требует пароль; цель недоступна (ждёт 15 с) | `net.log`: `error upstream: …`; `envbox.py probe --upstream URL` |
 | 502 «DNS resolution failed» | не работает DNS хоста или заданные `--dns` | `error dns: …`; `Resolver` кэширует отказ 2 с |

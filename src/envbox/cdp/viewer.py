@@ -4,6 +4,7 @@ import base64
 import json
 import re
 import threading
+import urllib.parse
 
 from ..core.consts import CDP_PORT
 from .browser import CdpBrowser, ZOOM_STEPS, _JS_SELECTION, _js_hit_info
@@ -23,12 +24,27 @@ def external_scheme(url):
     return m.group(1).lower() if m and m.group(1).lower() not in _OWN_SCHEMES else ""
 
 
+def local_callback_url(url):
+    """Адрес на этом же компьютере (http://127.0.0.1:порт/…), если он такой, иначе пустая строка.
+
+    Так завершается вход в программу внутри другой среды (Claude CLI): сайт перенаправляет браузер на порт, который
+    слушает программа, а у браузера-среды свой localhost, и страница пишет «refused to connect»."""
+    try:
+        u = urllib.parse.urlsplit(url or "")
+        return url if u.scheme in ("http", "https") and (u.hostname or "").lower() in ("localhost", "127.0.0.1", "::1") \
+            and u.port else ""
+    except ValueError:
+        return ""
+
+
 class CdpViewer:
     """Просмотр браузера среды: вкладки, кадры (JPEG) в on_frame, ввод мышью и клавиатурой, масштаб.
 
     on_tabs(список вкладок, id активной) вызывается из потока чтения при любом изменении вкладок.
     on_external(адрес) — страница пыталась открыть внешнюю программу (claude://…): Chrome без окна показывает
-    запрос, который нельзя закрыть, и вкладка перестаёт принимать ввод, поэтому вкладку мы закрываем сами."""
+    запрос, который нельзя закрыть, и вкладка перестаёт принимать ввод, поэтому вкладку мы закрываем сами.
+    Туда же приходит адрес колбэка входа (http://127.0.0.1:порт/callback…), на котором страница «не открылась»:
+    его слушает программа в другой среде; вкладка при этом остаётся."""
 
     def __init__(self, sock_path, on_frame, on_url=None, on_close=None, on_tabs=None, on_external=None):
         self.sock_path = sock_path
@@ -172,6 +188,10 @@ class CdpViewer:
             if external_scheme(url):
                 self._external(client, url)
             return
+        if method == "Page.frameNavigated":
+            frame = (params or {}).get("frame") or {}
+            if "parentId" not in frame and local_callback_url(frame.get("unreachableUrl", "")):
+                self._external(client, frame["unreachableUrl"], close=False)
         if client is not self.client:
             return
         if method == "Page.screencastFrame":
@@ -191,7 +211,7 @@ class CdpViewer:
         elif method == "Page.navigatedWithinDocument" and self.on_url:
             self.on_url(params.get("url", ""))
 
-    def _external(self, client, url):
+    def _external(self, client, url, close=True):
         """Страница запросила запуск внешней программы: сообщаем наружу и закрываем вкладку (она уже зависла)."""
         tid = next((t for t, c in self.clients.items() if c is client), None)
 
@@ -201,7 +221,7 @@ class CdpViewer:
                     self.on_external(url)
                 except Exception:  # noqa: BLE001  ошибка обработчика не должна оставить вкладку висеть
                     pass
-            if tid is not None and not self._closing:
+            if close and tid is not None and not self._closing:
                 try:
                     self.close_tab(tid)
                 except (OSError, CdpError, KeyError, ValueError):

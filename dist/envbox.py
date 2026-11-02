@@ -4205,12 +4205,27 @@ def external_scheme(url):
     return m.group(1).lower() if m and m.group(1).lower() not in _OWN_SCHEMES else ""
 
 
+def local_callback_url(url):
+    """Адрес на этом же компьютере (http://127.0.0.1:порт/…), если он такой, иначе пустая строка.
+
+    Так завершается вход в программу внутри другой среды (Claude CLI): сайт перенаправляет браузер на порт, который
+    слушает программа, а у браузера-среды свой localhost, и страница пишет «refused to connect»."""
+    try:
+        u = urllib.parse.urlsplit(url or "")
+        return url if u.scheme in ("http", "https") and (u.hostname or "").lower() in ("localhost", "127.0.0.1", "::1") \
+            and u.port else ""
+    except ValueError:
+        return ""
+
+
 class CdpViewer:
     """Просмотр браузера среды: вкладки, кадры (JPEG) в on_frame, ввод мышью и клавиатурой, масштаб.
 
     on_tabs(список вкладок, id активной) вызывается из потока чтения при любом изменении вкладок.
     on_external(адрес) — страница пыталась открыть внешнюю программу (claude://…): Chrome без окна показывает
-    запрос, который нельзя закрыть, и вкладка перестаёт принимать ввод, поэтому вкладку мы закрываем сами."""
+    запрос, который нельзя закрыть, и вкладка перестаёт принимать ввод, поэтому вкладку мы закрываем сами.
+    Туда же приходит адрес колбэка входа (http://127.0.0.1:порт/callback…), на котором страница «не открылась»:
+    его слушает программа в другой среде; вкладка при этом остаётся."""
 
     def __init__(self, sock_path, on_frame, on_url=None, on_close=None, on_tabs=None, on_external=None):
         self.sock_path = sock_path
@@ -4354,6 +4369,10 @@ class CdpViewer:
             if external_scheme(url):
                 self._external(client, url)
             return
+        if method == "Page.frameNavigated":
+            frame = (params or {}).get("frame") or {}
+            if "parentId" not in frame and local_callback_url(frame.get("unreachableUrl", "")):
+                self._external(client, frame["unreachableUrl"], close=False)
         if client is not self.client:
             return
         if method == "Page.screencastFrame":
@@ -4373,7 +4392,7 @@ class CdpViewer:
         elif method == "Page.navigatedWithinDocument" and self.on_url:
             self.on_url(params.get("url", ""))
 
-    def _external(self, client, url):
+    def _external(self, client, url, close=True):
         """Страница запросила запуск внешней программы: сообщаем наружу и закрываем вкладку (она уже зависла)."""
         tid = next((t for t, c in self.clients.items() if c is client), None)
 
@@ -4383,7 +4402,7 @@ class CdpViewer:
                     self.on_external(url)
                 except Exception:  # noqa: BLE001  ошибка обработчика не должна оставить вкладку висеть
                     pass
-            if tid is not None and not self._closing:
+            if close and tid is not None and not self._closing:
                 try:
                     self.close_tab(tid)
                 except (OSError, CdpError, KeyError, ValueError):
@@ -7274,13 +7293,16 @@ def _build_gui():
             if self.b_ext_busy:
                 return False
             label = safe_link_label(url)
+            local = url.lower().startswith(("http:", "https:"))   # колбэк входа на 127.0.0.1:порт, а не запуск программы
             try:
                 envs = find_env_for_url(url)
             except (OSError, ValueError):
                 envs = []
+            if not envs and local:
+                return False   # обычная недоступная локальная страница: не наше дело, окно с ошибкой не нужно
             if not envs:
-                alert(self, "Страница хочет открыть приложение",
-                      f"Адрес: {label}\n\nНи у одной среды нет такой схемы в «Схемах ссылок», передавать некуда. "
+                alert(self, "Страница хочет передать ссылку программе",
+                      f"Адрес: {label}\n\nНи у одной среды нет для этого настройки, передавать некуда. "
                       "Для Claude Desktop укажите схему claude в настройках его среды.")
                 return False
             self.b_ext_busy = True
@@ -7290,10 +7312,12 @@ def _build_gui():
                 if idx == 1:
                     self.send_link_to_env(url, envs[0])
 
-            choose(self, "Страница хочет открыть приложение",
-                   f"Адрес: {label}\nСреда: {envs[0]}\n\nПередать ссылку приложению в этой среде? Так завершается вход "
-                   "в Claude Desktop. Не передавайте ссылки с сайтов, которым не доверяете.",
-                   ["Отмена", "Передать приложению"], answer)
+            what = ("Сайт вернул вход на адрес, который слушает программа внутри среды (так завершается вход в Claude CLI). "
+                    "Браузер до неё не дотянется, но envbox может сделать этот запрос внутри среды."
+                    if local else "Так завершается вход в Claude Desktop.")
+            choose(self, "Страница хочет передать ссылку программе",
+                   f"Адрес: {label}\nСреда: {envs[0]}\n\n{what}\nПередать? Не передавайте ссылки с сайтов, "
+                   "которым не доверяете.", ["Отмена", "Передать"], answer)
             return False
 
         def browser_failed(self, msg):
@@ -8766,9 +8790,10 @@ def _build_gui():
             win = Gtk.Window(title="Ссылка", transient_for=self, modal=True)
             win.set_default_size(660, -1)
             box = margins(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10), 16)
-            box.append(hint("Вход в Claude Desktop по ссылке из письма (https://claude.ai/magic-link…): нажмите «Открыть в "
-                            "браузере». Браузер перекинет вас в Claude Desktop внутри песочницы, и приложение войдёт "
-                            "в аккаунт. Ссылки claude://… и http://localhost:…/ передавайте кнопкой «Передать приложению»."))
+            box.append(hint("Вход в Claude Desktop по ссылке из письма (https://claude.ai/magic-link…): нажмите «В браузере "
+                            "envbox». Страница предложит открыть приложение, envbox спросит и передаст ссылку Claude Desktop "
+                            "внутри песочницы. Ссылки claude://… и http://localhost:…/ передавайте кнопкой «Передать "
+                            "приложению»: обычную https-ссылку приложение само не понимает."))
             entry = Gtk.Entry(hexpand=True, placeholder_text="https://claude.ai/magic-link…   claude://…   http://localhost:…")
             box.append(entry)
             box.append(Gtk.Label(label="Среда с приложением:", xalign=0))
@@ -8782,10 +8807,14 @@ def _build_gui():
             buttons = Gtk.Box(spacing=8, halign=Gtk.Align.END)
             cancel = Gtk.Button(label="Отмена")
             send_btn = Gtk.Button(label="Передать приложению в среде")
-            web_btn = Gtk.Button(label="Открыть в браузере")
+            web_btn = Gtk.Button(label="В браузере компьютера")
+            eb_browsers = browser_profiles_names()
+            eb_btn = Gtk.Button(label="В браузере envbox")
             buttons.append(cancel)
             buttons.append(send_btn)
             buttons.append(web_btn)
+            if eb_browsers:
+                buttons.append(eb_btn)
             box.append(buttons)
 
             def selected_env():
@@ -8802,14 +8831,17 @@ def _build_gui():
             def refresh(*_):
                 kind = classify(entry.get_text())
                 web_btn.set_visible(True)
-                for btn, primary in ((web_btn, kind == "web"), (send_btn, kind != "web")):
+                for btn, primary in ((eb_btn, kind == "web" and bool(eb_browsers)),
+                                     (web_btn, kind == "web" and not eb_browsers), (send_btn, kind != "web")):
                     if primary:
                         btn.add_css_class("suggested-action")
                     else:
                         btn.remove_css_class("suggested-action")
                 if kind == "web":
                     note.set_text("Обычная веб-ссылка: откройте её в браузере. После входа он предложит открыть приложение "
-                                  "(claude://…), и envbox передаст это в песочницу. Если среда не запущена, она запустится сама.")
+                                  "(claude://…), и envbox передаст это в песочницу. Если среда не запущена, она запустится сама. "
+                                  + ("Надёжнее всего — «В браузере envbox»: ссылку перехватывает сам envbox."
+                                     if eb_browsers else "Среды-браузера нет: создайте её («Новая среда» → «Браузер»)."))
                 else:
                     note.set_text("Ссылка будет передана приложению внутри песочницы. Если среда не запущена, запустится "
                                   "её приложение с этой ссылкой.")
@@ -8839,10 +8871,30 @@ def _build_gui():
                 win.destroy()
                 self.open_link_in_browser(url, env)
 
+            def to_envbox_browser(*_):
+                raw = entry.get_text().strip()
+                env = selected_env()
+                try:
+                    url = parse_link(raw)
+                except ValueError as e:
+                    alert(self, "Ссылку нельзя открыть", str(e))
+                    return
+                try:
+                    q = load_profile(env) if env else None
+                except (OSError, ValueError):
+                    q = None
+                browser = self.pick_link_browser(q) or eb_browsers[0]
+                win.destroy()
+                self.open_url_in_browser(browser, url)
+                log_link_event(safe_link_label(url), f"открыта в браузере envbox «{browser}»")
+                self.status(f"Ссылка открыта в браузере envbox «{browser}»: страница предложит открыть приложение")
+
             entry.connect("changed", refresh)
             send_btn.connect("clicked", to_env)
             web_btn.connect("clicked", to_browser)
-            entry.connect("activate", lambda *_a: (to_browser() if classify(entry.get_text()) == "web" else to_env()))
+            eb_btn.connect("clicked", to_envbox_browser)
+            entry.connect("activate", lambda *_a: ((to_envbox_browser() if eb_browsers else to_browser())
+                                                   if classify(entry.get_text()) == "web" else to_env()))
             cancel.connect("clicked", lambda *_a: win.destroy())
             refresh()
             win.set_child(box)

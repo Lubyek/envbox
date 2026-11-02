@@ -280,9 +280,10 @@ class LinksMixin:
         win = Gtk.Window(title="Ссылка", transient_for=self, modal=True)
         win.set_default_size(660, -1)
         box = margins(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10), 16)
-        box.append(hint("Вход в Claude Desktop по ссылке из письма (https://claude.ai/magic-link…): нажмите «Открыть в "
-                        "браузере». Браузер перекинет вас в Claude Desktop внутри песочницы, и приложение войдёт "
-                        "в аккаунт. Ссылки claude://… и http://localhost:…/ передавайте кнопкой «Передать приложению»."))
+        box.append(hint("Вход в Claude Desktop по ссылке из письма (https://claude.ai/magic-link…): нажмите «В браузере "
+                        "envbox». Страница предложит открыть приложение, envbox спросит и передаст ссылку Claude Desktop "
+                        "внутри песочницы. Ссылки claude://… и http://localhost:…/ передавайте кнопкой «Передать "
+                        "приложению»: обычную https-ссылку приложение само не понимает."))
         entry = Gtk.Entry(hexpand=True, placeholder_text="https://claude.ai/magic-link…   claude://…   http://localhost:…")
         box.append(entry)
         box.append(Gtk.Label(label="Среда с приложением:", xalign=0))
@@ -296,10 +297,14 @@ class LinksMixin:
         buttons = Gtk.Box(spacing=8, halign=Gtk.Align.END)
         cancel = Gtk.Button(label="Отмена")
         send_btn = Gtk.Button(label="Передать приложению в среде")
-        web_btn = Gtk.Button(label="Открыть в браузере")
+        web_btn = Gtk.Button(label="В браузере компьютера")
+        eb_browsers = browser_profiles_names()
+        eb_btn = Gtk.Button(label="В браузере envbox")
         buttons.append(cancel)
         buttons.append(send_btn)
         buttons.append(web_btn)
+        if eb_browsers:
+            buttons.append(eb_btn)
         box.append(buttons)
 
         def selected_env():
@@ -316,14 +321,17 @@ class LinksMixin:
         def refresh(*_):
             kind = classify(entry.get_text())
             web_btn.set_visible(True)
-            for btn, primary in ((web_btn, kind == "web"), (send_btn, kind != "web")):
+            for btn, primary in ((eb_btn, kind == "web" and bool(eb_browsers)),
+                                 (web_btn, kind == "web" and not eb_browsers), (send_btn, kind != "web")):
                 if primary:
                     btn.add_css_class("suggested-action")
                 else:
                     btn.remove_css_class("suggested-action")
             if kind == "web":
                 note.set_text("Обычная веб-ссылка: откройте её в браузере. После входа он предложит открыть приложение "
-                              "(claude://…), и envbox передаст это в песочницу. Если среда не запущена, она запустится сама.")
+                              "(claude://…), и envbox передаст это в песочницу. Если среда не запущена, она запустится сама. "
+                              + ("Надёжнее всего — «В браузере envbox»: ссылку перехватывает сам envbox."
+                                 if eb_browsers else "Среды-браузера нет: создайте её («Новая среда» → «Браузер»)."))
             else:
                 note.set_text("Ссылка будет передана приложению внутри песочницы. Если среда не запущена, запустится "
                               "её приложение с этой ссылкой.")
@@ -353,10 +361,30 @@ class LinksMixin:
             win.destroy()
             self.open_link_in_browser(url, env)
 
+        def to_envbox_browser(*_):
+            raw = entry.get_text().strip()
+            env = selected_env()
+            try:
+                url = parse_link(raw)
+            except ValueError as e:
+                alert(self, "Ссылку нельзя открыть", str(e))
+                return
+            try:
+                q = load_profile(env) if env else None
+            except (OSError, ValueError):
+                q = None
+            browser = self.pick_link_browser(q) or eb_browsers[0]
+            win.destroy()
+            self.open_url_in_browser(browser, url)
+            log_link_event(safe_link_label(url), f"открыта в браузере envbox «{browser}»")
+            self.status(f"Ссылка открыта в браузере envbox «{browser}»: страница предложит открыть приложение")
+
         entry.connect("changed", refresh)
         send_btn.connect("clicked", to_env)
         web_btn.connect("clicked", to_browser)
-        entry.connect("activate", lambda *_a: (to_browser() if classify(entry.get_text()) == "web" else to_env()))
+        eb_btn.connect("clicked", to_envbox_browser)
+        entry.connect("activate", lambda *_a: ((to_envbox_browser() if eb_browsers else to_browser())
+                                               if classify(entry.get_text()) == "web" else to_env()))
         cancel.connect("clicked", lambda *_a: win.destroy())
         refresh()
         win.set_child(box)

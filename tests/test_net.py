@@ -742,6 +742,30 @@ class BrowserViewer(unittest.TestCase):
         self.assertFalse(done.wait(0.3))                       # обычные адреса не трогаем
         self.assertEqual((got, closed), (["claude://login?code=1"], ["TAB2"]))
 
+    def test_login_callback_on_localhost_is_reported_and_tab_kept(self):
+        # вход в Claude CLI: сайт ведёт браузер на http://127.0.0.1:порт/callback, который слушает программа в ДРУГОЙ среде
+        import threading
+        from envbox.cdp.viewer import CdpViewer, local_callback_url
+        self.assertTrue(local_callback_url("http://127.0.0.1:46441/callback?code=a&state=b"))
+        self.assertTrue(local_callback_url("http://localhost:3000/x"))
+        for no in ("", "https://claude.ai/callback", "http://127.0.0.1/x", "http://example.com:8080/", "claude://x"):
+            self.assertEqual(local_callback_url(no), no and "", no)
+        got, done = [], threading.Event()
+        v = CdpViewer("/nonexistent.sock", lambda *_: None, on_external=lambda u: (got.append(u), done.set()))
+        tab = mock.Mock()
+        v.clients, v.client = {"T": tab}, tab
+        v.close_tab = mock.Mock()
+        err = {"frame": {"url": "chrome-error://chromewebdata/",
+                         "unreachableUrl": "http://127.0.0.1:46441/callback?code=a&state=b"}}
+        v._page_event(tab, "Page.frameNavigated", err)
+        self.assertTrue(done.wait(5))
+        self.assertEqual(got, ["http://127.0.0.1:46441/callback?code=a&state=b"])
+        v.close_tab.assert_not_called()                          # вкладку не закрываем: она не зависла
+        done.clear()
+        err["frame"]["parentId"] = "P"                           # ошибка во вложенном кадре — не вход
+        v._page_event(tab, "Page.frameNavigated", err)
+        self.assertFalse(done.wait(0.3))
+
     def test_page_sees_real_window_size_and_zoom(self):
         # безоконный Chrome отвечал странице «окно 500x87, экран 1x1» (страница подтверждения входа: «окно слишком
         # маленькое»); масштаб был CSS-хитростью, и страница его не видела

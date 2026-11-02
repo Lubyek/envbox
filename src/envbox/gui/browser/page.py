@@ -273,13 +273,16 @@ class BrowserPageMixin:
         if self.b_ext_busy:
             return False
         label = safe_link_label(url)
+        local = url.lower().startswith(("http:", "https:"))   # колбэк входа на 127.0.0.1:порт, а не запуск программы
         try:
             envs = find_env_for_url(url)
         except (OSError, ValueError):
             envs = []
+        if not envs and local:
+            return False   # обычная недоступная локальная страница: не наше дело, окно с ошибкой не нужно
         if not envs:
-            alert(self, "Страница хочет открыть приложение",
-                  f"Адрес: {label}\n\nНи у одной среды нет такой схемы в «Схемах ссылок», передавать некуда. "
+            alert(self, "Страница хочет передать ссылку программе",
+                  f"Адрес: {label}\n\nНи у одной среды нет для этого настройки, передавать некуда. "
                   "Для Claude Desktop укажите схему claude в настройках его среды.")
             return False
         self.b_ext_busy = True
@@ -289,10 +292,12 @@ class BrowserPageMixin:
             if idx == 1:
                 self.send_link_to_env(url, envs[0])
 
-        choose(self, "Страница хочет открыть приложение",
-               f"Адрес: {label}\nСреда: {envs[0]}\n\nПередать ссылку приложению в этой среде? Так завершается вход "
-               "в Claude Desktop. Не передавайте ссылки с сайтов, которым не доверяете.",
-               ["Отмена", "Передать приложению"], answer)
+        what = ("Сайт вернул вход на адрес, который слушает программа внутри среды (так завершается вход в Claude CLI). "
+                "Браузер до неё не дотянется, но envbox может сделать этот запрос внутри среды."
+                if local else "Так завершается вход в Claude Desktop.")
+        choose(self, "Страница хочет передать ссылку программе",
+               f"Адрес: {label}\nСреда: {envs[0]}\n\n{what}\nПередать? Не передавайте ссылки с сайтов, "
+               "которым не доверяете.", ["Отмена", "Передать"], answer)
         return False
 
     def browser_failed(self, msg):
