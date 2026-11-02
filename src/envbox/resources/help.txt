@@ -1,0 +1,26 @@
+envbox — изолированные среды на bubblewrap: всё в одном файле.
+
+  python3 envbox.py                  графический интерфейс (при первом запуске установка)
+  python3 envbox.py install [--force]  установить: ~/.local/share/envbox, команда ~/.local/bin/envbox
+                                     (--force: заменить и более новую установленную версию)
+  python3 envbox.py run ARGS...      консольный запуск: envbox -n имя -w проект -- команда
+  python3 envbox.py build-appimage   собрать envbox-<архитектура>.AppImage
+  python3 envbox.py root [ПУТЬ|--reset] [--move]   показать или сменить каталог данных (по умолчанию ~/.envbox)
+  python3 envbox.py global [list|create ИМЯ|delete ИМЯ]   глобальные папки в <каталог данных>/_global
+  python3 envbox.py --version        версия этого файла (то же показывает заголовок окна GUI)
+  python3 envbox.py --install-desktop  ярлык и значок в меню приложений
+  python3 envbox.py proxy|wrap|probe|report  внутренние команды сетевого шлюза
+
+Что внутри этого файла:
+  1. консольная утилита envbox (bash, извлекается в ~/.local/share/envbox/envbox.sh);
+  2. сетевой шлюз: журналирующий прокси, мосты unix-сокет <-> localhost, проверка прокси;
+  3. ядро: профили, запуск терминала, секреты в keyring, сеансы, описание среды;
+  4. графический интерфейс GTK 4 (нужен системный python-gobject и gtk4);
+  5. сборка AppImage.
+
+Нужны: bubblewrap, системный /usr/bin/python3; для GUI — GTK 4 (Arch: sudo pacman -S
+python-gobject gtk4 vte4; vte4 — встроенный терминал, без него терминал открывается во внешнем окне),
+для секретов — libsecret (secret-tool), для сред-браузеров — Chrome/Chromium.
+
+Горячие клавиши GUI: Ctrl+S сохранить, Ctrl+N новая среда, Ctrl+T терминал в среде,
+Ctrl+R запустить команду/браузер, F5 обновить.

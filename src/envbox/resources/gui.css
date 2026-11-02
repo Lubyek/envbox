@@ -1,0 +1,17 @@
+.eb-title { font-size: 22px; font-weight: 700; }
+.eb-h2 { font-size: 15px; font-weight: 700; }
+.eb-card { background: alpha(currentColor, 0.05); border: 1px solid alpha(currentColor, 0.10);
+           border-radius: 12px; padding: 16px; }
+.eb-card-warn { background: alpha(#e5a50a, 0.14); border: 1px solid alpha(#e5a50a, 0.45);
+                border-radius: 12px; padding: 16px; }
+.eb-sidebar { background: alpha(currentColor, 0.04); }
+.eb-badge { border-radius: 999px; padding: 2px 12px; font-size: 12px; background: alpha(currentColor, 0.10); }
+.eb-badge-run { background: alpha(#26a269, 0.25); color: #26a269; font-weight: 700; }
+.eb-badge-warn { background: alpha(#e5a50a, 0.25); }
+.eb-dot { color: #26a269; font-size: 14px; }
+.eb-ok { color: #26a269; font-weight: 700; }
+.eb-warn { color: #e5a50a; font-weight: 700; }
+.eb-info { opacity: 0.6; }
+.eb-bad { color: #c01c28; font-weight: 700; }
+.eb-status { padding: 4px 12px; font-size: 12px; }
+.eb-welcome-title { font-size: 28px; font-weight: 800; }

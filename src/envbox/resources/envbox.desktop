@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=envbox
+Comment=Изолированные среды на bubblewrap
+Exec=envbox
+Icon=envbox
+Terminal=false
+Categories=System;Security;
