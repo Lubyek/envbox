@@ -1169,6 +1169,111 @@ class VpnSubscriptions(unittest.TestCase):
                 fetch_subscription(url, timeout=3)
             self.assertIn(part, str(cm.exception))
 
+    @staticmethod
+    def connect_proxy(mapping, auth=None):
+        """Подставной HTTP-прокси (CONNECT): имя из mapping ведёт на локальный порт, остальное не находится."""
+        import socketserver
+        import threading
+        seen = []
+
+        class H(socketserver.BaseRequestHandler):
+            def handle(self):
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    chunk = self.request.recv(4096)
+                    if not chunk:
+                        return
+                    buf += chunk
+                head = buf.decode("latin-1")
+                target = head.split()[1]
+                seen.append(target)
+                host, _, _port = target.rpartition(":")
+                if host not in mapping:
+                    self.request.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                    return
+                up = socket.create_connection(("127.0.0.1", mapping[host]))
+                self.request.sendall(b"HTTP/1.1 200 OK\r\n\r\n")
+
+                def pump(a, b):
+                    try:
+                        while (d := a.recv(65536)):
+                            b.sendall(d)
+                    except OSError:
+                        pass
+                    try:
+                        b.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+                t = threading.Thread(target=pump, args=(up, self.request), daemon=True)
+                t.start()
+                pump(self.request, up)
+                t.join(5)
+                up.close()
+        srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), H)
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv, seen
+
+    def test_subscription_through_a_proxy_when_the_site_is_not_resolvable(self):
+        # у вас: «[Errno -3] Temporary failure in name resolution» — имя сайта не находится по DNS компьютера
+        from envbox.core.vpn import fetch_subscription, import_subscription
+        port = self.srv.server_address[1]
+        proxy, seen = self.connect_proxy({"sub.invalid": port})
+        self.addCleanup(proxy.shutdown)
+        purl = f"http://127.0.0.1:{proxy.server_address[1]}"
+        with self.assertRaises(ValueError) as cm:                       # напрямую имя не находится: понятная подсказка
+            fetch_subscription(f"http://sub.invalid:{port}/tok", timeout=3)
+        self.assertIn("DNS", str(cm.exception))
+        self.assertIn("прокси среды", str(cm.exception))
+        done, _ = import_subscription("", f"http://sub.invalid:{port}/tok", proxy=purl)
+        self.assertEqual(len(done), 2)
+        self.assertEqual(seen, [f"sub.invalid:{port}"])                  # имя разрешал прокси, а не мы
+        with self.assertRaises(ValueError) as cm:                       # прокси не знает сайт: ошибка названа
+            fetch_subscription(f"http://other.invalid:{port}/tok", timeout=3, proxy=purl)
+        self.assertIn("через прокси", str(cm.exception))
+
+    def test_https_subscription_through_a_proxy_and_redirect(self):
+        import http.server
+        import ssl
+        import threading
+        from envbox.core.vpn import fetch_subscription
+        scratch = os.path.join(self.root, "tls")
+        os.makedirs(scratch)
+        crt, key = os.path.join(scratch, "c.pem"), os.path.join(scratch, "k.pem")
+        r = subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", crt,
+                            "-days", "2", "-subj", "/CN=sub.test", "-addext", "subjectAltName=DNS:sub.test"],
+                           capture_output=True)
+        if r.returncode:
+            self.skipTest("нет openssl")
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/old":
+                    self.send_response(302)
+                    self.send_header("Location", "/new")
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"trojan://pw@b.example:443#B")
+
+            def log_message(self, *a):
+                pass
+        tls = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(crt, key)
+        tls.socket = ctx.wrap_socket(tls.socket, server_side=True)
+        threading.Thread(target=tls.serve_forever, daemon=True).start()
+        self.addCleanup(tls.shutdown)
+        proxy, seen = self.connect_proxy({"sub.test": tls.server_address[1]})
+        self.addCleanup(proxy.shutdown)
+        client_ctx = ssl.create_default_context(cafile=crt)
+        with mock.patch("ssl.create_default_context", return_value=client_ctx):
+            text = fetch_subscription(f"https://sub.test:{tls.server_address[1]}/old", timeout=5,
+                                      proxy=f"http://127.0.0.1:{proxy.server_address[1]}")
+        self.assertEqual(text, "trojan://pw@b.example:443#B")                    # TLS поверх туннеля и переход /old → /new
+        self.assertEqual(len(seen), 2)
+
     def test_name_is_optional_and_forgiving(self):
         # «имя VPN: латинские буквы…» мешало добавить ссылку: имя пустое, с кириллицей или в него вставили ссылку
         from envbox.core.vpn import (free_name, import_many, is_subscription_url, list_vpns, looks_like_source,

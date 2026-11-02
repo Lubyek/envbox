@@ -1,5 +1,11 @@
 """Вкладка «VPN»: загрузка конфигураций (WireGuard, VLESS/Xray, sing-box), проверка и удаление."""
 
+import subprocess
+
+from ...core.consts import UPSTREAM_AUTH_VAR
+from ...core.keyring import secret_lookup, secret_tool_available
+from ...core.store import list_profiles, load_profile
+from ...core.upstream import split_proxy_url
 from ...core.vpn import (
     VPN_MAX_BYTES,
     delete_vpn,
@@ -117,6 +123,11 @@ class VpnPageMixin:
         box.append(name)
         view, sw = text_area(height=160)
         box.append(sw)
+        envs = self.proxy_envs()
+        via = Gtk.DropDown.new_from_strings(["Скачать подписку напрямую с этого компьютера"]
+                                            + [f"Скачать подписку через прокси среды «{n}»" for n in envs])
+        if envs:
+            box.append(via)
         buttons = Gtk.Box(spacing=8, halign=Gtk.Align.END)
         cancel = Gtk.Button(label="Отмена")
         ok = Gtk.Button(label="Добавить")
@@ -127,8 +138,9 @@ class VpnPageMixin:
 
         def go(*_a):
             text, n = get_text(view), name.get_text().strip()
+            idx = via.get_selected() if envs else 0
             win.destroy()
-            self.add_vpn(n, text)
+            self.add_vpn(n, text, via=envs[idx - 1] if idx > 0 else None)
 
         cancel.connect("clicked", lambda *_a: win.destroy())
         ok.connect("clicked", go)
@@ -136,26 +148,53 @@ class VpnPageMixin:
         win.present()
         name.grab_focus()
 
-    def add_vpn(self, name, text, replace=False):
+    def add_vpn(self, name, text, replace=False, via=None):
         text = (text or "").strip()
         if not text and looks_like_source(name):
             name, text = "", name.strip()      # ссылку вставили в поле имени: это не имя, а источник
         if is_subscription_url(text):          # ссылка-подписка: серверы скачиваются, а не вставлены
-            self.add_subscription((name or "").strip(), text)
+            self.add_subscription((name or "").strip(), text, via)
             return
         try:
             imported, skipped = import_many(name, text, replace=replace)
         except ValueError as e:
             if "уже есть" in str(e) and not replace:
                 choose(self, f"VPN «{name}» уже есть", "Заменить его новой конфигурацией?", ["Отмена", "Заменить"],
-                       lambda idx: self.add_vpn(name, text, True) if idx == 1 else None)
+                       lambda idx: self.add_vpn(name, text, True, via) if idx == 1 else None)
                 return
             alert(self, "Не удалось добавить VPN", str(e))
             return
         self.vpn_imported(imported, skipped)
 
-    def add_subscription(self, name, url):
-        self.status("Скачиваю подписку…")
+    def proxy_envs(self):
+        """Среды со своим прокси: через него можно скачать подписку, если сайт не открывается напрямую."""
+        out = []
+        for n in list_profiles():
+            try:
+                if load_profile(n).upstream:
+                    out.append(n)
+            except (OSError, ValueError):
+                continue
+        return out
+
+    @staticmethod
+    def env_proxy(env):
+        """(адрес, логин:пароль) прокси среды; пароль из keyring (вызывается в потоке)."""
+        p = load_profile(env)
+        url, auth = split_proxy_url(p.upstream)
+        if not auth and p.upstream_auth and secret_tool_available():
+            try:
+                auth = secret_lookup(env, UPSTREAM_AUTH_VAR)
+            except (OSError, subprocess.SubprocessError):
+                auth = ""
+        return url, auth
+
+    def add_subscription(self, name, url, via=None):
+        self.status("Скачиваю подписку" + (f" через прокси среды «{via}»" if via else "") + "…")
+
+        def work():
+            proxy, auth = self.env_proxy(via) if via else ("", "")
+            return import_subscription(name, url, proxy=proxy, auth=auth)
 
         def done(res):
             if isinstance(res, Exception):
@@ -163,7 +202,7 @@ class VpnPageMixin:
                 return
             self.vpn_imported(*res)
 
-        self.run_async(lambda: import_subscription(name, url), done)
+        self.run_async(work, done)
 
     def vpn_imported(self, imported, skipped):
         self.refresh_vpn_list()

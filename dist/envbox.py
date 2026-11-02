@@ -38,7 +38,7 @@ import time
 
 # ---- version.py: Версия envbox (строка читается регулярным выражением при установке — не менять формат).
 
-ENVBOX_VERSION = "2026.11.02.7"
+ENVBOX_VERSION = "2026.11.02.8"
 
 
 # ---- lazy.py: Ленивые модули стандартной библиотеки: настоящий import происходит при первом обращении к атрибуту.
@@ -5935,28 +5935,73 @@ def base_name_from_url(url):
     return "".join(c if c.isalnum() and c.isascii() else "-" for c in host).strip("-")[:40] or "vpn"
 
 
-def fetch_subscription(url, timeout=20):
-    """Скачать подписку по ссылке (с вашего компьютера напрямую: сервер подписки увидит ваш настоящий адрес).
+def open_via_proxy(proxy, auth, host, port, timeout):
+    """Подключённый сокет до host:port через прокси (http или socks5); имя сайта разрешает сам прокси."""
+    import asyncio
+    import socket
+
+    async def go():
+        up = Upstream(proxy, auth or None)
+        _r, w = await asyncio.wait_for(up.tunnel(host, port), timeout)
+        try:
+            return os.dup(w.get_extra_info("socket").fileno())     # соединение переживёт закрытие транспорта
+        finally:
+            w.close()
+            await asyncio.sleep(0)
+
+    sock = socket.socket(fileno=asyncio.run(go()))
+    sock.settimeout(timeout)
+    return sock
+
+
+def fetch_subscription(url, timeout=20, proxy="", auth=""):
+    """Скачать подписку по ссылке: напрямую с вашего компьютера (сервер подписки увидит ваш настоящий адрес) или
+    через прокси `proxy` (тогда имя сайта разрешает он: помогает, когда сайт блокируется или не находится по DNS).
 
     Многие панели отдают разные форматы разным программам, поэтому представляемся клиентом v2rayN: он получает
     список ссылок. ValueError с понятным текстом при любой неудаче."""
-    import urllib.error
+    import http.client
+    import socket
+    import ssl
     import urllib.parse
-    import urllib.request
     url = (url or "").strip()
     if urllib.parse.urlsplit(url).scheme not in ("http", "https") or any(c.isspace() for c in url):
         raise ValueError("нужна ссылка http:// или https:// без пробелов")
-    req = urllib.request.Request(url, headers={"User-Agent": "v2rayN/6.42", "Accept": "*/*"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+    via = " через прокси" if proxy else ""
+    for _hop in range(5):                                           # переходы по перенаправлениям
+        u = urllib.parse.urlsplit(url)
+        https = u.scheme == "https"
+        host = u.hostname or ""
+        try:
+            port = u.port or (443 if https else 80)
+        except ValueError:
+            raise ValueError("в ссылке неверный порт") from None
+        path = (u.path or "/") + (("?" + u.query) if u.query else "")
+        conn = (http.client.HTTPSConnection if https else http.client.HTTPConnection)(host, port, timeout=timeout)
+        try:
+            if proxy:
+                raw = open_via_proxy(proxy, auth, host, port, timeout)
+                conn.sock = ssl.create_default_context().wrap_socket(raw, server_hostname=host) if https else raw
+            conn.request("GET", path, headers={"User-Agent": "v2rayN/6.42", "Accept": "*/*",
+                                               "Accept-Encoding": "identity", "Connection": "close"})
+            r = conn.getresponse()
+            if r.status in (301, 302, 303, 307, 308) and r.getheader("Location"):
+                url = urllib.parse.urljoin(url, r.getheader("Location"))
+                continue
+            if r.status >= 400:
+                raise ValueError(f"сервер подписки ответил: HTTP {r.status}")
             data = r.read(SUB_MAX_BYTES + 1)
-    except urllib.error.HTTPError as e:
-        raise ValueError(f"сервер подписки ответил: HTTP {e.code}") from None
-    except (urllib.error.URLError, OSError) as e:
-        raise ValueError(f"не удалось скачать подписку: {getattr(e, 'reason', e)}") from None
-    if len(data) > SUB_MAX_BYTES:
-        raise ValueError("ответ сервера слишком большой (больше 2 МБ): это не подписка")
-    return data.decode("utf-8", "replace")
+        except socket.gaierror:
+            raise ValueError(f"не удалось найти сайт «{host}»: DNS вашего компьютера не отвечает или сайт "
+                             "заблокирован. Выберите «Через прокси среды…» в окне добавления") from None
+        except (OSError, http.client.HTTPException, UnicodeError) as e:
+            raise ValueError(f"не удалось скачать подписку{via}: {e or type(e).__name__}") from None
+        finally:
+            conn.close()
+        if len(data) > SUB_MAX_BYTES:
+            raise ValueError("ответ сервера слишком большой (больше 2 МБ): это не подписка")
+        return data.decode("utf-8", "replace")
+    raise ValueError("слишком много перенаправлений")
 
 
 def import_many(base, text, replace=False):
@@ -5991,10 +6036,10 @@ def import_many(base, text, replace=False):
     return done, skipped
 
 
-def import_subscription(base, url):
-    """Скачать подписку и добавить серверы из неё (см. import_many)."""
+def import_subscription(base, url, proxy="", auth=""):
+    """Скачать подписку (напрямую или через прокси) и добавить серверы из неё (см. import_many)."""
     url = (url or "").strip().strip("\"'<>")
-    return import_many(base or base_name_from_url(url), fetch_subscription(url), replace=True)
+    return import_many(base or base_name_from_url(url), fetch_subscription(url, proxy=proxy, auth=auth), replace=True)
 
 
 # ---- core/profile.py: Профиль среды (dataclass Profile) и его проверка.
@@ -11889,6 +11934,11 @@ def _build_gui():
             box.append(name)
             view, sw = text_area(height=160)
             box.append(sw)
+            envs = self.proxy_envs()
+            via = Gtk.DropDown.new_from_strings(["Скачать подписку напрямую с этого компьютера"]
+                                                + [f"Скачать подписку через прокси среды «{n}»" for n in envs])
+            if envs:
+                box.append(via)
             buttons = Gtk.Box(spacing=8, halign=Gtk.Align.END)
             cancel = Gtk.Button(label="Отмена")
             ok = Gtk.Button(label="Добавить")
@@ -11899,8 +11949,9 @@ def _build_gui():
 
             def go(*_a):
                 text, n = get_text(view), name.get_text().strip()
+                idx = via.get_selected() if envs else 0
                 win.destroy()
-                self.add_vpn(n, text)
+                self.add_vpn(n, text, via=envs[idx - 1] if idx > 0 else None)
 
             cancel.connect("clicked", lambda *_a: win.destroy())
             ok.connect("clicked", go)
@@ -11908,26 +11959,53 @@ def _build_gui():
             win.present()
             name.grab_focus()
 
-        def add_vpn(self, name, text, replace=False):
+        def add_vpn(self, name, text, replace=False, via=None):
             text = (text or "").strip()
             if not text and looks_like_source(name):
                 name, text = "", name.strip()      # ссылку вставили в поле имени: это не имя, а источник
             if is_subscription_url(text):          # ссылка-подписка: серверы скачиваются, а не вставлены
-                self.add_subscription((name or "").strip(), text)
+                self.add_subscription((name or "").strip(), text, via)
                 return
             try:
                 imported, skipped = import_many(name, text, replace=replace)
             except ValueError as e:
                 if "уже есть" in str(e) and not replace:
                     choose(self, f"VPN «{name}» уже есть", "Заменить его новой конфигурацией?", ["Отмена", "Заменить"],
-                           lambda idx: self.add_vpn(name, text, True) if idx == 1 else None)
+                           lambda idx: self.add_vpn(name, text, True, via) if idx == 1 else None)
                     return
                 alert(self, "Не удалось добавить VPN", str(e))
                 return
             self.vpn_imported(imported, skipped)
 
-        def add_subscription(self, name, url):
-            self.status("Скачиваю подписку…")
+        def proxy_envs(self):
+            """Среды со своим прокси: через него можно скачать подписку, если сайт не открывается напрямую."""
+            out = []
+            for n in list_profiles():
+                try:
+                    if load_profile(n).upstream:
+                        out.append(n)
+                except (OSError, ValueError):
+                    continue
+            return out
+
+        @staticmethod
+        def env_proxy(env):
+            """(адрес, логин:пароль) прокси среды; пароль из keyring (вызывается в потоке)."""
+            p = load_profile(env)
+            url, auth = split_proxy_url(p.upstream)
+            if not auth and p.upstream_auth and secret_tool_available():
+                try:
+                    auth = secret_lookup(env, UPSTREAM_AUTH_VAR)
+                except (OSError, subprocess.SubprocessError):
+                    auth = ""
+            return url, auth
+
+        def add_subscription(self, name, url, via=None):
+            self.status("Скачиваю подписку" + (f" через прокси среды «{via}»" if via else "") + "…")
+
+            def work():
+                proxy, auth = self.env_proxy(via) if via else ("", "")
+                return import_subscription(name, url, proxy=proxy, auth=auth)
 
             def done(res):
                 if isinstance(res, Exception):
@@ -11935,7 +12013,7 @@ def _build_gui():
                     return
                 self.vpn_imported(*res)
 
-            self.run_async(lambda: import_subscription(name, url), done)
+            self.run_async(work, done)
 
         def vpn_imported(self, imported, skipped):
             self.refresh_vpn_list()

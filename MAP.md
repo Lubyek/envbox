@@ -53,7 +53,7 @@
   detect_terminal(), terminal_argv(), dry_run(), launch_background(), read_tail()
 - `src/envbox/core/upstream.py` (70 стр.) — Вышестоящий прокси профиля: разбор URL, чтение из файла, проверка.
   split_proxy_url(), read_proxy_file(), probe_upstream()
-- `src/envbox/core/vpn.py` (252 стр.) — Хранилище VPN-конфигураций: импорт, список, удаление и проверка наличия клиента.
+- `src/envbox/core/vpn.py` (298 стр.) — Хранилище VPN-конфигураций: импорт, список, удаление и проверка наличия клиента.
   vpn_dir(), vpn_path(), vpn_name_from_file(), normalize_name(), free_name(), looks_like_source(), is_subscription_url(), list_vpns(), vpn_source(), import_vpn(), delete_vpn(), vpn_binary_problem(), test_vpn(), base_name_from_url() …
 - `src/envbox/gui/app.py` (24 стр.) — Приложение GTK и точка входа gui_main.
   App (2 методов), gui_main()
@@ -85,8 +85,8 @@
   SidebarMixin (6 методов)
 - `src/envbox/gui/pages/terminal.py` (276 стр.) — Встроенный терминал (VTE).
   TerminalMixin (9 методов)
-- `src/envbox/gui/pages/vpn.py` (197 стр.) — Вкладка «VPN»: загрузка конфигураций (WireGuard, VLESS/Xray, sing-box), проверка и удаление.
-  VpnPageMixin (9 методов)
+- `src/envbox/gui/pages/vpn.py` (236 стр.) — Вкладка «VPN»: загрузка конфигураций (WireGuard, VLESS/Xray, sing-box), проверка и удаление.
+  VpnPageMixin (11 методов)
 - `src/envbox/gui/tables.py` (62 стр.) — Таблицы и строки списков GUI.
   Row (1 методов), Table (5 методов)
 - `src/envbox/gui/widgets.py` (222 стр.) — Мелкие виджеты и диалоги GTK: кнопки, карточки, переключатели, alert/choose/prompt.

@@ -9,6 +9,7 @@ import re
 
 from ..net.vpn import (VPN_BINARIES, VPN_HINTS, VPN_KINDS, VPN_LABELS, VpnClient, detect_kind, find_binary,
                        split_links, vpn_validate)
+from ..net.upstream import Upstream
 from .consts import NAME_RE
 from .root import envbox_root
 
@@ -190,28 +191,73 @@ def base_name_from_url(url):
     return "".join(c if c.isalnum() and c.isascii() else "-" for c in host).strip("-")[:40] or "vpn"
 
 
-def fetch_subscription(url, timeout=20):
-    """Скачать подписку по ссылке (с вашего компьютера напрямую: сервер подписки увидит ваш настоящий адрес).
+def open_via_proxy(proxy, auth, host, port, timeout):
+    """Подключённый сокет до host:port через прокси (http или socks5); имя сайта разрешает сам прокси."""
+    import asyncio
+    import socket
+
+    async def go():
+        up = Upstream(proxy, auth or None)
+        _r, w = await asyncio.wait_for(up.tunnel(host, port), timeout)
+        try:
+            return os.dup(w.get_extra_info("socket").fileno())     # соединение переживёт закрытие транспорта
+        finally:
+            w.close()
+            await asyncio.sleep(0)
+
+    sock = socket.socket(fileno=asyncio.run(go()))
+    sock.settimeout(timeout)
+    return sock
+
+
+def fetch_subscription(url, timeout=20, proxy="", auth=""):
+    """Скачать подписку по ссылке: напрямую с вашего компьютера (сервер подписки увидит ваш настоящий адрес) или
+    через прокси `proxy` (тогда имя сайта разрешает он: помогает, когда сайт блокируется или не находится по DNS).
 
     Многие панели отдают разные форматы разным программам, поэтому представляемся клиентом v2rayN: он получает
     список ссылок. ValueError с понятным текстом при любой неудаче."""
-    import urllib.error
+    import http.client
+    import socket
+    import ssl
     import urllib.parse
-    import urllib.request
     url = (url or "").strip()
     if urllib.parse.urlsplit(url).scheme not in ("http", "https") or any(c.isspace() for c in url):
         raise ValueError("нужна ссылка http:// или https:// без пробелов")
-    req = urllib.request.Request(url, headers={"User-Agent": "v2rayN/6.42", "Accept": "*/*"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+    via = " через прокси" if proxy else ""
+    for _hop in range(5):                                           # переходы по перенаправлениям
+        u = urllib.parse.urlsplit(url)
+        https = u.scheme == "https"
+        host = u.hostname or ""
+        try:
+            port = u.port or (443 if https else 80)
+        except ValueError:
+            raise ValueError("в ссылке неверный порт") from None
+        path = (u.path or "/") + (("?" + u.query) if u.query else "")
+        conn = (http.client.HTTPSConnection if https else http.client.HTTPConnection)(host, port, timeout=timeout)
+        try:
+            if proxy:
+                raw = open_via_proxy(proxy, auth, host, port, timeout)
+                conn.sock = ssl.create_default_context().wrap_socket(raw, server_hostname=host) if https else raw
+            conn.request("GET", path, headers={"User-Agent": "v2rayN/6.42", "Accept": "*/*",
+                                               "Accept-Encoding": "identity", "Connection": "close"})
+            r = conn.getresponse()
+            if r.status in (301, 302, 303, 307, 308) and r.getheader("Location"):
+                url = urllib.parse.urljoin(url, r.getheader("Location"))
+                continue
+            if r.status >= 400:
+                raise ValueError(f"сервер подписки ответил: HTTP {r.status}")
             data = r.read(SUB_MAX_BYTES + 1)
-    except urllib.error.HTTPError as e:
-        raise ValueError(f"сервер подписки ответил: HTTP {e.code}") from None
-    except (urllib.error.URLError, OSError) as e:
-        raise ValueError(f"не удалось скачать подписку: {getattr(e, 'reason', e)}") from None
-    if len(data) > SUB_MAX_BYTES:
-        raise ValueError("ответ сервера слишком большой (больше 2 МБ): это не подписка")
-    return data.decode("utf-8", "replace")
+        except socket.gaierror:
+            raise ValueError(f"не удалось найти сайт «{host}»: DNS вашего компьютера не отвечает или сайт "
+                             "заблокирован. Выберите «Через прокси среды…» в окне добавления") from None
+        except (OSError, http.client.HTTPException, UnicodeError) as e:
+            raise ValueError(f"не удалось скачать подписку{via}: {e or type(e).__name__}") from None
+        finally:
+            conn.close()
+        if len(data) > SUB_MAX_BYTES:
+            raise ValueError("ответ сервера слишком большой (больше 2 МБ): это не подписка")
+        return data.decode("utf-8", "replace")
+    raise ValueError("слишком много перенаправлений")
 
 
 def import_many(base, text, replace=False):
@@ -246,7 +292,7 @@ def import_many(base, text, replace=False):
     return done, skipped
 
 
-def import_subscription(base, url):
-    """Скачать подписку и добавить серверы из неё (см. import_many)."""
+def import_subscription(base, url, proxy="", auth=""):
+    """Скачать подписку (напрямую или через прокси) и добавить серверы из неё (см. import_many)."""
     url = (url or "").strip().strip("\"'<>")
-    return import_many(base or base_name_from_url(url), fetch_subscription(url), replace=True)
+    return import_many(base or base_name_from_url(url), fetch_subscription(url, proxy=proxy, auth=auth), replace=True)

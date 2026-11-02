@@ -140,7 +140,8 @@ unix-сокет run/proxy.sock → net/proxy.py Proxy.handle (на хосте) �
 
 VPN-клиенты (`net/vpn.py`): WireGuard через `wireproxy`, ссылки `vless://`, `vmess://` (base64-JSON и вид `uuid@хост`),
 `trojan://`, `ss://` (SIP002 и старый вид; плагины нет) и JSON Xray — через `xray`, JSON sing-box — через `sing-box`; без root.
-Подписка (`https://…` от провайдера, `core/vpn.py fetch_subscription`: скачивается с хоста напрямую, User-Agent `v2rayN`) —
+Подписка (`https://…` от провайдера, `core/vpn.py fetch_subscription`: напрямую с хоста или через прокси среды —
+`open_via_proxy` строит туннель кодом шлюза `Upstream`, имя сайта разрешает прокси; User-Agent `v2rayN`) —
 список ссылок, часто в base64 (`split_links`); каждый сервер сохраняется отдельным VPN `<имя>-N` (`import_many`, до 40).
 Не поддержаны: hysteria2, tuic, Clash YAML (нет YAML в стандартной библиотеке) — пропускаются с пояснением.
 Шлюз генерирует временную конфигурацию (каталог 0700, стирается при остановке) со SOCKS5 на `127.0.0.1:<свободный порт>` с
@@ -708,6 +709,7 @@ python3 -I dist/envbox.py wrap --map 3999:/tmp/ebp/p.sock -- curl --noproxy '' -
 | Claude «бесконечно думает» и/или большая загрузка (npm, 330 МБ) обрывается, хотя короткие запросы идут | вышестоящий прокси рвёт каждый туннель ровно через ~60 с после установки, независимо от активности (журнал: `close` с `end=upstream`, `ms` ≈ 60.5–63.3 с и у многих соединений одинаковый; у простаивающих `down_last` задолго до конца; у загрузок `down` десятки–сотни МБ и тот же `ms`; `end=client` у npm с `down=0` — клиент сам сдался) | `python3 -c` по `net.log`: сгруппировать `close` по `ts` и `ms`; проверка без envbox: `curl -x прокси -m 100 https://speed.cloudflare.com/__down?bytes=2000000000` — обрыв на ~60 с подтверждает предел самого прокси. Лечится у поставщика (длинная/«липкая» сессия, статический адрес, другой порт/протокол) или `direct_domains` для сайтов, которым прокси не нужен (npm). Метки `up_end/down_first/down_last` в `close` показывают, кто молчит |
 | «VPN не запустился»/всё через `direct`: в журнале `channel` с `state: broken` | нет программы клиента (wireproxy/xray/sing-box) или конфигурация не читается | `reason` в событии; `vpn-<n>.log` рядом с `net.log`; кнопка «Проверить» на вкладке «VPN» (`core/vpn.py test_vpn`) |
 | Канал «мигает» (`down`/`up` по кругу) | проба `example.com:443` проходит, а рабочие соединения нет (или наоборот) | `PROBE_TARGET`, `PROBE_EVERY` в `net/chain.py`; события `channel` с `reason` |
+| Вкладка «VPN», подписка: «[Errno -3] Temporary failure in name resolution» | DNS компьютера не находит сайт подписки (блокировка, нет сети у процесса) | в окне «Вставить…» выбрать «Скачать подписку через прокси среды…»: `fetch_subscription(..., proxy=…)` |
 | 403 «Private address forbidden» на обычных сайтах | локальный DNS отдаёт частные/нулевые адреса (fake-ip 198.18/15 уже разрешён; `0.0.0.0` от блокировщиков, split-DNS, Tailscale `100.64/10`) | `net.log`: `deny private-address`, поле `resolved`; `--dns`, `--net-allow-private` или чинить DNS |
 | 502 «Upstream proxy failed» | вышестоящий прокси (VPN-клиент) не запущен/не отвечает/требует пароль; цель недоступна (ждёт 15 с) | `net.log`: `error upstream: …`; `envbox.py probe --upstream URL` |
 | 502 «DNS resolution failed» | не работает DNS хоста или заданные `--dns` | `error dns: …`; `Resolver` кэширует отказ 2 с |
