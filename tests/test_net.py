@@ -658,6 +658,21 @@ class Presets(unittest.TestCase):
                                     "allow_domains": ["example.com"]})
         self.assertEqual(custom.allow_domains, ["example.com"])      # свои списки не трогаем
 
+    def test_desktop_preset_allows_the_login_captcha(self):
+        # вход на claude.ai проверяется через hCaptcha; без js.hcaptcha.com: «Couldn't verify your browser»
+        from envbox.core.consts import OLD_CLAUDE_DESKTOP_DOMAINS
+        from envbox.core.profile import Profile
+        from envbox.net.proxy import host_matches
+        p = Profile.claude_desktop_preset("d")
+        self.assertTrue(host_matches(p.allow_domains, "js.hcaptcha.com"))
+        self.assertFalse(host_matches(Profile.claude_preset("c").allow_domains, "js.hcaptcha.com"))
+        q = Profile.from_dict({"name": "d", "net": "allowlist", "link_handler": "claude-desktop",
+                               "allow_domains": list(OLD_CLAUDE_DESKTOP_DOMAINS)})
+        self.assertTrue(host_matches(q.allow_domains, "js.hcaptcha.com"))     # прежний пресет обновляется
+        custom = Profile.from_dict({"name": "d", "net": "allowlist", "link_handler": "claude-desktop",
+                                    "allow_domains": OLD_CLAUDE_DESKTOP_DOMAINS + ["example.com"]})
+        self.assertNotIn("*.hcaptcha.com", custom.allow_domains)               # свои списки не трогаем
+
     def test_timeout_errors_are_not_logged_with_an_empty_reason(self):
         from envbox.net.proxy import err_text
         self.assertEqual(err_text(asyncio.TimeoutError()), "TimeoutError")

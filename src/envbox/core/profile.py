@@ -19,6 +19,7 @@ from .consts import (
     LANG_RE,
     NAME_RE,
     NET_MODES,
+    OLD_CLAUDE_DESKTOP_DOMAINS,
     OLD_CLAUDE_DOMAINS,
     RESERVED_VARS,
     SCHEME_RE,
@@ -149,8 +150,8 @@ class Profile:
         if p.net == "allowlist" and p.allow_domains == OLD_CLAUDE_DOMAINS:
             p.allow_domains = list(CLAUDE_DOMAINS)   # старый пресет не пускал обновление токена на claude.com
         if (p.net == "allowlist" and p.link_handler == "claude-desktop"
-                and p.allow_domains in (list(CLAUDE_DOMAINS), OLD_CLAUDE_DOMAINS)):
-            p.allow_domains = list(CLAUDE_DESKTOP_DOMAINS)   # пресет Claude Desktop без bridge.claudeusercontent.com
+                and p.allow_domains in (list(CLAUDE_DOMAINS), OLD_CLAUDE_DOMAINS, OLD_CLAUDE_DESKTOP_DOMAINS)):
+            p.allow_domains = list(CLAUDE_DESKTOP_DOMAINS)   # пресет Claude Desktop без bridge и hCaptcha
         if p.kind not in KINDS:
             p.kind = "app"
         return p
