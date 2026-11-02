@@ -282,7 +282,11 @@ class Proxy:
     async def open_chain(self, host, port, method, rec):
         """Первый отозвавшийся канал цепочки. Упавшие пропускаются; смена канала пишется в журнал."""
         errors = []
-        for ch in self.chain.order():
+        order = self.chain.order()
+        if not order:     # все каналы не запустились (нет программы VPN, плохой конфиг): отказ с причиной, не обрыв
+            raise OpenFailed("chain: " + "; ".join(f"{c.label}: {c.error or 'недоступен'}" for c in self.chain.channels),
+                             "Upstream proxy failed")
+        for ch in order:
             try:
                 ur, uw, tunnel, up, ip = await self.open_channel(ch, host, port, method, rec)
             except PrivateAddress:

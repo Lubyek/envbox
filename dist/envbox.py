@@ -38,7 +38,7 @@ import time
 
 # ---- version.py: Версия envbox (строка читается регулярным выражением при установке — не менять формат).
 
-ENVBOX_VERSION = "2026.11.02.8"
+ENVBOX_VERSION = "2026.11.02.9"
 
 
 # ---- lazy.py: Ленивые модули стандартной библиотеки: настоящий import происходит при первом обращении к атрибуту.
@@ -1783,7 +1783,11 @@ class Proxy:
     async def open_chain(self, host, port, method, rec):
         """Первый отозвавшийся канал цепочки. Упавшие пропускаются; смена канала пишется в журнал."""
         errors = []
-        for ch in self.chain.order():
+        order = self.chain.order()
+        if not order:     # все каналы не запустились (нет программы VPN, плохой конфиг): отказ с причиной, не обрыв
+            raise OpenFailed("chain: " + "; ".join(f"{c.label}: {c.error or 'недоступен'}" for c in self.chain.channels),
+                             "Upstream proxy failed")
+        for ch in order:
             try:
                 ur, uw, tunnel, up, ip = await self.open_channel(ch, host, port, method, rec)
             except PrivateAddress:
@@ -5789,6 +5793,44 @@ def vpn_name_from_file(filename):
     return stem[:48] or "vpn"
 
 
+# Режимы выхода в интернет: каждый — готовый порядок каналов (Profile.upstream_chain)
+EXIT_MODES = ("proxy", "vpn_only", "vpn_then_proxy", "proxy_then_vpn", "custom")
+
+
+EXIT_LABELS = {
+    "proxy": "Напрямую или только через свой прокси (как раньше)",
+    "vpn_only": "Только через VPN (без прокси и без прямого выхода)",
+    "vpn_then_proxy": "Сначала VPN, запасной — свой прокси",
+    "proxy_then_vpn": "Сначала свой прокси, запасной — VPN",
+    "custom": "Свой порядок каналов (список ниже)",
+}
+
+
+def exit_chain(mode, vpn):
+    """Порядок каналов для режима выхода и выбранного VPN (режим custom список не меняет: возвращает None)."""
+    if mode == "proxy":
+        return []
+    if mode == "custom":
+        return None
+    v = f"vpn:{vpn}"
+    return {"vpn_only": [v], "vpn_then_proxy": [v, "proxy"], "proxy_then_vpn": ["proxy", v]}[mode]
+
+
+def exit_mode(chain):
+    """(режим, имя VPN) по порядку каналов; нестандартный порядок — режим custom."""
+    chain = list(chain or [])
+    if not chain:
+        return "proxy", ""
+    vpn = lambda c: c[4:] if c.startswith("vpn:") else ""    # noqa: E731
+    if len(chain) == 1 and vpn(chain[0]):
+        return "vpn_only", vpn(chain[0])
+    if chain[1:] == ["proxy"] and vpn(chain[0]):
+        return "vpn_then_proxy", vpn(chain[0])
+    if chain[:1] == ["proxy"] and len(chain) == 2 and vpn(chain[1]):
+        return "proxy_then_vpn", vpn(chain[1])
+    return "custom", ""
+
+
 SOURCE_RE = re.compile(r"^(https?://|vless://|vmess://|trojan://|ss://|\[interface\]|\{)", re.I)
 
 
@@ -7591,20 +7633,30 @@ def describe(p):
                     + ": запросы идут по сети без шифрования, их видит сеть и владелец сервера."))
     if p.chain_on:
         names = {"proxy": f"ваш прокси {p.upstream}", "direct": "выход этого компьютера (в том числе его системный VPN)"}
-        out.append(("info", "Каналы выхода по порядку: " + " → ".join(
-            names.get(c) or f"VPN «{c[4:]}»" for c in p.upstream_chain) +
-            ". Первый рабочий получает новые соединения, при его отказе берётся следующий; когда он вернётся, "
-            "соединения снова идут через него. Уже открытые соединения при отказе канала обрываются."))
+        chain = p.upstream_chain
+        if all(c.startswith("vpn:") for c in chain) and len(chain) == 1:
+            out.append(("info", f"Весь трафик идёт только через VPN «{chain[0][4:]}». Если он не запустится или "
+                                "оборвётся, соединения будут отклоняться: прямого выхода и прокси нет, настоящий "
+                                "адрес не раскрывается. Уже открытые соединения при обрыве VPN разрываются."))
+        else:
+            out.append(("info", "Каналы выхода по порядку: " + " → ".join(
+                names.get(c) or f"VPN «{c[4:]}»" for c in chain) +
+                ". Первый рабочий получает новые соединения, при его отказе берётся следующий; когда он вернётся, "
+                "соединения снова идут через него. Уже открытые соединения при отказе канала обрываются."))
+        if "direct" in chain:
+            out.append(("warn", "В порядке выхода есть «direct»: когда остальные каналы не отвечают, трафик пойдёт "
+                                "напрямую с вашего настоящего адреса. Если нужен выход только через VPN или прокси, "
+                                "уберите «direct»."))
         if p.has_remote:
             out.append(("info", "Имена сайтов разрешает прокси или VPN, а не этот компьютер."))
     elif p.upstream and p.net in ("log", "allowlist"):
         who = "логином и паролем из keyring" if p.upstream_auth else "без логина"
         out.append(("info", f"Дальше трафик идёт через ваш прокси {p.upstream} ({who}); "
                             "имена сайтов разрешает он."))
-        if p.direct_domains:
-            out.append(("warn", "Напрямую, мимо этого прокси, пойдут: " + ", ".join(p.direct_domains) +
-                        ". Эти сайты увидят ваш настоящий адрес. Программа в среде по-прежнему видит только "
-                        "прокси envbox."))
+    if p.direct_domains and p.has_remote and p.net in ("log", "allowlist"):
+        out.append(("warn", "Напрямую, мимо прокси и VPN, пойдут: " + ", ".join(p.direct_domains) +
+                    ". Эти сайты увидят ваш настоящий адрес. Программа в среде по-прежнему видит только "
+                    "прокси envbox."))
     if not p.is_browser and (p.link_handler or p.link_callback):
         bits = []
         if p.link_handler:
@@ -10649,11 +10701,78 @@ def _build_gui():
         # ---- порядок выхода (прокси, VPN, выход компьютера)
 
         def refresh_vpn_choices(self):
-            """Список VPN в выпадающем списке «+ VPN» (после загрузки или удаления VPN)."""
+            """Список VPN в выпадающих списках (после загрузки или удаления VPN и при показе профиля)."""
             if not hasattr(self, "dd_vpns"):
                 return
             names = [v["name"] for v in list_vpns()]
-            self.dd_vpns.set_model(Gtk.StringList.new(["—"] + names))
+            self.exit_vpns = names
+            model = ["—"] + names
+            was, self.exit_sync = getattr(self, "exit_sync", False), True   # смена модели не должна переписывать порядок
+            try:
+                self.dd_vpns.set_model(Gtk.StringList.new(model))
+                if hasattr(self, "dd_exit_vpn"):
+                    self.dd_exit_vpn.set_model(Gtk.StringList.new(model))
+            finally:
+                self.exit_sync = was
+            self.sync_exit_from_chain()
+
+        VPN_EXIT_MODES = ("vpn_only", "vpn_then_proxy", "proxy_then_vpn")
+
+        def on_exit_changed(self, *_):
+            """Выбран режим выхода или VPN: порядок каналов переписывается под него."""
+            if getattr(self, "exit_sync", False) or not hasattr(self, "tv_chain"):
+                return
+            mode = EXIT_MODES[self.dd_exit.get_selected()]
+            names = self.exit_vpns
+            i = self.dd_exit_vpn.get_selected()
+            vpn = names[i - 1] if 0 < i <= len(names) else ""
+            if mode in self.VPN_EXIT_MODES and not vpn:
+                if not names:
+                    alert(self, "Нет VPN", "Сначала загрузите VPN на вкладке «VPN», затем выберите этот режим.")
+                    self.sync_exit_from_chain()      # вернуть прежний режим
+                    return
+                vpn = names[0]
+                self.exit_sync = True
+                self.dd_exit_vpn.set_selected(1)
+                self.exit_sync = False
+            chain = exit_chain(mode, vpn)
+            if chain is not None:
+                self.exit_sync = True
+                set_text(self.tv_chain, "\n".join(chain))
+                self.exit_sync = False
+            self.update_net_sensitivity()
+
+        def sync_exit_from_chain(self):
+            """Выпадающие списки режима и VPN показывают то, что записано в порядке каналов."""
+            if getattr(self, "exit_sync", False) or not hasattr(self, "dd_exit") or not hasattr(self, "tv_chain"):
+                return
+            mode, vpn = exit_mode(get_lines(self.tv_chain))
+            self.exit_sync = True
+            try:
+                self.dd_exit.set_selected(EXIT_MODES.index(mode))
+                names = self.exit_vpns
+                self.dd_exit_vpn.set_selected(names.index(vpn) + 1 if vpn in names else 0)
+            finally:
+                self.exit_sync = False
+            self.update_exit_ui(None)
+
+        def update_exit_ui(self, net_on=True):
+            """Что показывать: выбор VPN нужен режимам с VPN, ручной список — только режиму «свой порядок»."""
+            if net_on is None:
+                net_on = NET_MODES[self.dd_net.get_selected()] in ("log", "allowlist")
+            mode = EXIT_MODES[self.dd_exit.get_selected()]
+            self.dd_exit_vpn.set_visible(bool(net_on) and mode in self.VPN_EXIT_MODES)
+            show_all(self.chain_widgets, bool(net_on) and mode == "custom")
+            self.lbl_exit.set_text({
+                "proxy": "Один прокси, если он указан выше, иначе прямой выход с этого компьютера.",
+                "vpn_only": "Все соединения идут через выбранный VPN. Если он не запустится или оборвётся, соединения "
+                            "отклоняются: прямого выхода и прокси нет. Нужна программа клиента (см. вкладку «VPN»).",
+                "vpn_then_proxy": "Пока VPN работает, всё идёт через него; если он не отвечает, берётся ваш прокси "
+                                  "(адрес выше), а когда VPN вернётся, снова через него.",
+                "proxy_then_vpn": "Пока прокси работает, всё идёт через него; если он не отвечает, берётся VPN, а когда "
+                                  "прокси вернётся, снова через него.",
+                "custom": "Порядок каналов задаёте сами в списке ниже: proxy, vpn:имя, direct.",
+            }[mode])
 
         def on_chain_add(self, item):
             lines = get_lines(self.tv_chain)
@@ -10878,6 +10997,22 @@ def _build_gui():
             rows.grid.attach(self.lbl_up, 1, rows.r, 1, 1)
             rows.r += 1
             self.e_upstream.connect("changed", lambda *_: self.update_net_sensitivity())
+            # режим выхода: готовые порядки каналов; «только через VPN» — без прокси и прямого выхода
+            self.exit_sync = False
+            self.exit_vpns = []
+            exit_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            self.dd_exit = Gtk.DropDown.new_from_strings([EXIT_LABELS[m] for m in EXIT_MODES])
+            self.dd_exit.connect("notify::selected", self.on_exit_changed)
+            exit_box.append(self.dd_exit)
+            self.dd_exit_vpn = Gtk.DropDown.new_from_strings(["—"])
+            self.dd_exit_vpn.connect("notify::selected", self.on_exit_changed)
+            exit_box.append(self.dd_exit_vpn)
+            self.lbl_exit = hint("")
+            exit_box.append(self.lbl_exit)
+            self.up_widgets += rows.add("Выход в интернет", exit_box,
+                                        "VPN загружаются на вкладке «VPN». «Только через VPN»: весь трафик идёт через "
+                                        "выбранный VPN, а если он не запустился или оборвался, соединения отклоняются "
+                                        "(настоящий адрес не раскрывается).")
             # порядок выхода: прокси, VPN, выход этого компьютера; первый рабочий принимает новые соединения
             self.tv_chain, sw = text_area(height=56)
             chain_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -10893,13 +11028,15 @@ def _build_gui():
             bt.connect("clicked", self.on_chain_add_vpn)
             chain_bar.append(bt)
             chain_box.append(chain_bar)
-            self.up_widgets += rows.add(
+            self.chain_widgets = rows.add(
                 "Порядок выхода", chain_box,
                 "Необязательно. По одному каналу в строке: proxy (свой прокси выше), vpn:имя (вкладка «VPN»), "
                 "direct (выход этого компьютера, в том числе через его системный VPN). Первый рабочий принимает все "
                 "новые соединения; если он не отвечает, берётся следующий, а когда первый вернётся, соединения снова "
                 "идут через него. Пусто: как раньше, один прокси или прямой выход.")
-            self.tv_chain.get_buffer().connect("changed", lambda *_: self.update_net_sensitivity())
+            self.up_widgets += self.chain_widgets
+            self.tv_chain.get_buffer().connect("changed", lambda *_: (self.sync_exit_from_chain(),
+                                                                      self.update_net_sensitivity()))
             adv.append(box)
 
 
@@ -11061,6 +11198,8 @@ def _build_gui():
             chain_items = get_lines(self.tv_chain) if hasattr(self, "tv_chain") else []
             via_upstream = mode in ("log", "allowlist") and (
                 bool(self.e_upstream.get_text().strip()) or any(c.startswith("vpn:") for c in chain_items))
+            if hasattr(self, "dd_exit"):
+                self.update_exit_ui(mode in ("log", "allowlist"))
             show_all(self.dns_widgets, mode in ("log", "allowlist", "host") and not via_upstream)
             if mode == "host":
                 self.lbl_dns.set_text("Серверы запишутся в /etc/resolv.conf среды.")

@@ -19,7 +19,7 @@
 - `src/envbox/core/browser.py` (124 стр.) — Среды-браузеры: поиск Chrome/Chromium, монтирование, команда запуска, CDP-сокет.
   find_browser(), browser_mounts(), host_program_in_home(), browser_display_flag(), browser_command(), cdp_socket_path(), attach_snippets()
 - `src/envbox/core/consts.py` (113 стр.) — Общие константы ядра: регулярные выражения, режимы сети, подписи, пути установки.
-- `src/envbox/core/describe.py` (163 стр.) — Человеческое описание того, что получит среда (для вкладки «Обзор»).
+- `src/envbox/core/describe.py` (173 стр.) — Человеческое описание того, что получит среда (для вкладки «Обзор»).
   describe()
 - `src/envbox/core/desktop.py` (43 стр.) — Ярлык и значок envbox в меню приложений.
   install_desktop_entry()
@@ -53,8 +53,8 @@
   detect_terminal(), terminal_argv(), dry_run(), launch_background(), read_tail()
 - `src/envbox/core/upstream.py` (70 стр.) — Вышестоящий прокси профиля: разбор URL, чтение из файла, проверка.
   split_proxy_url(), read_proxy_file(), probe_upstream()
-- `src/envbox/core/vpn.py` (298 стр.) — Хранилище VPN-конфигураций: импорт, список, удаление и проверка наличия клиента.
-  vpn_dir(), vpn_path(), vpn_name_from_file(), normalize_name(), free_name(), looks_like_source(), is_subscription_url(), list_vpns(), vpn_source(), import_vpn(), delete_vpn(), vpn_binary_problem(), test_vpn(), base_name_from_url() …
+- `src/envbox/core/vpn.py` (336 стр.) — Хранилище VPN-конфигураций: импорт, список, удаление и проверка наличия клиента.
+  vpn_dir(), vpn_path(), vpn_name_from_file(), exit_chain(), exit_mode(), normalize_name(), free_name(), looks_like_source(), is_subscription_url(), list_vpns(), vpn_source(), import_vpn(), delete_vpn(), vpn_binary_problem() …
 - `src/envbox/gui/app.py` (24 стр.) — Приложение GTK и точка входа gui_main.
   App (2 методов), gui_main()
 - `src/envbox/gui/browser/page.py` (412 стр.) — Страница встроенного браузера: подключение, отключение, запуск.
@@ -75,9 +75,9 @@
   NetPageMixin (11 методов)
 - `src/envbox/gui/pages/overview.py` (162 стр.) — Страницы «Добро пожаловать» и «Обзор».
   OverviewMixin (3 методов)
-- `src/envbox/gui/pages/profile_net.py` (261 стр.) — Настройки сети среды: секрет, прокси, подключение приложений, CDP.
-  ProfileNetMixin (15 методов)
-- `src/envbox/gui/pages/profile_page.py` (549 стр.) — Страница настроек среды: сбор формы, сохранение.
+- `src/envbox/gui/pages/profile_net.py` (328 стр.) — Настройки сети среды: секрет, прокси, подключение приложений, CDP.
+  ProfileNetMixin (18 методов)
+- `src/envbox/gui/pages/profile_page.py` (570 стр.) — Страница настроек среды: сбор формы, сохранение.
   ProfilePageMixin (10 методов)
 - `src/envbox/gui/pages/settings.py` (114 стр.) — Настройки приложения, диагностика, ярлык.
   version_line(), SettingsMixin (5 методов)
@@ -111,7 +111,7 @@
   NetArgs (1 методов), net_usage(), net_parse(), net_main()
 - `src/envbox/net/gitcheck.py` (112 стр.) — Проверка Git после работы среды: хуки и config проекта не должны меняться незаметно.
   git_state(), cmd_gitcheck()
-- `src/envbox/net/proxy.py` (547 стр.) — Сетевой шлюз: журналирующий прокси (команда proxy).
+- `src/envbox/net/proxy.py` (551 стр.) — Сетевой шлюз: журналирующий прокси (команда proxy).
   host_matches(), err_text(), PrivateAddress (1 методов), OpenFailed (1 методов), Proxy (7 методов), build_chain(), cmd_proxy()
 - `src/envbox/net/report.py` (112 стр.) — Сетевой шлюз: чтение и вывод журнала соединений (команда report).
   human(), clean(), events(), fmt_event(), cmd_report()

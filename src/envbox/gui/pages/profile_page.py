@@ -11,6 +11,7 @@ from ...core.root import envbox_root
 from ...core.store import browser_profiles, save_profile
 from ...core.system import installed_shells, pkg_hint
 from ...core.upstream import split_proxy_url
+from ...core.vpn import EXIT_LABELS, EXIT_MODES
 from ..gtk import GLib, Gtk
 from ..widgets import (
     Rows,
@@ -164,6 +165,22 @@ class ProfilePageMixin:
         rows.grid.attach(self.lbl_up, 1, rows.r, 1, 1)
         rows.r += 1
         self.e_upstream.connect("changed", lambda *_: self.update_net_sensitivity())
+        # режим выхода: готовые порядки каналов; «только через VPN» — без прокси и прямого выхода
+        self.exit_sync = False
+        self.exit_vpns = []
+        exit_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.dd_exit = Gtk.DropDown.new_from_strings([EXIT_LABELS[m] for m in EXIT_MODES])
+        self.dd_exit.connect("notify::selected", self.on_exit_changed)
+        exit_box.append(self.dd_exit)
+        self.dd_exit_vpn = Gtk.DropDown.new_from_strings(["—"])
+        self.dd_exit_vpn.connect("notify::selected", self.on_exit_changed)
+        exit_box.append(self.dd_exit_vpn)
+        self.lbl_exit = hint("")
+        exit_box.append(self.lbl_exit)
+        self.up_widgets += rows.add("Выход в интернет", exit_box,
+                                    "VPN загружаются на вкладке «VPN». «Только через VPN»: весь трафик идёт через "
+                                    "выбранный VPN, а если он не запустился или оборвался, соединения отклоняются "
+                                    "(настоящий адрес не раскрывается).")
         # порядок выхода: прокси, VPN, выход этого компьютера; первый рабочий принимает новые соединения
         self.tv_chain, sw = text_area(height=56)
         chain_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -179,13 +196,15 @@ class ProfilePageMixin:
         bt.connect("clicked", self.on_chain_add_vpn)
         chain_bar.append(bt)
         chain_box.append(chain_bar)
-        self.up_widgets += rows.add(
+        self.chain_widgets = rows.add(
             "Порядок выхода", chain_box,
             "Необязательно. По одному каналу в строке: proxy (свой прокси выше), vpn:имя (вкладка «VPN»), "
             "direct (выход этого компьютера, в том числе через его системный VPN). Первый рабочий принимает все "
             "новые соединения; если он не отвечает, берётся следующий, а когда первый вернётся, соединения снова "
             "идут через него. Пусто: как раньше, один прокси или прямой выход.")
-        self.tv_chain.get_buffer().connect("changed", lambda *_: self.update_net_sensitivity())
+        self.up_widgets += self.chain_widgets
+        self.tv_chain.get_buffer().connect("changed", lambda *_: (self.sync_exit_from_chain(),
+                                                                  self.update_net_sensitivity()))
         adv.append(box)
 
 
@@ -347,6 +366,8 @@ class ProfilePageMixin:
         chain_items = get_lines(self.tv_chain) if hasattr(self, "tv_chain") else []
         via_upstream = mode in ("log", "allowlist") and (
             bool(self.e_upstream.get_text().strip()) or any(c.startswith("vpn:") for c in chain_items))
+        if hasattr(self, "dd_exit"):
+            self.update_exit_ui(mode in ("log", "allowlist"))
         show_all(self.dns_widgets, mode in ("log", "allowlist", "host") and not via_upstream)
         if mode == "host":
             self.lbl_dns.set_text("Серверы запишутся в /etc/resolv.conf среды.")

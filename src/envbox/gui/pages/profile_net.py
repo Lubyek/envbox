@@ -4,14 +4,14 @@ import subprocess
 
 from ...cdp.http import cdp_listening
 from ...core.browser import attach_snippets, cdp_socket_path
-from ...core.consts import RESERVED_VARS, UPSTREAM_AUTH_VAR, VAR_RE
+from ...core.consts import NET_MODES, RESERVED_VARS, UPSTREAM_AUTH_VAR, VAR_RE
 from ...core.keyring import secret_clear, secret_exists, secret_lookup, secret_store, secret_tool_available
 from ...core.system import pkg_hint
 from ...core.terminal import dry_run
 from ...core.upstream import probe_upstream, read_proxy_file, split_proxy_url
-from ...core.vpn import list_vpns
+from ...core.vpn import EXIT_MODES, exit_chain, exit_mode, list_vpns
 from ..gtk import GLib, Gtk
-from ..widgets import alert, get_lines, hint, margins, prompt, set_text, to_home
+from ..widgets import alert, get_lines, hint, margins, prompt, set_text, show_all, to_home
 
 
 class ProfileNetMixin:
@@ -168,11 +168,78 @@ class ProfileNetMixin:
     # ---- порядок выхода (прокси, VPN, выход компьютера)
 
     def refresh_vpn_choices(self):
-        """Список VPN в выпадающем списке «+ VPN» (после загрузки или удаления VPN)."""
+        """Список VPN в выпадающих списках (после загрузки или удаления VPN и при показе профиля)."""
         if not hasattr(self, "dd_vpns"):
             return
         names = [v["name"] for v in list_vpns()]
-        self.dd_vpns.set_model(Gtk.StringList.new(["—"] + names))
+        self.exit_vpns = names
+        model = ["—"] + names
+        was, self.exit_sync = getattr(self, "exit_sync", False), True   # смена модели не должна переписывать порядок
+        try:
+            self.dd_vpns.set_model(Gtk.StringList.new(model))
+            if hasattr(self, "dd_exit_vpn"):
+                self.dd_exit_vpn.set_model(Gtk.StringList.new(model))
+        finally:
+            self.exit_sync = was
+        self.sync_exit_from_chain()
+
+    VPN_EXIT_MODES = ("vpn_only", "vpn_then_proxy", "proxy_then_vpn")
+
+    def on_exit_changed(self, *_):
+        """Выбран режим выхода или VPN: порядок каналов переписывается под него."""
+        if getattr(self, "exit_sync", False) or not hasattr(self, "tv_chain"):
+            return
+        mode = EXIT_MODES[self.dd_exit.get_selected()]
+        names = self.exit_vpns
+        i = self.dd_exit_vpn.get_selected()
+        vpn = names[i - 1] if 0 < i <= len(names) else ""
+        if mode in self.VPN_EXIT_MODES and not vpn:
+            if not names:
+                alert(self, "Нет VPN", "Сначала загрузите VPN на вкладке «VPN», затем выберите этот режим.")
+                self.sync_exit_from_chain()      # вернуть прежний режим
+                return
+            vpn = names[0]
+            self.exit_sync = True
+            self.dd_exit_vpn.set_selected(1)
+            self.exit_sync = False
+        chain = exit_chain(mode, vpn)
+        if chain is not None:
+            self.exit_sync = True
+            set_text(self.tv_chain, "\n".join(chain))
+            self.exit_sync = False
+        self.update_net_sensitivity()
+
+    def sync_exit_from_chain(self):
+        """Выпадающие списки режима и VPN показывают то, что записано в порядке каналов."""
+        if getattr(self, "exit_sync", False) or not hasattr(self, "dd_exit") or not hasattr(self, "tv_chain"):
+            return
+        mode, vpn = exit_mode(get_lines(self.tv_chain))
+        self.exit_sync = True
+        try:
+            self.dd_exit.set_selected(EXIT_MODES.index(mode))
+            names = self.exit_vpns
+            self.dd_exit_vpn.set_selected(names.index(vpn) + 1 if vpn in names else 0)
+        finally:
+            self.exit_sync = False
+        self.update_exit_ui(None)
+
+    def update_exit_ui(self, net_on=True):
+        """Что показывать: выбор VPN нужен режимам с VPN, ручной список — только режиму «свой порядок»."""
+        if net_on is None:
+            net_on = NET_MODES[self.dd_net.get_selected()] in ("log", "allowlist")
+        mode = EXIT_MODES[self.dd_exit.get_selected()]
+        self.dd_exit_vpn.set_visible(bool(net_on) and mode in self.VPN_EXIT_MODES)
+        show_all(self.chain_widgets, bool(net_on) and mode == "custom")
+        self.lbl_exit.set_text({
+            "proxy": "Один прокси, если он указан выше, иначе прямой выход с этого компьютера.",
+            "vpn_only": "Все соединения идут через выбранный VPN. Если он не запустится или оборвётся, соединения "
+                        "отклоняются: прямого выхода и прокси нет. Нужна программа клиента (см. вкладку «VPN»).",
+            "vpn_then_proxy": "Пока VPN работает, всё идёт через него; если он не отвечает, берётся ваш прокси "
+                              "(адрес выше), а когда VPN вернётся, снова через него.",
+            "proxy_then_vpn": "Пока прокси работает, всё идёт через него; если он не отвечает, берётся VPN, а когда "
+                              "прокси вернётся, снова через него.",
+            "custom": "Порядок каналов задаёте сами в списке ниже: proxy, vpn:имя, direct.",
+        }[mode])
 
     def on_chain_add(self, item):
         lines = get_lines(self.tv_chain)

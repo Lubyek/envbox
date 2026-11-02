@@ -45,6 +45,44 @@ def vpn_name_from_file(filename):
     return stem[:48] or "vpn"
 
 
+# Режимы выхода в интернет: каждый — готовый порядок каналов (Profile.upstream_chain)
+EXIT_MODES = ("proxy", "vpn_only", "vpn_then_proxy", "proxy_then_vpn", "custom")
+
+
+EXIT_LABELS = {
+    "proxy": "Напрямую или только через свой прокси (как раньше)",
+    "vpn_only": "Только через VPN (без прокси и без прямого выхода)",
+    "vpn_then_proxy": "Сначала VPN, запасной — свой прокси",
+    "proxy_then_vpn": "Сначала свой прокси, запасной — VPN",
+    "custom": "Свой порядок каналов (список ниже)",
+}
+
+
+def exit_chain(mode, vpn):
+    """Порядок каналов для режима выхода и выбранного VPN (режим custom список не меняет: возвращает None)."""
+    if mode == "proxy":
+        return []
+    if mode == "custom":
+        return None
+    v = f"vpn:{vpn}"
+    return {"vpn_only": [v], "vpn_then_proxy": [v, "proxy"], "proxy_then_vpn": ["proxy", v]}[mode]
+
+
+def exit_mode(chain):
+    """(режим, имя VPN) по порядку каналов; нестандартный порядок — режим custom."""
+    chain = list(chain or [])
+    if not chain:
+        return "proxy", ""
+    vpn = lambda c: c[4:] if c.startswith("vpn:") else ""    # noqa: E731
+    if len(chain) == 1 and vpn(chain[0]):
+        return "vpn_only", vpn(chain[0])
+    if chain[1:] == ["proxy"] and vpn(chain[0]):
+        return "vpn_then_proxy", vpn(chain[0])
+    if chain[:1] == ["proxy"] and len(chain) == 2 and vpn(chain[1]):
+        return "proxy_then_vpn", vpn(chain[1])
+    return "custom", ""
+
+
 SOURCE_RE = re.compile(r"^(https?://|vless://|vmess://|trojan://|ss://|\[interface\]|\{)", re.I)
 
 

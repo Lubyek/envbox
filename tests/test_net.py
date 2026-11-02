@@ -886,6 +886,40 @@ class ChainTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(opened.get("direct"))
         self.assertEqual(opened.get("chan"), "direct")
 
+    async def test_vpn_only_fails_closed_and_never_goes_direct(self):
+        # «только через VPN»: VPN не запустился/упал — отказ, а не тихий выход с настоящего адреса
+        from envbox.net.chain import Channel
+        hits = []
+
+        async def secret_service(r, w):
+            hits.append(1)
+            w.close()
+        echo = await asyncio.start_server(secret_service, "127.0.0.1", 0)
+        port = echo.sockets[0].getsockname()[1]
+
+        class Broken:
+            async def start(self):
+                raise OSError("не найдена программа wireproxy")
+
+            def stop(self):
+                pass
+        vpn = Channel("vpn:x", "vpn", client=Broken())
+        proxy, server, path = await self.start([vpn], allow_private=True)    # частные адреса разрешены: всё равно не напрямую
+        proxy.begin()
+        try:
+            data, _r, w = await ask(path, f"CONNECT 127.0.0.1:{port} HTTP/1.1\r\nHost: x\r\n\r\n".encode(), read=-1)
+            self.assertTrue(data.startswith(b"HTTP/1.1 502"), data)
+            w.close()
+        finally:
+            proxy.end()
+            server.close()
+            echo.close()
+        await asyncio.sleep(0.1)
+        self.assertEqual(hits, [])                                            # к цели никто не подключался
+        self.assertFalse([e for e in self.read_log() if e.get("event") == "open"])
+        reasons = [e["reason"] for e in self.read_log() if e.get("event") == "error"]
+        self.assertTrue(any("wireproxy" in r for r in reasons), reasons)      # причина названа в журнале
+
     async def test_every_channel_failed_gives_one_clear_502(self):
         from envbox.net.chain import Channel
         a = Channel("a", "proxy", Upstream(f"http://127.0.0.1:{self.dead_port()}"))
@@ -1371,6 +1405,39 @@ class VpnStore(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("wireproxy", msg)                                      # понятно, что установить
         self.assertFalse(test_vpn("нет-такого")[0])
+
+    def test_exit_modes_round_trip(self):
+        from envbox.core.vpn import EXIT_MODES, exit_chain, exit_mode
+        self.assertEqual(exit_chain("proxy", ""), [])
+        self.assertEqual(exit_chain("vpn_only", "wg0"), ["vpn:wg0"])
+        self.assertEqual(exit_chain("vpn_then_proxy", "wg0"), ["vpn:wg0", "proxy"])
+        self.assertEqual(exit_chain("proxy_then_vpn", "wg0"), ["proxy", "vpn:wg0"])
+        self.assertIsNone(exit_chain("custom", "wg0"))                      # свой список режим не переписывает
+        for mode in ("proxy", "vpn_only", "vpn_then_proxy", "proxy_then_vpn"):
+            self.assertEqual(exit_mode(exit_chain(mode, "wg0")), (mode, "wg0" if mode != "proxy" else ""))
+        for odd in (["direct"], ["vpn:a", "vpn:b"], ["vpn:a", "direct"], ["proxy"], ["vpn:a", "proxy", "direct"]):
+            self.assertEqual(exit_mode(odd)[0], "custom", odd)
+        self.assertEqual(set(EXIT_MODES), {"proxy", "vpn_only", "vpn_then_proxy", "proxy_then_vpn", "custom"})
+
+    def test_vpn_only_profile_needs_no_proxy_and_is_described_honestly(self):
+        from envbox.core.describe import describe
+        from envbox.core.profile import Profile
+        from envbox.core.vpn import import_vpn
+        import_vpn("wg0", self.WG)
+        p = Profile(name="c", net="allowlist", allow_domains=["example.com"], no_workdir=True,
+                    upstream_chain=["vpn:wg0"])
+        self.assertEqual(p.validate(), [])                                  # прокси не нужен
+        a = p.envbox_args()
+        self.assertNotIn("--upstream", a)
+        self.assertEqual([a[i + 1] for i, x in enumerate(a) if x == "--chain"][0].split(":")[:2], ["vpn", "wireguard"])
+        text = " ".join(t for _lvl, t in describe(p))
+        self.assertIn("только через VPN «wg0»", text)
+        self.assertIn("отклоняться", text)
+        self.assertNotIn("direct", text.replace("прямого", ""))
+        leak = Profile(name="c", net="log", upstream_chain=["vpn:wg0", "direct"], direct_domains=["a.example"])
+        warns = " ".join(t for lvl, t in describe(leak) if lvl == "warn")
+        self.assertIn("напрямую с вашего настоящего адреса", warns)         # утечка через direct названа
+        self.assertIn("a.example", warns)                                   # и сайты «напрямую» тоже
 
     def test_bad_input_is_rejected_with_a_reason(self):
         from envbox.core.vpn import import_vpn, list_vpns
