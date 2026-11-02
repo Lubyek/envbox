@@ -38,7 +38,7 @@ import time
 
 # ---- version.py: Версия envbox (строка читается регулярным выражением при установке — не менять формат).
 
-ENVBOX_VERSION = "2026.11.02.5"
+ENVBOX_VERSION = "2026.11.02.6"
 
 
 # ---- lazy.py: Ленивые модули стандартной библиотеки: настоящий import происходит при первом обращении к атрибуту.
@@ -1110,6 +1110,10 @@ WG_DROP_KEYS = ("preup", "postup", "predown", "postdown", "saveconfig", "table",
 WG_KEEP_SECTIONS = ("interface", "peer")
 
 
+# Ссылки на серверы, которые превращаются в конфигурацию Xray (клиент xray)
+LINK_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://")
+
+
 UUID_RE = r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
 
 
@@ -1118,7 +1122,7 @@ def detect_kind(text):
     t = (text or "").strip()
     if not t:
         raise ValueError("конфигурация пуста")
-    if t.lower().startswith("vless://"):
+    if t.lower().startswith(LINK_SCHEMES):
         return "xray"
     if t.startswith("{"):
         try:
@@ -1135,7 +1139,7 @@ def detect_kind(text):
     if re.search(r"^\s*\[interface\]", t, re.I | re.M) and re.search(r"^\s*\[peer\]", t, re.I | re.M):
         return "wireguard"
     raise ValueError("не удалось определить формат: ожидается WireGuard (.conf с [Interface] и [Peer]), ссылка "
-                     "vless://… или JSON Xray / sing-box")
+                     "vless://, vmess://, trojan:// или ss://, список таких ссылок (подписка) или JSON Xray / sing-box")
 
 
 def wg_sections(text):
@@ -1196,24 +1200,24 @@ def wg_runtime(text, port, user, password):
     return f"{body}\n\n[Socks5]\nBindAddress = 127.0.0.1:{port}\nUsername = {user}\nPassword = {password}\n"
 
 
-def parse_vless(url):
-    """Ссылка vless://uuid@хост:порт?параметры#имя -> исходящее подключение Xray."""
-    u = urllib_parse.urlsplit(url.strip())
-    if u.scheme.lower() != "vless":
-        raise ValueError("ожидается ссылка vless://")
-    uid, host = urllib_parse.unquote(u.username or ""), u.hostname
-    try:
-        port = u.port
-    except ValueError:
-        port = None
-    if not re.match(UUID_RE, uid):
-        raise ValueError("в ссылке vless:// неверный UUID")
-    if not host or not port or not 0 < port < 65536:
-        raise ValueError("в ссылке vless:// нет адреса сервера или порта")
-    q = {k: v for k, v in urllib_parse.parse_qsl(u.query)}
-    net = (q.get("type") or "tcp").lower()
-    sec = (q.get("security") or "none").lower()
-    stream = {"network": "xhttp" if net == "splithttp" else net, "security": sec}
+def share_scheme(text):
+    """Схема ссылки на сервер (vless, vmess, trojan, ss) или пустая строка."""
+    t = (text or "").strip().lower()
+    return next((x[:-3] for x in LINK_SCHEMES if t.startswith(x)), "")
+
+
+def b64decode(text):
+    """base64 в обычном и url-безопасном виде, с отсутствующими знаками «=». ValueError, если не base64."""
+    t = re.sub(r"\s+", "", text).replace("-", "+").replace("_", "/")
+    return base64.b64decode(t + "=" * (-len(t) % 4))
+
+
+def stream_settings(q, host, security="none"):
+    """Параметры транспорта Xray из параметров ссылки (type, security, sni, fp, path, host, serviceName, pbk, sid…)."""
+    net = (q.get("type") or q.get("net") or "tcp").lower()
+    sec = (q.get("security") or security or "none").lower()
+    net = {"splithttp": "xhttp", "h2": "http"}.get(net, net)
+    stream = {"network": net, "security": sec}
     if sec == "tls":
         tls = {"serverName": q.get("sni") or q.get("host") or host, "fingerprint": q.get("fp") or "chrome"}
         if q.get("alpn"):
@@ -1231,26 +1235,150 @@ def parse_vless(url):
         stream["wsSettings"] = {"path": path, "headers": {"Host": q.get("host") or q.get("sni") or host}}
     elif net == "grpc":
         stream["grpcSettings"] = {"serviceName": q.get("serviceName") or q.get("path") or ""}
-    elif net in ("xhttp", "splithttp"):
+    elif net == "xhttp":
         stream["xhttpSettings"] = {"path": path, "host": q.get("host") or "", "mode": q.get("mode") or "auto"}
     elif net == "httpupgrade":
         stream["httpupgradeSettings"] = {"path": path, "host": q.get("host") or ""}
-    elif net == "tcp":
-        pass
-    else:
+    elif net == "http":
+        stream["httpSettings"] = {"path": path, "host": [h for h in (q.get("host") or "").split(",") if h]}
+    elif net == "kcp":
+        stream["kcpSettings"] = {"header": {"type": q.get("headerType") or "none"}, "seed": q.get("seed", "")}
+    elif net != "tcp":
         raise ValueError(f"неподдерживаемый транспорт type={net}")
-    user = {"id": uid, "encryption": q.get("encryption") or "none"}
-    if q.get("flow"):
-        user["flow"] = q["flow"]
-    return {"protocol": "vless", "tag": "proxy", "streamSettings": stream,
-            "settings": {"vnext": [{"address": host, "port": port, "users": [user]}]}}
+    return stream
+
+
+def check_server(host, port):
+    if not host or not port or not 0 < port < 65536:
+        raise ValueError("в ссылке нет адреса сервера или порта")
+
+
+def parse_vmess_json(t):
+    """vmess://<base64 от JSON>: самый распространённый вид ссылки vmess."""
+    try:
+        d = json.loads(b64decode(t[len("vmess://"):].split("#", 1)[0]).decode("utf-8", "replace"))
+        host, port, uid = str(d.get("add") or ""), int(d.get("port") or 0), str(d.get("id") or "")
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError("в ссылке vmess:// повреждены данные") from None
+    check_server(host, port)
+    if not re.match(UUID_RE, uid):
+        raise ValueError("в ссылке vmess:// неверный UUID")
+    tls = str(d.get("tls") or "").lower()
+    q = {"type": d.get("net") or "tcp", "security": "tls" if tls == "tls" else "none", "sni": d.get("sni") or "",
+         "host": d.get("host") or "", "path": d.get("path") or "", "fp": d.get("fp") or "", "alpn": d.get("alpn") or "",
+         "serviceName": d.get("path") or "", "headerType": d.get("type") if d.get("type") != "none" else ""}
+    try:
+        alter = int(d.get("aid") or 0)
+    except ValueError:
+        alter = 0
+    user = {"id": uid, "alterId": alter, "security": d.get("scy") or "auto"}
+    out = {"protocol": "vmess", "tag": "proxy", "streamSettings": stream_settings(q, host, q["security"]),
+           "settings": {"vnext": [{"address": host, "port": port, "users": [user]}]}}
+    return out, str(d.get("ps") or "")
+
+
+def parse_shadowsocks(t):
+    """ss://: SIP002 (метод:пароль в base64 или открытым текстом @хост:порт) и старый вид «всё в base64»."""
+    body, _, frag = t[len("ss://"):].partition("#")
+    body, _, query = body.partition("?")
+    if "plugin=" in query:
+        raise ValueError("ss:// с плагином (obfs, v2ray-plugin) не поддерживается")
+    body = body.rstrip("/")
+    try:
+        if "@" in body:
+            userinfo, _, hostport = body.rpartition("@")
+            userinfo = urllib_parse.unquote(userinfo)
+            if ":" not in userinfo:
+                userinfo = b64decode(userinfo).decode("utf-8")
+        else:
+            userinfo, _, hostport = b64decode(urllib_parse.unquote(body)).decode("utf-8").rpartition("@")
+        method, _, password = userinfo.partition(":")
+        u = urllib_parse.urlsplit("//" + hostport)
+        host, port = u.hostname, u.port
+    except (ValueError, UnicodeDecodeError):
+        raise ValueError("в ссылке ss:// повреждены данные") from None
+    check_server(host, port)
+    if not method or not password:
+        raise ValueError("в ссылке ss:// нет метода шифрования или пароля")
+    out = {"protocol": "shadowsocks", "tag": "proxy",
+           "settings": {"servers": [{"address": host, "port": port, "method": method, "password": password}]}}
+    return out, urllib_parse.unquote(frag)
+
+
+def parse_share_link(url):
+    """Ссылка vless://, vmess://, trojan://, ss:// -> (исходящее подключение Xray, имя из ссылки)."""
+    t = url.strip()
+    scheme = share_scheme(t)
+    if not scheme:
+        raise ValueError("ожидается ссылка vless://, vmess://, trojan:// или ss://")
+    if scheme == "ss":
+        return parse_shadowsocks(t)
+    if scheme == "vmess" and "@" not in t.split("#", 1)[0]:
+        return parse_vmess_json(t)
+    u = urllib_parse.urlsplit(t)
+    host = u.hostname
+    try:
+        port = u.port
+    except ValueError:
+        port = None
+    check_server(host, port)
+    q = dict(urllib_parse.parse_qsl(u.query))
+    remark = urllib_parse.unquote(u.fragment)
+    cred = urllib_parse.unquote(u.netloc.rpartition("@")[0])
+    if scheme == "trojan":
+        if not cred:
+            raise ValueError("в ссылке trojan:// нет пароля")
+        out = {"protocol": "trojan", "tag": "proxy", "streamSettings": stream_settings(q, host, "tls"),
+               "settings": {"servers": [{"address": host, "port": port, "password": cred}]}}
+        return out, remark
+    if not re.match(UUID_RE, cred):
+        raise ValueError(f"в ссылке {scheme}:// неверный UUID")
+    if scheme == "vless":
+        user = {"id": cred, "encryption": q.get("encryption") or "none"}
+        if q.get("flow"):
+            user["flow"] = q["flow"]
+    else:   # vmess в виде vmess://uuid@хост:порт?параметры
+        user = {"id": cred, "alterId": 0, "security": q.get("encryption") or q.get("scy") or "auto"}
+    out = {"protocol": scheme, "tag": "proxy", "streamSettings": stream_settings(q, host),
+           "settings": {"vnext": [{"address": host, "port": port, "users": [user]}]}}
+    return out, remark
+
+
+def link_server(out):
+    """«хост:порт» исходящего подключения Xray."""
+    s = out["settings"]
+    node = (s.get("vnext") or s.get("servers"))[0]
+    return f"{node['address']}:{node['port']}"
+
+
+def split_links(text):
+    """Ссылки на серверы из текста подписки -> (поддерживаемые ссылки, схемы остальных ссылок).
+
+    Подписка — это список ссылок по одной в строке; провайдеры часто отдают его целиком в base64."""
+    def lines(t):
+        return [ln.strip() for ln in t.splitlines() if ln.strip()]
+    found = lines(text)
+    if not any(re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", ln) for ln in found):
+        try:
+            found = lines(b64decode(text).decode("utf-8", "replace"))
+        except ValueError:
+            found = []
+    ours, other = [], []
+    for ln in found:
+        if share_scheme(ln):
+            ours.append(ln)
+        else:
+            m = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*)://", ln)
+            if m:
+                other.append(m.group(1).lower())
+    return ours, other
 
 
 def xray_runtime(text, port, user, password):
     """Конфигурация Xray: исходные исходящие подключения + наш SOCKS5 на loopback вместо всех входящих."""
     t = text.strip()
-    if t.lower().startswith("vless://"):
-        cfg = {"outbounds": [parse_vless(t)]}
+    if share_scheme(t):
+        cfg = {"outbounds": [parse_share_link(t)[0]]}
     else:
         cfg = json.loads(t)
         for k in ("api", "stats", "metrics"):   # управляющие порты чужого конфига нам не нужны
@@ -1276,10 +1404,9 @@ def vpn_validate(kind, text):
     """Проверка конфигурации при импорте; возвращает короткое описание (сервер). ValueError с понятным текстом."""
     if kind == "wireguard":
         return wg_validate(text)
-    if kind == "xray" and text.strip().lower().startswith("vless://"):
-        out = parse_vless(text)
-        v = out["settings"]["vnext"][0]
-        return f"{v['address']}:{v['port']}"
+    if kind == "xray" and share_scheme(text):
+        out, remark = parse_share_link(text)
+        return f"{remark} ({link_server(out)})" if remark else link_server(out)
     try:
         cfg = json.loads(text)
     except ValueError:
@@ -5640,6 +5767,13 @@ VPN_EXT = {"wireguard": ".conf", "xray": ".xray", "singbox": ".singbox"}
 VPN_MAX_BYTES = 256 * 1024
 
 
+# Подписка: ответ сервера не больше этого размера, серверов берём не больше SUB_MAX_LINKS
+SUB_MAX_BYTES = 2 * 1024 * 1024
+
+
+SUB_MAX_LINKS = 40
+
+
 def vpn_dir():
     return os.path.join(envbox_root(), VPN_DIR)
 
@@ -5761,6 +5895,72 @@ def test_vpn(name, target=("example.com", 443)):
             client.stop()
 
     return asyncio.run(run())
+
+
+def base_name_from_url(url):
+    """Имя VPN из адреса подписки: https://www.example.com/x -> example-com."""
+    import urllib.parse
+    host = (urllib.parse.urlsplit(url).hostname or "vpn").lower()
+    host = host[4:] if host.startswith("www.") else host
+    return "".join(c if c.isalnum() and c.isascii() else "-" for c in host).strip("-")[:40] or "vpn"
+
+
+def fetch_subscription(url, timeout=20):
+    """Скачать подписку по ссылке (с вашего компьютера напрямую: сервер подписки увидит ваш настоящий адрес).
+
+    Многие панели отдают разные форматы разным программам, поэтому представляемся клиентом v2rayN: он получает
+    список ссылок. ValueError с понятным текстом при любой неудаче."""
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    url = (url or "").strip()
+    if urllib.parse.urlsplit(url).scheme not in ("http", "https") or any(c.isspace() for c in url):
+        raise ValueError("нужна ссылка http:// или https:// без пробелов")
+    req = urllib.request.Request(url, headers={"User-Agent": "v2rayN/6.42", "Accept": "*/*"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = r.read(SUB_MAX_BYTES + 1)
+    except urllib.error.HTTPError as e:
+        raise ValueError(f"сервер подписки ответил: HTTP {e.code}") from None
+    except (urllib.error.URLError, OSError) as e:
+        raise ValueError(f"не удалось скачать подписку: {getattr(e, 'reason', e)}") from None
+    if len(data) > SUB_MAX_BYTES:
+        raise ValueError("ответ сервера слишком большой (больше 2 МБ): это не подписка")
+    return data.decode("utf-8", "replace")
+
+
+def import_many(base, text, replace=False):
+    """Добавить VPN из текста: одна конфигурация, ссылка или подписка (список ссылок, в том числе в base64).
+
+    Возвращает ([(имя, вид, описание)], [причины пропуска]). Из подписки каждый сервер сохраняется отдельным VPN
+    с именем <основа>-1, <основа>-2…; повторный импорт заменяет одноимённые. Ссылки других видов
+    (hysteria2, tuic…) пропускаются с пояснением."""
+    links, other = split_links(text)
+    if not links:
+        if other:
+            raise ValueError("в подписке только неподдерживаемые ссылки: " + ", ".join(sorted(set(other)))
+                             + ". Поддерживаются vless, vmess, trojan, ss, WireGuard и JSON Xray / sing-box")
+        return [import_vpn(base, text, replace=replace)], []
+    done, skipped = [], []
+    base = base[:40]
+    for i, link in enumerate(links[:SUB_MAX_LINKS], 1):
+        name = base if len(links) == 1 else f"{base}-{i}"
+        try:
+            done.append(import_vpn(name, link, replace=replace or len(links) > 1))
+        except ValueError as e:
+            skipped.append(f"сервер {i}: {e}")
+    if len(links) > SUB_MAX_LINKS:
+        skipped.append(f"взяты первые {SUB_MAX_LINKS} серверов из {len(links)}")
+    if other:
+        skipped.append("неподдерживаемые ссылки пропущены: " + ", ".join(sorted(set(other))))
+    if not done:
+        raise ValueError("ни один сервер не удалось добавить: " + "; ".join(skipped[:3]))
+    return done, skipped
+
+
+def import_subscription(base, url):
+    """Скачать подписку и добавить серверы из неё (см. import_many)."""
+    return import_many(base or base_name_from_url(url), fetch_subscription(url), replace=True)
 
 
 # ---- core/profile.py: Профиль среды (dataclass Profile) и его проверка.
@@ -11562,7 +11762,9 @@ def _build_gui():
             title = Gtk.Label(label="VPN", xalign=0)
             title.add_css_class("eb-h2")
             box.append(title)
-            box.append(hint("Загрузите конфигурацию WireGuard (.conf), ссылку vless://… или JSON для Xray / sing-box. "
+            box.append(hint("Загрузите конфигурацию WireGuard (.conf), ссылку на сервер (vless://, vmess://, trojan://, ss://), "
+                            "ссылку-подписку от провайдера (https://…: из неё добавятся все серверы) или JSON для Xray / "
+                            "sing-box. "
                             "envbox сам запускает VPN-клиент вместе со средой и останавливает его вместе с ней, без root: "
                             "клиент слушает только 127.0.0.1 с одноразовым паролем, а среда по-прежнему выходит только "
                             "через прокси envbox. Нужна программа клиента: wireproxy для WireGuard, xray или sing-box "
@@ -11644,9 +11846,12 @@ def _build_gui():
             win = Gtk.Window(title="Добавить VPN", transient_for=self, modal=True)
             win.set_default_size(640, -1)
             box = margins(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10), 16)
-            box.append(hint("Вставьте ссылку vless://…, конфигурацию WireGuard или JSON Xray / sing-box. Вид "
-                            "определяется сам."))
-            name = Gtk.Entry(hexpand=True, placeholder_text="имя, например vpn1")
+            box.append(hint("Вставьте ссылку на сервер (vless://, vmess://, trojan://, ss://), список таких ссылок, "
+                            "конфигурацию WireGuard, JSON Xray / sing-box или ссылку-подписку https://… Вид определяется "
+                            "сам. Подписка скачивается с вашего компьютера напрямую: её сервер увидит ваш настоящий "
+                            "адрес. Каждый сервер подписки сохраняется отдельным VPN (имя-1, имя-2…); Clash-подписки "
+                            "в формате YAML не поддерживаются."))
+            name = Gtk.Entry(hexpand=True, placeholder_text="имя, например vpn1 (для подписки можно не указывать)")
             box.append(name)
             view, sw = text_area(height=160)
             box.append(sw)
@@ -11670,8 +11875,12 @@ def _build_gui():
             name.grab_focus()
 
         def add_vpn(self, name, text, replace=False):
+            text = (text or "").strip()
+            if re.match(r"^https?://\S+$", text):   # ссылка-подписка: серверы скачиваются, а не вставлены
+                self.add_subscription((name or "").strip(), text)
+                return
             try:
-                name, kind, server = import_vpn(name, text, replace=replace)
+                imported, skipped = import_many(name, text, replace=replace)
             except ValueError as e:
                 if "уже есть" in str(e) and not replace:
                     choose(self, f"VPN «{name}» уже есть", "Заменить его новой конфигурацией?", ["Отмена", "Заменить"],
@@ -11679,8 +11888,25 @@ def _build_gui():
                     return
                 alert(self, "Не удалось добавить VPN", str(e))
                 return
+            self.vpn_imported(imported, skipped)
+
+        def add_subscription(self, name, url):
+            self.status("Скачиваю подписку…")
+
+            def done(res):
+                if isinstance(res, Exception):
+                    alert(self, "Не удалось загрузить подписку", str(res))
+                    return
+                self.vpn_imported(*res)
+
+            self.run_async(lambda: import_subscription(name, url), done)
+
+        def vpn_imported(self, imported, skipped):
             self.refresh_vpn_list()
-            self.status(f"VPN «{name}» добавлен ({server}). Добавьте его в «Порядок выхода» в настройках среды")
+            names = ", ".join(n for n, _k, _s in imported[:6]) + (" …" if len(imported) > 6 else "")
+            self.status(f"Добавлено VPN: {len(imported)} ({names}). Добавьте нужный в «Порядок выхода» в настройках среды")
+            if skipped:
+                alert(self, "Часть серверов пропущена", "\n".join(skipped[:10]))
 
         # ---- проверка и удаление
 

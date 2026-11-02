@@ -1,9 +1,12 @@
 """Вкладка «VPN»: загрузка конфигураций (WireGuard, VLESS/Xray, sing-box), проверка и удаление."""
 
+import re
+
 from ...core.vpn import (
     VPN_MAX_BYTES,
     delete_vpn,
-    import_vpn,
+    import_many,
+    import_subscription,
     list_vpns,
     test_vpn,
     vpn_binary_problem,
@@ -21,7 +24,9 @@ class VpnPageMixin:
         title = Gtk.Label(label="VPN", xalign=0)
         title.add_css_class("eb-h2")
         box.append(title)
-        box.append(hint("Загрузите конфигурацию WireGuard (.conf), ссылку vless://… или JSON для Xray / sing-box. "
+        box.append(hint("Загрузите конфигурацию WireGuard (.conf), ссылку на сервер (vless://, vmess://, trojan://, ss://), "
+                        "ссылку-подписку от провайдера (https://…: из неё добавятся все серверы) или JSON для Xray / "
+                        "sing-box. "
                         "envbox сам запускает VPN-клиент вместе со средой и останавливает его вместе с ней, без root: "
                         "клиент слушает только 127.0.0.1 с одноразовым паролем, а среда по-прежнему выходит только "
                         "через прокси envbox. Нужна программа клиента: wireproxy для WireGuard, xray или sing-box "
@@ -103,9 +108,12 @@ class VpnPageMixin:
         win = Gtk.Window(title="Добавить VPN", transient_for=self, modal=True)
         win.set_default_size(640, -1)
         box = margins(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10), 16)
-        box.append(hint("Вставьте ссылку vless://…, конфигурацию WireGuard или JSON Xray / sing-box. Вид "
-                        "определяется сам."))
-        name = Gtk.Entry(hexpand=True, placeholder_text="имя, например vpn1")
+        box.append(hint("Вставьте ссылку на сервер (vless://, vmess://, trojan://, ss://), список таких ссылок, "
+                        "конфигурацию WireGuard, JSON Xray / sing-box или ссылку-подписку https://… Вид определяется "
+                        "сам. Подписка скачивается с вашего компьютера напрямую: её сервер увидит ваш настоящий "
+                        "адрес. Каждый сервер подписки сохраняется отдельным VPN (имя-1, имя-2…); Clash-подписки "
+                        "в формате YAML не поддерживаются."))
+        name = Gtk.Entry(hexpand=True, placeholder_text="имя, например vpn1 (для подписки можно не указывать)")
         box.append(name)
         view, sw = text_area(height=160)
         box.append(sw)
@@ -129,8 +137,12 @@ class VpnPageMixin:
         name.grab_focus()
 
     def add_vpn(self, name, text, replace=False):
+        text = (text or "").strip()
+        if re.match(r"^https?://\S+$", text):   # ссылка-подписка: серверы скачиваются, а не вставлены
+            self.add_subscription((name or "").strip(), text)
+            return
         try:
-            name, kind, server = import_vpn(name, text, replace=replace)
+            imported, skipped = import_many(name, text, replace=replace)
         except ValueError as e:
             if "уже есть" in str(e) and not replace:
                 choose(self, f"VPN «{name}» уже есть", "Заменить его новой конфигурацией?", ["Отмена", "Заменить"],
@@ -138,8 +150,25 @@ class VpnPageMixin:
                 return
             alert(self, "Не удалось добавить VPN", str(e))
             return
+        self.vpn_imported(imported, skipped)
+
+    def add_subscription(self, name, url):
+        self.status("Скачиваю подписку…")
+
+        def done(res):
+            if isinstance(res, Exception):
+                alert(self, "Не удалось загрузить подписку", str(res))
+                return
+            self.vpn_imported(*res)
+
+        self.run_async(lambda: import_subscription(name, url), done)
+
+    def vpn_imported(self, imported, skipped):
         self.refresh_vpn_list()
-        self.status(f"VPN «{name}» добавлен ({server}). Добавьте его в «Порядок выхода» в настройках среды")
+        names = ", ".join(n for n, _k, _s in imported[:6]) + (" …" if len(imported) > 6 else "")
+        self.status(f"Добавлено VPN: {len(imported)} ({names}). Добавьте нужный в «Порядок выхода» в настройках среды")
+        if skipped:
+            alert(self, "Часть серверов пропущена", "\n".join(skipped[:10]))
 
     # ---- проверка и удаление
 

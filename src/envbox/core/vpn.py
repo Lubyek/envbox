@@ -7,7 +7,7 @@
 import os
 
 from ..net.vpn import (VPN_BINARIES, VPN_HINTS, VPN_KINDS, VPN_LABELS, VpnClient, detect_kind, find_binary,
-                       vpn_validate)
+                       split_links, vpn_validate)
 from .consts import NAME_RE
 from .root import envbox_root
 
@@ -19,6 +19,13 @@ VPN_EXT = {"wireguard": ".conf", "xray": ".xray", "singbox": ".singbox"}
 
 
 VPN_MAX_BYTES = 256 * 1024
+
+
+# Подписка: ответ сервера не больше этого размера, серверов берём не больше SUB_MAX_LINKS
+SUB_MAX_BYTES = 2 * 1024 * 1024
+
+
+SUB_MAX_LINKS = 40
 
 
 def vpn_dir():
@@ -142,3 +149,69 @@ def test_vpn(name, target=("example.com", 443)):
             client.stop()
 
     return asyncio.run(run())
+
+
+def base_name_from_url(url):
+    """Имя VPN из адреса подписки: https://www.example.com/x -> example-com."""
+    import urllib.parse
+    host = (urllib.parse.urlsplit(url).hostname or "vpn").lower()
+    host = host[4:] if host.startswith("www.") else host
+    return "".join(c if c.isalnum() and c.isascii() else "-" for c in host).strip("-")[:40] or "vpn"
+
+
+def fetch_subscription(url, timeout=20):
+    """Скачать подписку по ссылке (с вашего компьютера напрямую: сервер подписки увидит ваш настоящий адрес).
+
+    Многие панели отдают разные форматы разным программам, поэтому представляемся клиентом v2rayN: он получает
+    список ссылок. ValueError с понятным текстом при любой неудаче."""
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    url = (url or "").strip()
+    if urllib.parse.urlsplit(url).scheme not in ("http", "https") or any(c.isspace() for c in url):
+        raise ValueError("нужна ссылка http:// или https:// без пробелов")
+    req = urllib.request.Request(url, headers={"User-Agent": "v2rayN/6.42", "Accept": "*/*"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = r.read(SUB_MAX_BYTES + 1)
+    except urllib.error.HTTPError as e:
+        raise ValueError(f"сервер подписки ответил: HTTP {e.code}") from None
+    except (urllib.error.URLError, OSError) as e:
+        raise ValueError(f"не удалось скачать подписку: {getattr(e, 'reason', e)}") from None
+    if len(data) > SUB_MAX_BYTES:
+        raise ValueError("ответ сервера слишком большой (больше 2 МБ): это не подписка")
+    return data.decode("utf-8", "replace")
+
+
+def import_many(base, text, replace=False):
+    """Добавить VPN из текста: одна конфигурация, ссылка или подписка (список ссылок, в том числе в base64).
+
+    Возвращает ([(имя, вид, описание)], [причины пропуска]). Из подписки каждый сервер сохраняется отдельным VPN
+    с именем <основа>-1, <основа>-2…; повторный импорт заменяет одноимённые. Ссылки других видов
+    (hysteria2, tuic…) пропускаются с пояснением."""
+    links, other = split_links(text)
+    if not links:
+        if other:
+            raise ValueError("в подписке только неподдерживаемые ссылки: " + ", ".join(sorted(set(other)))
+                             + ". Поддерживаются vless, vmess, trojan, ss, WireGuard и JSON Xray / sing-box")
+        return [import_vpn(base, text, replace=replace)], []
+    done, skipped = [], []
+    base = base[:40]
+    for i, link in enumerate(links[:SUB_MAX_LINKS], 1):
+        name = base if len(links) == 1 else f"{base}-{i}"
+        try:
+            done.append(import_vpn(name, link, replace=replace or len(links) > 1))
+        except ValueError as e:
+            skipped.append(f"сервер {i}: {e}")
+    if len(links) > SUB_MAX_LINKS:
+        skipped.append(f"взяты первые {SUB_MAX_LINKS} серверов из {len(links)}")
+    if other:
+        skipped.append("неподдерживаемые ссылки пропущены: " + ", ".join(sorted(set(other))))
+    if not done:
+        raise ValueError("ни один сервер не удалось добавить: " + "; ".join(skipped[:3]))
+    return done, skipped
+
+
+def import_subscription(base, url):
+    """Скачать подписку и добавить серверы из неё (см. import_many)."""
+    return import_many(base or base_name_from_url(url), fetch_subscription(url), replace=True)

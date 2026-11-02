@@ -53,8 +53,8 @@
   detect_terminal(), terminal_argv(), dry_run(), launch_background(), read_tail()
 - `src/envbox/core/upstream.py` (70 стр.) — Вышестоящий прокси профиля: разбор URL, чтение из файла, проверка.
   split_proxy_url(), read_proxy_file(), probe_upstream()
-- `src/envbox/core/vpn.py` (144 стр.) — Хранилище VPN-конфигураций: импорт, список, удаление и проверка наличия клиента.
-  vpn_dir(), vpn_path(), vpn_name_from_file(), list_vpns(), vpn_source(), import_vpn(), delete_vpn(), vpn_binary_problem(), test_vpn()
+- `src/envbox/core/vpn.py` (217 стр.) — Хранилище VPN-конфигураций: импорт, список, удаление и проверка наличия клиента.
+  vpn_dir(), vpn_path(), vpn_name_from_file(), list_vpns(), vpn_source(), import_vpn(), delete_vpn(), vpn_binary_problem(), test_vpn(), base_name_from_url(), fetch_subscription(), import_many(), import_subscription()
 - `src/envbox/gui/app.py` (24 стр.) — Приложение GTK и точка входа gui_main.
   App (2 методов), gui_main()
 - `src/envbox/gui/browser/page.py` (412 стр.) — Страница встроенного браузера: подключение, отключение, запуск.
@@ -85,8 +85,8 @@
   SidebarMixin (6 методов)
 - `src/envbox/gui/pages/terminal.py` (276 стр.) — Встроенный терминал (VTE).
   TerminalMixin (9 методов)
-- `src/envbox/gui/pages/vpn.py` (166 стр.) — Вкладка «VPN»: загрузка конфигураций (WireGuard, VLESS/Xray, sing-box), проверка и удаление.
-  VpnPageMixin (7 методов)
+- `src/envbox/gui/pages/vpn.py` (195 стр.) — Вкладка «VPN»: загрузка конфигураций (WireGuard, VLESS/Xray, sing-box), проверка и удаление.
+  VpnPageMixin (9 методов)
 - `src/envbox/gui/tables.py` (62 стр.) — Таблицы и строки списков GUI.
   Row (1 методов), Table (5 методов)
 - `src/envbox/gui/widgets.py` (222 стр.) — Мелкие виджеты и диалоги GTK: кнопки, карточки, переключатели, alert/choose/prompt.
@@ -119,8 +119,8 @@
   seccomp_program_x86_64(), cmd_seccomp()
 - `src/envbox/net/upstream.py` (121 стр.) — Сетевой шлюз: вышестоящий прокси (http / socks5 / socks5h).
   UpstreamError (0 методов), Upstream (2 методов)
-- `src/envbox/net/vpn.py` (330 стр.) — Сетевой шлюз: VPN-клиенты как локальные SOCKS-прокси.
-  detect_kind(), wg_sections(), wg_validate(), wg_runtime(), parse_vless(), xray_runtime(), singbox_runtime(), vpn_validate(), build_runtime(), find_binary(), die_with_parent(), free_port(), VpnClient (2 методов)
+- `src/envbox/net/vpn.py` (457 стр.) — Сетевой шлюз: VPN-клиенты как локальные SOCKS-прокси.
+  detect_kind(), wg_sections(), wg_validate(), wg_runtime(), share_scheme(), b64decode(), stream_settings(), check_server(), parse_vmess_json(), parse_shadowsocks(), parse_share_link(), link_server(), split_links(), xray_runtime() …
 - `src/envbox/resources.py` (9 стр.) — Встроенные ресурсы (envbox.sh, значки, CSS…): файлы из resources/; в собранном envbox.py они вшиты строками.
   resource_text()
 - `src/envbox/selfpath.py` (21 стр.) — Пути к самому envbox: точка запуска (SELF) и единый файл для установки (bundle_path).

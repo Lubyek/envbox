@@ -138,7 +138,11 @@ unix-сокет run/proxy.sock → net/proxy.py Proxy.handle (на хосте) �
 (иначе первое же соединение платило бы тайм-аут подключения). Уже открытые потоки на другой канал не переносятся.
 Политику (allowlist, частные адреса) канал не меняет: `PrivateAddress` — это 403, а не сбой канала.
 
-VPN-клиенты (`net/vpn.py`): WireGuard через `wireproxy`, VLESS и JSON через `xray`, JSON sing-box через `sing-box`; без root.
+VPN-клиенты (`net/vpn.py`): WireGuard через `wireproxy`, ссылки `vless://`, `vmess://` (base64-JSON и вид `uuid@хост`),
+`trojan://`, `ss://` (SIP002 и старый вид; плагины нет) и JSON Xray — через `xray`, JSON sing-box — через `sing-box`; без root.
+Подписка (`https://…` от провайдера, `core/vpn.py fetch_subscription`: скачивается с хоста напрямую, User-Agent `v2rayN`) —
+список ссылок, часто в base64 (`split_links`); каждый сервер сохраняется отдельным VPN `<имя>-N` (`import_many`, до 40).
+Не поддержаны: hysteria2, tuic, Clash YAML (нет YAML в стандартной библиотеке) — пропускаются с пояснением.
 Шлюз генерирует временную конфигурацию (каталог 0700, стирается при остановке) со SOCKS5 на `127.0.0.1:<свободный порт>` с
 одноразовым логином и паролем и подключается к нему как к `socks5://` вышестоящему прокси; имена разрешает VPN. Из
 чужих конфигураций вырезаются сценарии wg-quick (`PostUp` и др.), лишние туннели wireproxy, `api`/`experimental`.

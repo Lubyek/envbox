@@ -1004,7 +1004,7 @@ class VpnConfigs(unittest.TestCase):
         from envbox.net.vpn import vpn_validate, xray_runtime
         link = (f"vless://{self.UUID}@h.example:443?type=ws&security=tls&sni=s.example&path=%2Fw&fp=firefox"
                 "&flow=xtls-rprx-vision#name")
-        self.assertEqual(vpn_validate("xray", link), "h.example:443")
+        self.assertEqual(vpn_validate("xray", link), "name (h.example:443)")   # имя из #name показывается
         cfg = _json.loads(xray_runtime(link, 1080, "u", "p"))
         inbound = cfg["inbounds"][0]
         self.assertEqual((inbound["listen"], inbound["port"], inbound["settings"]["auth"]), ("127.0.0.1", 1080, "password"))
@@ -1037,6 +1037,150 @@ class VpnConfigs(unittest.TestCase):
         for bad in ("vpn", "vpn:foo:/x", "vpn:xray:rel/path", "socks5://x", ""):
             with self.assertRaises(ValueError):
                 parse_chain_spec(bad)
+
+
+class ShareLinks(unittest.TestCase):
+    UUID = VpnConfigs.UUID
+
+    @staticmethod
+    def b64(text, url=False, pad=True):
+        import base64 as _b
+        raw = (_b.urlsafe_b64encode if url else _b.b64encode)(text.encode())
+        return (raw if pad else raw.rstrip(b"=")).decode()
+
+    def test_vmess_base64_json_link(self):
+        import json as _json
+        from envbox.net.vpn import detect_kind, parse_share_link, vpn_validate
+        d = {"v": "2", "ps": "Берлин", "add": "v.example", "port": "443", "id": self.UUID, "aid": "0", "scy": "auto",
+             "net": "ws", "type": "none", "host": "cdn.example", "path": "/ws", "tls": "tls", "sni": "s.example"}
+        link = "vmess://" + self.b64(_json.dumps(d, ensure_ascii=False))
+        self.assertEqual(detect_kind(link), "xray")
+        out, remark = parse_share_link(link)
+        self.assertEqual((out["protocol"], remark), ("vmess", "Берлин"))
+        self.assertEqual(out["settings"]["vnext"][0]["users"][0]["id"], self.UUID)
+        st = out["streamSettings"]
+        self.assertEqual((st["network"], st["security"], st["tlsSettings"]["serverName"]), ("ws", "tls", "s.example"))
+        self.assertEqual(st["wsSettings"], {"path": "/ws", "headers": {"Host": "cdn.example"}})
+        self.assertEqual(vpn_validate("xray", link), "Берлин (v.example:443)")
+        for bad in ("vmess://!!!!", "vmess://" + self.b64("{}"), "vmess://" + self.b64(_json.dumps({**d, "id": "x"}))):
+            with self.assertRaises(ValueError):
+                parse_share_link(bad)
+
+    def test_vmess_url_trojan_and_vless_links(self):
+        from envbox.net.vpn import parse_share_link
+        out, _ = parse_share_link(f"vmess://{self.UUID}@h.example:8443?type=grpc&serviceName=g&security=tls&sni=s#r")
+        self.assertEqual((out["protocol"], out["streamSettings"]["grpcSettings"]), ("vmess", {"serviceName": "g"}))
+        out, remark = parse_share_link("trojan://p%40ss:w%3Ard@t.example:443?sni=t.example&type=ws&path=%2Ft#%D0%A2")
+        node = out["settings"]["servers"][0]
+        self.assertEqual((node["password"], node["port"], remark), ("p@ss:w:rd", 443, "Т"))
+        self.assertEqual(out["streamSettings"]["security"], "tls")                    # у trojan защита по умолчанию
+        with self.assertRaises(ValueError):
+            parse_share_link("trojan://t.example:443")                                  # нет пароля
+        out, _ = parse_share_link(f"vless://{self.UUID}@h.example:443?type=h2&security=tls&host=a.example,b.example")
+        self.assertEqual(out["streamSettings"]["network"], "http")
+        self.assertEqual(out["streamSettings"]["httpSettings"]["host"], ["a.example", "b.example"])
+        with self.assertRaises(ValueError):
+            parse_share_link(f"vless://{self.UUID}@h.example:443?type=quic")           # незнакомый транспорт
+
+    def test_shadowsocks_links(self):
+        from envbox.net.vpn import parse_share_link
+        # SIP002: метод:пароль в base64url
+        out, remark = parse_share_link("ss://" + self.b64("aes-256-gcm:pa55", url=True, pad=False) + "@s.example:8388#S1")
+        node = out["settings"]["servers"][0]
+        self.assertEqual((node["method"], node["password"], node["address"], node["port"], remark),
+                         ("aes-256-gcm", "pa55", "s.example", 8388, "S1"))
+        # открытым текстом (новый вид) и старый «всё в base64»
+        out, _ = parse_share_link("ss://chacha20-ietf-poly1305:pw@s.example:1")
+        self.assertEqual(out["settings"]["servers"][0]["method"], "chacha20-ietf-poly1305")
+        out, _ = parse_share_link("ss://" + self.b64("aes-128-gcm:pw@old.example:2000"))
+        self.assertEqual(out["settings"]["servers"][0]["address"], "old.example")
+        with self.assertRaises(ValueError):
+            parse_share_link("ss://" + self.b64("aes-128-gcm:pw", url=True) + "@s.example:1/?plugin=obfs-local")
+        with self.assertRaises(ValueError):
+            parse_share_link("ss://@@@")
+
+    def test_subscription_text_plain_and_base64(self):
+        from envbox.net.vpn import split_links
+        v = f"vless://{self.UUID}@a.example:443?security=tls"
+        t = "trojan://pw@b.example:443"
+        h = "hysteria2://pw@c.example:443"
+        for text in (f"{v}\n{t}\n{h}\n", self.b64(f"{v}\n{t}\n{h}"), self.b64(f"{v}\r\n{t}\r\n{h}", url=True, pad=False),
+                     "\n".join([self.b64(f"{v}\n{t}\n{h}")[:40], self.b64(f"{v}\n{t}\n{h}")[40:]])):    # переносы внутри base64
+            links, other = split_links(text)
+            self.assertEqual(links, [v, t], text[:30])
+            self.assertEqual(other, ["hysteria2"])
+        self.assertEqual(split_links("<html><body>Please open in app</body></html>"), ([], []))
+
+
+class VpnSubscriptions(unittest.TestCase):
+    UUID = VpnConfigs.UUID
+
+    def setUp(self):
+        import http.server
+        import threading
+        self.root = tempfile.mkdtemp(prefix="eb")
+        self.addCleanup(shutil.rmtree, self.root, True)
+        patcher = mock.patch("envbox.core.vpn.envbox_root", return_value=self.root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.agents = []
+        body = ShareLinks.b64(f"vless://{self.UUID}@a.example:443?security=tls#A\nhysteria2://x@h.example:1\n"
+                              "trojan://pw@b.example:443#B\nss://bad\n")
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                outer.agents.append(self.headers.get("User-Agent"))
+                if self.path == "/missing":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                data = b"x" * (3 * 1024 * 1024) if self.path == "/huge" else body.encode()
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *a):
+                pass
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.addCleanup(self.srv.shutdown)
+        self.url = f"http://127.0.0.1:{self.srv.server_address[1]}"
+
+    def test_import_subscription_creates_one_vpn_per_server(self):
+        from envbox.core.vpn import import_subscription, list_vpns
+        done, skipped = import_subscription("prov", self.url + "/token")
+        self.assertEqual([n for n, _k, _s in done], ["prov-1", "prov-2"])
+        self.assertEqual([s for _n, _k, s in done], ["A (a.example:443)", "B (b.example:443)"])
+        self.assertTrue(any("hysteria2" in x for x in skipped))                 # неподдерживаемое названо, а не молчком
+        self.assertTrue(any("сервер 3" in x for x in skipped))                  # битая ссылка объяснена
+        self.assertEqual(self.agents, ["v2rayN/6.42"])                          # так панели отдают список ссылок
+        import_subscription("prov", self.url + "/token")                        # повторно: обновляет, а не падает
+        self.assertEqual([v["name"] for v in list_vpns()], ["prov-1", "prov-2"])
+        # имя можно не указывать: берётся из адреса
+        from envbox.core.vpn import base_name_from_url
+        self.assertEqual(base_name_from_url("https://www.toriispirits.com/tok"), "toriispirits-com")
+
+    def test_download_errors_are_explained(self):
+        from envbox.core.vpn import fetch_subscription
+        for url, part in ((self.url + "/missing", "HTTP 404"), (self.url + "/huge", "слишком большой"),
+                          ("ftp://x/y", "http://"), ("http://127.0.0.1:1/", "не удалось скачать"), ("https://a b", "пробелов")):
+            with self.assertRaises(ValueError) as cm:
+                fetch_subscription(url, timeout=3)
+            self.assertIn(part, str(cm.exception))
+
+    def test_single_link_and_pasted_list(self):
+        from envbox.core.vpn import import_many, list_vpns
+        done, _ = import_many("one", f"vless://{self.UUID}@a.example:443")
+        self.assertEqual([n for n, _k, _s in done], ["one"])                    # одна ссылка: имя как задано
+        done, _ = import_many("many", f"trojan://a@x.example:1\ntrojan://b@y.example:2")
+        self.assertEqual([n for n, _k, _s in done], ["many-1", "many-2"])
+        self.assertEqual(len(list_vpns()), 3)
+        with self.assertRaises(ValueError) as cm:
+            import_many("only", "hysteria2://x@h.example:1\ntuic://y@t.example:2")
+        self.assertIn("hysteria2", str(cm.exception))
+        with self.assertRaises(ValueError):
+            import_many("html", "<html>login</html>")
 
 
 class VpnStore(unittest.TestCase):
