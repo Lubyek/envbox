@@ -153,6 +153,11 @@ VPN-клиенты (`net/vpn.py`): WireGuard через `wireproxy`, ссылк�
 заголовки устройства (`device_headers`: случайный `x-hwid` в `_vpn/.hwid`, один на установку). Папка (сервис) — это
 `profile-title` подписки или имя сайта; метаданные (`_vpn/meta.json`, 0600, там адрес с токеном): `list_folders`,
 `set_folder`, `refresh_folder` (убирает пропавшие серверы), `delete_folder`; трафик и срок — `folder_summary`.
+Подписка бывает и массивом готовых конфигураций Xray (`[{"remarks":…, "outbounds":…}, …]`, `split_json_configs`):
+каждый элемент — отдельный VPN, название из `remarks`; весь ответ может быть больше `VPN_MAX_BYTES` (лимит на одну
+конфигурацию). Чужая маршрутизация («эти сайты напрямую») вырезается (`xray_runtime`, `singbox_runtime`): весь трафик идёт через
+первый прокси-выход, иначе «только через VPN» протекал бы настоящим адресом. Непонятный ответ описывается
+(`describe_response`: HTML, Clash YAML, JSON без outbounds), без самих данных.
 Поиск `search_vpns`, пинг `ping_vpns` (TCP-подключение с хоста; WireGuard — UDP, не измеряется).
 Не поддержаны: hysteria2, tuic, Clash YAML (нет YAML в стандартной библиотеке) — пропускаются с пояснением.
 Шлюз генерирует временную конфигурацию (каталог 0700, стирается при остановке) со SOCKS5 на `127.0.0.1:<свободный порт>` с
@@ -722,6 +727,7 @@ python3 -I dist/envbox.py wrap --map 3999:/tmp/ebp/p.sock -- curl --noproxy '' -
 | Канал «мигает» (`down`/`up` по кругу) | проба `example.com:443` проходит, а рабочие соединения нет (или наоборот) | `PROBE_TARGET`, `PROBE_EVERY` в `net/chain.py`; события `channel` с `reason` |
 | Вкладка «VPN», подписка: «[Errno -3] Temporary failure in name resolution» | DNS компьютера не находит сайт подписки (блокировка, нет сети у процесса) | в окне «Вставить…» выбрать «Скачать подписку через прокси среды…»: `fetch_subscription(..., proxy=…)` |
 | Подписка импортировалась «серверами» «Приложение не поддерживается» / «Используйте Happ» (адрес 0.0.0.0:1) | провайдер узнаёт приложение по User-Agent/HWID и другим отдаёт заглушки | `import_subscription` перебирает приложения и пропускает заглушки; если настоящих нет — ошибка с текстом заглушек |
+| Подписка: «конфигурация слишком большая (больше 256 КБ)» | ответ — массив конфигураций Xray (Happ JSON), а не список ссылок; лимит 256 КБ относился ко всему ответу | `parse_subscription` / `split_json_configs` в `core/vpn.py`: каждая конфигурация отдельным VPN |
 | 403 «Private address forbidden» на обычных сайтах | локальный DNS отдаёт частные/нулевые адреса (fake-ip 198.18/15 уже разрешён; `0.0.0.0` от блокировщиков, split-DNS, Tailscale `100.64/10`) | `net.log`: `deny private-address`, поле `resolved`; `--dns`, `--net-allow-private` или чинить DNS |
 | 502 «Upstream proxy failed» | вышестоящий прокси (VPN-клиент) не запущен/не отвечает/требует пароль; цель недоступна (ждёт 15 с) | `net.log`: `error upstream: …`; `envbox.py probe --upstream URL` |
 | 502 «DNS resolution failed» | не работает DNS хоста или заданные `--dns` | `error dns: …`; `Resolver` кэширует отказ 2 с |

@@ -38,7 +38,7 @@ import time
 
 # ---- version.py: Версия envbox (строка читается регулярным выражением при установке — не менять формат).
 
-ENVBOX_VERSION = "2026.11.02.10"
+ENVBOX_VERSION = "2026.11.02.11"
 
 
 # ---- lazy.py: Ленивые модули стандартной библиотеки: настоящий import происходит при первом обращении к атрибуту.
@@ -1351,6 +1351,11 @@ def link_server(out):
     return f"{node['address']}:{node['port']}"
 
 
+# Какие исходящие подключения считаются «через сервер» (а не прямым выходом, блокировкой и т. п.)
+PROXY_PROTOCOLS = ("vless", "vmess", "trojan", "shadowsocks", "socks", "http", "wireguard", "hysteria", "hysteria2",
+                   "tuic", "shadowtls", "ssh")
+
+
 # Адреса, которые подписки подставляют вместо серверов, когда приложение им «не подходит»
 STUB_HOSTS = ("0.0.0.0", "127.0.0.1", "::", "::1", "localhost")
 
@@ -1389,6 +1394,42 @@ def json_server(cfg):
     return "", 0
 
 
+def split_json_configs(text):
+    """Подписка-массив готовых конфигураций Xray/sing-box ([{"remarks": …, "outbounds": […]}, …]) -> [(имя, JSON)]."""
+    t = (text or "").strip()
+    if not t.startswith("["):
+        return []
+    try:
+        data = json.loads(t)
+    except ValueError:
+        return []
+    out = []
+    for item in data if isinstance(data, list) else []:
+        if isinstance(item, dict) and isinstance(item.get("outbounds"), list):
+            out.append((str(item.get("remarks") or item.get("remark") or item.get("name") or ""),
+                        json.dumps(item, ensure_ascii=False)))
+    return out
+
+
+def describe_response(text):
+    """Что за ответ пришёл вместо подписки (без самих данных: в них могут быть секреты)."""
+    t = (text or "").strip()
+    if not t:
+        return "пустой ответ"
+    if t.lstrip().lower().startswith(("<!doctype", "<html", "<head", "<body")):
+        return "веб-страница (HTML): адрес ведёт на страницу, а не на подписку"
+    if t.startswith(("{", "[")):
+        try:
+            data = json.loads(t)
+            return f"JSON ({'массив из ' + str(len(data)) + ' элементов' if isinstance(data, list) else 'объект'}), "\
+                   "но без конфигураций Xray или sing-box (outbounds)"
+        except ValueError:
+            return "повреждённый JSON"
+    if re.search(r"^\s*(proxies|proxy-groups|port|mixed-port)\s*:", t, re.M):
+        return "Clash-подписка (YAML): такой формат не поддерживается"
+    return f"текст из {len(t)} знаков без ссылок vless://, vmess://, trojan://, ss://"
+
+
 def vpn_info(kind, text):
     """Сведения для списка: {title, host, port, udp}. ValueError при плохой конфигурации (как vpn_validate)."""
     if kind == "wireguard":
@@ -1399,8 +1440,10 @@ def vpn_info(kind, text):
         node = (out["settings"].get("vnext") or out["settings"].get("servers"))[0]
         return {"title": remark, "host": str(node["address"]), "port": int(node["port"]), "udp": False}
     vpn_validate(kind, text)
-    host, port = json_server(json.loads(text))
-    return {"title": "", "host": host, "port": port, "udp": False}
+    cfg = json.loads(text)
+    host, port = json_server(cfg)
+    return {"title": str(cfg.get("remarks") or cfg.get("remark") or "") if isinstance(cfg, dict) else "",
+            "host": host, "port": port, "udp": False}
 
 
 def split_links(text):
@@ -1433,8 +1476,16 @@ def xray_runtime(text, port, user, password):
         cfg = {"outbounds": [parse_share_link(t)[0]]}
     else:
         cfg = json.loads(t)
-        for k in ("api", "stats", "metrics"):   # управляющие порты чужого конфига нам не нужны
+        for k in ("api", "stats", "metrics", "observatory", "burstObservatory"):   # чужие управляющие порты не нужны
             cfg.pop(k, None)
+        # Маршрутизация подписки («российские сайты напрямую», блокировка рекламы) вывела бы часть трафика мимо VPN:
+        # убираем её, и всё идёт через первый прокси-выход (его ставим первым: по умолчанию берётся первый)
+        cfg.pop("routing", None)
+        outs = [o for o in cfg.get("outbounds") or [] if isinstance(o, dict)]
+        first = next((o for o in outs if o.get("protocol") in PROXY_PROTOCOLS), None)
+        if first is None:
+            raise ValueError("в конфигурации нет прокси-выхода (vless, vmess, trojan, shadowsocks…): только прямой выход")
+        cfg["outbounds"] = [first] + [o for o in outs if o is not first]
     cfg["log"] = {"loglevel": "warning"}
     cfg["inbounds"] = [{"tag": "envbox-in", "listen": "127.0.0.1", "port": port, "protocol": "socks",
                         "settings": {"auth": "password", "udp": False, "accounts": [{"user": user, "pass": password}]}}]
@@ -1446,6 +1497,12 @@ def singbox_runtime(text, port, user, password):
     cfg = json.loads(text)
     for k in ("experimental", "ntp"):   # clash_api и подобное открывают порты
         cfg.pop(k, None)
+    # правила маршрутизации подписки вывели бы часть трафика мимо VPN: всё идёт через первый прокси-выход
+    first = next((o for o in cfg.get("outbounds") or [] if isinstance(o, dict) and o.get("type") in PROXY_PROTOCOLS),
+                 None)
+    if first is None:
+        raise ValueError("в конфигурации нет прокси-выхода (vless, vmess, trojan, shadowsocks…): только прямой выход")
+    cfg["route"] = {"final": first.setdefault("tag", "envbox-out")}
     cfg["log"] = {"level": "warn"}
     cfg["inbounds"] = [{"type": "socks", "tag": "envbox-in", "listen": "127.0.0.1", "listen_port": port,
                         "users": [{"username": user, "password": password}]}]
@@ -6296,8 +6353,33 @@ def subscription_info(headers):
     return info
 
 
+def parse_subscription(text):
+    """Что в ответе подписки -> (серверы, заглушки, другие схемы).
+
+    серверы — тексты, которые можно сохранить как VPN (ссылка на сервер, конфигурация из массива JSON или весь текст,
+    если это одна конфигурация); заглушки — имена фальшивых серверов провайдера; другие схемы — hysteria2, tuic…"""
+    configs = split_json_configs(text)
+    if configs:
+        items, stubs = [], []
+        for remark, body in configs:
+            host, port = json_server(json.loads(body))
+            if host and (host.lower() in STUB_HOSTS or port <= 1):
+                stubs.append(remark or host)
+            else:
+                items.append(body)
+        return items, stubs, []
+    links, other = split_links(text)
+    if links:
+        stubs = [stub_remark(x) or x[:30] for x in links if is_stub_link(x)]
+        return [x for x in links if not is_stub_link(x)], stubs, other
+    if other:
+        return [], [], other
+    return ([text] if (text or "").strip() else []), [], []
+
+
 def import_many(base, text, replace=False, folder=None):
-    """Добавить VPN из текста: одна конфигурация, ссылка или подписка (список ссылок, в том числе в base64).
+    """Добавить VPN из текста: одна конфигурация, ссылка или подписка (список ссылок или массив конфигураций JSON,
+    в том числе в base64).
 
     Возвращает ([(имя, вид, описание)], [причины пропуска]). Из подписки каждый сервер сохраняется отдельным VPN
     с именем <основа>-1, <основа>-2…; повторный импорт заменяет одноимённые. Заглушки провайдера (адрес 0.0.0.0,
@@ -6306,29 +6388,33 @@ def import_many(base, text, replace=False, folder=None):
     base = normalize_name(base, "")
     if not base:
         base = free_name("vpn")     # имя не задано или целиком из недопустимых знаков: не затираем то, что уже есть
-    links, other = split_links(text)
-    if not links:
-        if other:
-            raise ValueError("в подписке только неподдерживаемые ссылки: " + ", ".join(sorted(set(other)))
-                             + ". Поддерживаются vless, vmess, trojan, ss, WireGuard и JSON Xray / sing-box")
-        return [import_vpn(base, text, replace=replace, folder=folder)], []
-    stubs = [stub_remark(x) or x[:30] for x in links if is_stub_link(x)]
-    links = [x for x in links if not is_stub_link(x)]
+    items, stubs, other = parse_subscription(text)
     done, skipped = [], []
     if stubs:
         skipped.append("заглушки провайдера пропущены: " + ", ".join("«" + t + "»" for t in dict.fromkeys(stubs)))
-    if not links:
-        raise ValueError("провайдер вернул вместо серверов только заглушки (" + ", ".join(dict.fromkeys(stubs))
-                         + "): подписка привязана к приложению провайдера или лимиту устройств")
-    base = base[:40]
-    for i, link in enumerate(links[:SUB_MAX_LINKS], 1):
-        name = base if len(links) == 1 else f"{base}-{i}"
+    if not items:
+        if stubs:
+            raise ValueError("провайдер вернул вместо серверов только заглушки (" + ", ".join(dict.fromkeys(stubs))
+                             + "): подписка привязана к приложению провайдера или лимиту устройств")
+        if other:
+            raise ValueError("в подписке только неподдерживаемые ссылки: " + ", ".join(sorted(set(other)))
+                             + ". Поддерживаются vless, vmess, trojan, ss, WireGuard и JSON Xray / sing-box")
+        raise ValueError("ответ не похож на подписку: " + describe_response(text))
+    if len(items) == 1 and items[0] is text:       # весь ответ — одна конфигурация (WireGuard, JSON-объект), не список
         try:
-            done.append(import_vpn(name, link, replace=replace or len(links) > 1, folder=folder))
+            detect_kind(text)
+        except ValueError:
+            raise ValueError("ответ не похож на подписку: " + describe_response(text)) from None
+        return [import_vpn(base, text, replace=replace, folder=folder)], skipped
+    base = base[:40]
+    for i, item in enumerate(items[:SUB_MAX_LINKS], 1):
+        name = base if len(items) == 1 else f"{base}-{i}"
+        try:
+            done.append(import_vpn(name, item, replace=replace or len(items) > 1, folder=folder))
         except ValueError as e:
             skipped.append(f"сервер {i}: {e}")
-    if len(links) > SUB_MAX_LINKS:
-        skipped.append(f"взяты первые {SUB_MAX_LINKS} серверов из {len(links)}")
+    if len(items) > SUB_MAX_LINKS:
+        skipped.append(f"взяты первые {SUB_MAX_LINKS} серверов из {len(items)}")
     if other:
         skipped.append("неподдерживаемые ссылки пропущены: " + ", ".join(sorted(set(other))))
     if not done:
@@ -6346,10 +6432,9 @@ def import_subscription(base, url, proxy="", auth="", via="", folder=None):
     stubs, text, headers = [], "", {}
     for agent in SUB_AGENTS:
         text, headers = fetch_subscription_full(url, proxy=proxy, auth=auth, agent=agent)
-        links, _other = split_links(text)
-        real = [x for x in links if not is_stub_link(x)]
-        stubs += [stub_remark(x) for x in links if is_stub_link(x)]
-        if real or not links:        # настоящие серверы или не список ссылок (JSON, WireGuard): дальше не перебираем
+        items, found, _other = parse_subscription(text)
+        stubs += found
+        if items or not found:       # настоящие серверы (или вообще не заглушки): дальше не перебираем
             break
     info = subscription_info(headers)
     base = base or base_name_from_url(url)

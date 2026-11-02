@@ -53,7 +53,7 @@
   detect_terminal(), terminal_argv(), dry_run(), launch_background(), read_tail()
 - `src/envbox/core/upstream.py` (70 стр.) — Вышестоящий прокси профиля: разбор URL, чтение из файла, проверка.
   split_proxy_url(), read_proxy_file(), probe_upstream()
-- `src/envbox/core/vpn.py` (587 стр.) — Хранилище VPN-конфигураций: импорт, список, удаление и проверка наличия клиента.
+- `src/envbox/core/vpn.py` (616 стр.) — Хранилище VPN-конфигураций: импорт, список, удаление и проверка наличия клиента.
   vpn_dir(), vpn_path(), vpn_name_from_file(), exit_chain(), exit_mode(), normalize_name(), free_name(), looks_like_source(), is_subscription_url(), clean_folder(), load_meta(), save_meta(), set_folder(), human_bytes() …
 - `src/envbox/gui/app.py` (24 стр.) — Приложение GTK и точка входа gui_main.
   App (2 методов), gui_main()
@@ -119,7 +119,7 @@
   seccomp_program_x86_64(), cmd_seccomp()
 - `src/envbox/net/upstream.py` (121 стр.) — Сетевой шлюз: вышестоящий прокси (http / socks5 / socks5h).
   UpstreamError (0 методов), Upstream (2 методов)
-- `src/envbox/net/vpn.py` (509 стр.) — Сетевой шлюз: VPN-клиенты как локальные SOCKS-прокси.
+- `src/envbox/net/vpn.py` (566 стр.) — Сетевой шлюз: VPN-клиенты как локальные SOCKS-прокси.
   detect_kind(), wg_sections(), wg_validate(), wg_runtime(), share_scheme(), b64decode(), stream_settings(), check_server(), parse_vmess_json(), parse_shadowsocks(), parse_share_link(), link_server(), is_stub_link(), stub_remark() …
 - `src/envbox/resources.py` (9 стр.) — Встроенные ресурсы (envbox.sh, значки, CSS…): файлы из resources/; в собранном envbox.py они вшиты строками.
   resource_text()

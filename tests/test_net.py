@@ -1427,6 +1427,66 @@ class VpnSubscriptions(unittest.TestCase):
         self.assertIsNone(res["dead"])                                      # не ответил
         self.assertNotIn("wg", res)                                         # WireGuard — UDP, пингом не измеряется
 
+    def test_json_array_subscription_is_split_into_servers(self):
+        # «конфигурация слишком большая (больше 256 КБ)»: подписка отдала массив готовых конфигураций Xray
+        import json as _json
+        from envbox.core.vpn import import_many, list_vpns
+        junk = [f"geosite:{i}-example.com" for i in range(4000)]               # правила маршрутизации «раздувают» конфиг
+
+        def cfg(remark, host, port):
+            out = {"protocol": "vless", "tag": "proxy", "settings": {"vnext": [{
+                "address": host, "port": port, "users": [{"id": VpnConfigs.UUID, "encryption": "none"}]}]},
+                "streamSettings": {"network": "tcp", "security": "none"}}
+            return {"remarks": remark, "inbounds": [{"port": 10808, "protocol": "socks"}],
+                    "outbounds": [{"protocol": "freedom", "tag": "direct"}, out],
+                    "routing": {"rules": [{"type": "field", "domain": junk, "outboundTag": "direct"}]}}
+        body = _json.dumps([cfg("Берлин", "a.example", 443), cfg("Приложение не поддерживается", "0.0.0.0", 1),
+                            cfg("Париж", "b.example", 8443)], ensure_ascii=False)
+        self.assertGreater(len(body.encode()), 256 * 1024)                      # весь ответ больше лимита одной конфигурации
+        done, skipped = import_many("svc", body, folder="Сервис")
+        self.assertEqual([n for n, _k, _s in done], ["svc-1", "svc-2"])
+        self.assertTrue(any("заглушки" in x and "Приложение не поддерживается" in x for x in skipped), skipped)
+        by = {v["name"]: v for v in list_vpns()}
+        self.assertEqual((by["svc-1"]["title"], by["svc-1"]["host"], by["svc-1"]["port"], by["svc-1"]["folder"]),
+                         ("Берлин", "a.example", 443, "Сервис"))                # название и сервер видны в списке и для пинга
+        self.assertEqual(by["svc-2"]["title"], "Париж")
+
+    def test_foreign_routing_cannot_bypass_the_vpn(self):
+        # в подписках бывают правила «эти сайты напрямую»: при «только через VPN» это утечка настоящего адреса
+        import json as _json
+        from envbox.net.vpn import singbox_runtime, xray_runtime
+        direct_first = {"outbounds": [{"protocol": "freedom", "tag": "direct"}, {"protocol": "blackhole"},
+                                      {"protocol": "vless", "tag": "proxy"}],
+                        "routing": {"rules": [{"domain": ["geosite:ru"], "outboundTag": "direct"}]},
+                        "observatory": {"subjectSelector": ["proxy"]}}
+        cfg = _json.loads(xray_runtime(_json.dumps(direct_first), 1081, "u", "p"))
+        self.assertNotIn("routing", cfg)
+        self.assertNotIn("observatory", cfg)
+        self.assertEqual(cfg["outbounds"][0]["protocol"], "vless")              # по умолчанию берётся первый выход
+        with self.assertRaises(ValueError):
+            xray_runtime('{"outbounds":[{"protocol":"freedom"}]}', 1, "u", "p")  # без прокси-выхода VPN не VPN
+        sb = _json.loads(singbox_runtime(_json.dumps({
+            "outbounds": [{"type": "direct", "tag": "direct"}, {"type": "vless", "tag": "p"}],
+            "route": {"final": "direct", "rules": [{"domain_suffix": [".ru"], "outbound": "direct"}]}}), 1082, "u", "p"))
+        self.assertEqual(sb["route"], {"final": "p"})
+        sb = _json.loads(singbox_runtime('{"outbounds":[{"type":"vless"}]}', 1082, "u", "p"))
+        self.assertEqual(sb["route"], {"final": "envbox-out"})                  # без тега даём свой
+        with self.assertRaises(ValueError):
+            singbox_runtime('{"outbounds":[{"type":"direct","tag":"d"}]}', 1, "u", "p")
+
+    def test_unrecognised_response_is_described_not_just_too_big(self):
+        from envbox.core.vpn import import_many
+        cases = (("<!DOCTYPE html><html>" + "x" * 300000 + "</html>", "веб-страница"),
+                 ("proxies:\n  - name: a\n    type: vless\n", "Clash"),
+                 ('[{"a":1},{"b":2}]', "массив из 2 элементов"),
+                 ("просто текст без ссылок", "без ссылок"),
+                 ("   ", "пустой"))
+        for text, part in cases:
+            with self.assertRaises(ValueError) as cm:
+                import_many("x", text)
+            self.assertIn("не похож на подписку", str(cm.exception))
+            self.assertIn(part, str(cm.exception))
+
     def test_folder_summary_and_natural_order(self):
         from envbox.core.vpn import folder_summary, human_bytes, natural_key
         self.assertEqual(human_bytes(512), "512 Б")

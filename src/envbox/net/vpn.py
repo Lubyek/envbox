@@ -283,6 +283,11 @@ def link_server(out):
     return f"{node['address']}:{node['port']}"
 
 
+# Какие исходящие подключения считаются «через сервер» (а не прямым выходом, блокировкой и т. п.)
+PROXY_PROTOCOLS = ("vless", "vmess", "trojan", "shadowsocks", "socks", "http", "wireguard", "hysteria", "hysteria2",
+                   "tuic", "shadowtls", "ssh")
+
+
 # Адреса, которые подписки подставляют вместо серверов, когда приложение им «не подходит»
 STUB_HOSTS = ("0.0.0.0", "127.0.0.1", "::", "::1", "localhost")
 
@@ -321,6 +326,42 @@ def json_server(cfg):
     return "", 0
 
 
+def split_json_configs(text):
+    """Подписка-массив готовых конфигураций Xray/sing-box ([{"remarks": …, "outbounds": […]}, …]) -> [(имя, JSON)]."""
+    t = (text or "").strip()
+    if not t.startswith("["):
+        return []
+    try:
+        data = json.loads(t)
+    except ValueError:
+        return []
+    out = []
+    for item in data if isinstance(data, list) else []:
+        if isinstance(item, dict) and isinstance(item.get("outbounds"), list):
+            out.append((str(item.get("remarks") or item.get("remark") or item.get("name") or ""),
+                        json.dumps(item, ensure_ascii=False)))
+    return out
+
+
+def describe_response(text):
+    """Что за ответ пришёл вместо подписки (без самих данных: в них могут быть секреты)."""
+    t = (text or "").strip()
+    if not t:
+        return "пустой ответ"
+    if t.lstrip().lower().startswith(("<!doctype", "<html", "<head", "<body")):
+        return "веб-страница (HTML): адрес ведёт на страницу, а не на подписку"
+    if t.startswith(("{", "[")):
+        try:
+            data = json.loads(t)
+            return f"JSON ({'массив из ' + str(len(data)) + ' элементов' if isinstance(data, list) else 'объект'}), "\
+                   "но без конфигураций Xray или sing-box (outbounds)"
+        except ValueError:
+            return "повреждённый JSON"
+    if re.search(r"^\s*(proxies|proxy-groups|port|mixed-port)\s*:", t, re.M):
+        return "Clash-подписка (YAML): такой формат не поддерживается"
+    return f"текст из {len(t)} знаков без ссылок vless://, vmess://, trojan://, ss://"
+
+
 def vpn_info(kind, text):
     """Сведения для списка: {title, host, port, udp}. ValueError при плохой конфигурации (как vpn_validate)."""
     if kind == "wireguard":
@@ -331,8 +372,10 @@ def vpn_info(kind, text):
         node = (out["settings"].get("vnext") or out["settings"].get("servers"))[0]
         return {"title": remark, "host": str(node["address"]), "port": int(node["port"]), "udp": False}
     vpn_validate(kind, text)
-    host, port = json_server(json.loads(text))
-    return {"title": "", "host": host, "port": port, "udp": False}
+    cfg = json.loads(text)
+    host, port = json_server(cfg)
+    return {"title": str(cfg.get("remarks") or cfg.get("remark") or "") if isinstance(cfg, dict) else "",
+            "host": host, "port": port, "udp": False}
 
 
 def split_links(text):
@@ -365,8 +408,16 @@ def xray_runtime(text, port, user, password):
         cfg = {"outbounds": [parse_share_link(t)[0]]}
     else:
         cfg = json.loads(t)
-        for k in ("api", "stats", "metrics"):   # управляющие порты чужого конфига нам не нужны
+        for k in ("api", "stats", "metrics", "observatory", "burstObservatory"):   # чужие управляющие порты не нужны
             cfg.pop(k, None)
+        # Маршрутизация подписки («российские сайты напрямую», блокировка рекламы) вывела бы часть трафика мимо VPN:
+        # убираем её, и всё идёт через первый прокси-выход (его ставим первым: по умолчанию берётся первый)
+        cfg.pop("routing", None)
+        outs = [o for o in cfg.get("outbounds") or [] if isinstance(o, dict)]
+        first = next((o for o in outs if o.get("protocol") in PROXY_PROTOCOLS), None)
+        if first is None:
+            raise ValueError("в конфигурации нет прокси-выхода (vless, vmess, trojan, shadowsocks…): только прямой выход")
+        cfg["outbounds"] = [first] + [o for o in outs if o is not first]
     cfg["log"] = {"loglevel": "warning"}
     cfg["inbounds"] = [{"tag": "envbox-in", "listen": "127.0.0.1", "port": port, "protocol": "socks",
                         "settings": {"auth": "password", "udp": False, "accounts": [{"user": user, "pass": password}]}}]
@@ -378,6 +429,12 @@ def singbox_runtime(text, port, user, password):
     cfg = json.loads(text)
     for k in ("experimental", "ntp"):   # clash_api и подобное открывают порты
         cfg.pop(k, None)
+    # правила маршрутизации подписки вывели бы часть трафика мимо VPN: всё идёт через первый прокси-выход
+    first = next((o for o in cfg.get("outbounds") or [] if isinstance(o, dict) and o.get("type") in PROXY_PROTOCOLS),
+                 None)
+    if first is None:
+        raise ValueError("в конфигурации нет прокси-выхода (vless, vmess, trojan, shadowsocks…): только прямой выход")
+    cfg["route"] = {"final": first.setdefault("tag", "envbox-out")}
     cfg["log"] = {"level": "warn"}
     cfg["inbounds"] = [{"type": "socks", "tag": "envbox-in", "listen": "127.0.0.1", "listen_port": port,
                         "users": [{"username": user, "password": password}]}]

@@ -10,7 +10,8 @@ import re
 import time
 
 from ..net.vpn import (VPN_BINARIES, VPN_HINTS, VPN_KINDS, VPN_LABELS, VpnClient, detect_kind, find_binary,
-                       is_stub_link, split_links, stub_remark, vpn_info, vpn_validate)
+                       describe_response, is_stub_link, json_server, split_json_configs, split_links, stub_remark,
+                       vpn_info, vpn_validate, STUB_HOSTS)
 from ..net.upstream import Upstream
 from .consts import NAME_RE
 from .root import envbox_root
@@ -498,8 +499,33 @@ def subscription_info(headers):
     return info
 
 
+def parse_subscription(text):
+    """Что в ответе подписки -> (серверы, заглушки, другие схемы).
+
+    серверы — тексты, которые можно сохранить как VPN (ссылка на сервер, конфигурация из массива JSON или весь текст,
+    если это одна конфигурация); заглушки — имена фальшивых серверов провайдера; другие схемы — hysteria2, tuic…"""
+    configs = split_json_configs(text)
+    if configs:
+        items, stubs = [], []
+        for remark, body in configs:
+            host, port = json_server(json.loads(body))
+            if host and (host.lower() in STUB_HOSTS or port <= 1):
+                stubs.append(remark or host)
+            else:
+                items.append(body)
+        return items, stubs, []
+    links, other = split_links(text)
+    if links:
+        stubs = [stub_remark(x) or x[:30] for x in links if is_stub_link(x)]
+        return [x for x in links if not is_stub_link(x)], stubs, other
+    if other:
+        return [], [], other
+    return ([text] if (text or "").strip() else []), [], []
+
+
 def import_many(base, text, replace=False, folder=None):
-    """Добавить VPN из текста: одна конфигурация, ссылка или подписка (список ссылок, в том числе в base64).
+    """Добавить VPN из текста: одна конфигурация, ссылка или подписка (список ссылок или массив конфигураций JSON,
+    в том числе в base64).
 
     Возвращает ([(имя, вид, описание)], [причины пропуска]). Из подписки каждый сервер сохраняется отдельным VPN
     с именем <основа>-1, <основа>-2…; повторный импорт заменяет одноимённые. Заглушки провайдера (адрес 0.0.0.0,
@@ -508,29 +534,33 @@ def import_many(base, text, replace=False, folder=None):
     base = normalize_name(base, "")
     if not base:
         base = free_name("vpn")     # имя не задано или целиком из недопустимых знаков: не затираем то, что уже есть
-    links, other = split_links(text)
-    if not links:
-        if other:
-            raise ValueError("в подписке только неподдерживаемые ссылки: " + ", ".join(sorted(set(other)))
-                             + ". Поддерживаются vless, vmess, trojan, ss, WireGuard и JSON Xray / sing-box")
-        return [import_vpn(base, text, replace=replace, folder=folder)], []
-    stubs = [stub_remark(x) or x[:30] for x in links if is_stub_link(x)]
-    links = [x for x in links if not is_stub_link(x)]
+    items, stubs, other = parse_subscription(text)
     done, skipped = [], []
     if stubs:
         skipped.append("заглушки провайдера пропущены: " + ", ".join("«" + t + "»" for t in dict.fromkeys(stubs)))
-    if not links:
-        raise ValueError("провайдер вернул вместо серверов только заглушки (" + ", ".join(dict.fromkeys(stubs))
-                         + "): подписка привязана к приложению провайдера или лимиту устройств")
-    base = base[:40]
-    for i, link in enumerate(links[:SUB_MAX_LINKS], 1):
-        name = base if len(links) == 1 else f"{base}-{i}"
+    if not items:
+        if stubs:
+            raise ValueError("провайдер вернул вместо серверов только заглушки (" + ", ".join(dict.fromkeys(stubs))
+                             + "): подписка привязана к приложению провайдера или лимиту устройств")
+        if other:
+            raise ValueError("в подписке только неподдерживаемые ссылки: " + ", ".join(sorted(set(other)))
+                             + ". Поддерживаются vless, vmess, trojan, ss, WireGuard и JSON Xray / sing-box")
+        raise ValueError("ответ не похож на подписку: " + describe_response(text))
+    if len(items) == 1 and items[0] is text:       # весь ответ — одна конфигурация (WireGuard, JSON-объект), не список
         try:
-            done.append(import_vpn(name, link, replace=replace or len(links) > 1, folder=folder))
+            detect_kind(text)
+        except ValueError:
+            raise ValueError("ответ не похож на подписку: " + describe_response(text)) from None
+        return [import_vpn(base, text, replace=replace, folder=folder)], skipped
+    base = base[:40]
+    for i, item in enumerate(items[:SUB_MAX_LINKS], 1):
+        name = base if len(items) == 1 else f"{base}-{i}"
+        try:
+            done.append(import_vpn(name, item, replace=replace or len(items) > 1, folder=folder))
         except ValueError as e:
             skipped.append(f"сервер {i}: {e}")
-    if len(links) > SUB_MAX_LINKS:
-        skipped.append(f"взяты первые {SUB_MAX_LINKS} серверов из {len(links)}")
+    if len(items) > SUB_MAX_LINKS:
+        skipped.append(f"взяты первые {SUB_MAX_LINKS} серверов из {len(items)}")
     if other:
         skipped.append("неподдерживаемые ссылки пропущены: " + ", ".join(sorted(set(other))))
     if not done:
@@ -548,10 +578,9 @@ def import_subscription(base, url, proxy="", auth="", via="", folder=None):
     stubs, text, headers = [], "", {}
     for agent in SUB_AGENTS:
         text, headers = fetch_subscription_full(url, proxy=proxy, auth=auth, agent=agent)
-        links, _other = split_links(text)
-        real = [x for x in links if not is_stub_link(x)]
-        stubs += [stub_remark(x) for x in links if is_stub_link(x)]
-        if real or not links:        # настоящие серверы или не список ссылок (JSON, WireGuard): дальше не перебираем
+        items, found, _other = parse_subscription(text)
+        stubs += found
+        if items or not found:       # настоящие серверы (или вообще не заглушки): дальше не перебираем
             break
     info = subscription_info(headers)
     base = base or base_name_from_url(url)
