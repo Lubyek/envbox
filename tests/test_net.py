@@ -732,6 +732,410 @@ class Presets(unittest.TestCase):
         self.assertTrue([e for e in p.validate() if "прямого" in e])
 
 
+FAKE_WIREPROXY = r"""#!/usr/bin/env python3
+import asyncio, re, sys
+cfg = open(sys.argv[sys.argv.index("-c") + 1]).read()
+assert "PostUp" not in cfg and "TCPServerTunnel" not in cfg, cfg
+host, port = re.search(r"BindAddress\s*=\s*(\S+):(\d+)", cfg).groups()
+user = re.search(r"Username\s*=\s*(\S+)", cfg).group(1)
+pw = re.search(r"Password\s*=\s*(\S+)", cfg).group(1)
+async def pipe(r, w):
+    try:
+        while (d := await r.read(4096)):
+            w.write(d); await w.drain()
+    finally:
+        w.close()
+async def handle(r, w):
+    _ver, n = await r.readexactly(2)
+    await r.readexactly(n)
+    w.write(b"\x05\x02")
+    await w.drain()
+    await r.readexactly(1)
+    u = await r.readexactly((await r.readexactly(1))[0])
+    p = await r.readexactly((await r.readexactly(1))[0])
+    ok = u.decode() == user and p.decode() == pw
+    w.write(b"\x01" + (b"\x00" if ok else b"\x01"))
+    await w.drain()
+    if not ok:
+        return w.close()
+    head = await r.readexactly(4)
+    if head[3] == 3:
+        addr = (await r.readexactly((await r.readexactly(1))[0])).decode()
+    else:
+        addr = ".".join(str(b) for b in await r.readexactly(4))
+    dport = int.from_bytes(await r.readexactly(2), "big")
+    ur, uw = await asyncio.open_connection("127.0.0.1", dport)    # любое имя «внутри VPN» ведёт на локальный стенд
+    w.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+    await w.drain()
+    await asyncio.gather(pipe(r, uw), pipe(ur, w), return_exceptions=True)
+async def main():
+    srv = await asyncio.start_server(handle, host, int(port))
+    await srv.serve_forever()
+asyncio.run(main())
+"""
+
+
+class ChainTests(unittest.IsolatedAsyncioTestCase):
+    """Цепочка каналов: прокси, VPN-клиент, прямой выход; переключение на запасной и возврат на основной."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="eb")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    async def start(self, channels, **kw):
+        from envbox.net.chain import Chain
+        proxy, server, path = await start_proxy(self.tmp, chain=Chain(channels), **kw)
+        self.addCleanup(proxy.log.close)
+        return proxy, server, path
+
+    @staticmethod
+    async def http_proxy(tag, port=0):
+        """Подставной вышестоящий HTTP-прокси: принимает CONNECT и отвечает «<метка>:<данные>»."""
+        async def handle(r, w):
+            await r.readuntil(b"\r\n\r\n")
+            w.write(b"HTTP/1.1 200 OK\r\n\r\n")
+            await w.drain()
+            w.write(tag + b":" + await r.read(100))
+            await w.drain()
+            w.close()
+        srv = await asyncio.start_server(handle, "127.0.0.1", port)
+        return srv, srv.sockets[0].getsockname()[1]
+
+    @staticmethod
+    def dead_port():
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+
+    def read_log(self):
+        with open(os.path.join(self.tmp, "net.log"), encoding="utf-8") as f:
+            return [json.loads(line) for line in f]
+
+    async def through(self, path, payload=b"ping"):
+        data, r, w = await ask(path, b"CONNECT 93.184.216.34:443 HTTP/1.1\r\nHost: x\r\n\r\n")
+        self.assertTrue(data.startswith(b"HTTP/1.1 200"), data)
+        w.write(payload)
+        await w.drain()
+        answer = await asyncio.wait_for(r.read(100), 5)
+        w.close()
+        return answer
+
+    async def test_failover_then_return_to_the_preferred_channel(self):
+        import envbox.net.proxy as proxy_mod
+        from envbox.net.chain import Channel
+        dead = self.dead_port()
+        b_srv, b_port = await self.http_proxy(b"B")
+        a = Channel("a", "proxy", Upstream(f"http://127.0.0.1:{dead}"))
+        b = Channel("b", "proxy", Upstream(f"http://127.0.0.1:{b_port}"))
+        proxy, server, path = await self.start([a, b])
+        old = proxy_mod.PROBE_EVERY
+        proxy_mod.PROBE_EVERY = 0.1
+        self.addCleanup(setattr, proxy_mod, "PROBE_EVERY", old)
+        proxy.begin()
+        a_srv = None
+        try:
+            self.assertEqual(await self.through(path), b"B:ping")                # первый не отвечает: идём через второй
+            self.assertTrue(a.down)
+            self.assertEqual(proxy.chain.order()[0], b)                          # упавший больше не пробуем первым
+            self.assertEqual(await self.through(path), b"B:ping")
+            a_srv, _ = await self.http_proxy(b"A", dead)                         # основной канал ожил
+            for _ in range(40):
+                if not a.down:
+                    break
+                await asyncio.sleep(0.1)
+            self.assertFalse(a.down)
+            self.assertEqual(await self.through(path), b"A:ping")                # новые соединения вернулись на него
+        finally:
+            proxy.end()
+            server.close()
+            b_srv.close()
+            if a_srv:
+                a_srv.close()
+        await asyncio.sleep(0.2)
+        states = [(e["state"], e["channel"]) for e in self.read_log() if e.get("event") == "channel"]
+        self.assertIn(("down", a.label), states)
+        self.assertIn(("up", a.label), states)
+        opens = [e for e in self.read_log() if e.get("event") == "open"]
+        self.assertEqual([e.get("chan") for e in opens][0], b.label)             # в журнале видно, через что шло
+
+    async def test_direct_channel_is_the_last_resort(self):
+        from envbox.net.chain import Channel
+        async def answer(r, w):
+            await r.read(100)
+            w.write(b"direct:ok")
+            await w.drain()
+            w.close()
+        echo = await asyncio.start_server(answer, "127.0.0.1", 0)
+        port = echo.sockets[0].getsockname()[1]
+        a = Channel("a", "proxy", Upstream(f"http://127.0.0.1:{self.dead_port()}"))
+        proxy, server, path = await self.start([a, Channel("direct", "direct")], allow_private=True)
+        try:
+            data, r, w = await ask(path, f"CONNECT 127.0.0.1:{port} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+            self.assertTrue(data.startswith(b"HTTP/1.1 200"), data)
+            w.write(b"hi")
+            await w.drain()
+            self.assertEqual(await asyncio.wait_for(r.read(100), 5), b"direct:ok")
+            w.close()
+        finally:
+            server.close()
+            echo.close()
+        await asyncio.sleep(0.1)
+        opened = [e for e in self.read_log() if e.get("event") == "open"][-1]
+        self.assertTrue(opened.get("direct"))
+        self.assertEqual(opened.get("chan"), "direct")
+
+    async def test_every_channel_failed_gives_one_clear_502(self):
+        from envbox.net.chain import Channel
+        a = Channel("a", "proxy", Upstream(f"http://127.0.0.1:{self.dead_port()}"))
+        b = Channel("b", "proxy", Upstream(f"socks5://127.0.0.1:{self.dead_port()}"))
+        proxy, server, path = await self.start([a, b])
+        try:
+            data, _r, w = await ask(path, b"CONNECT 93.184.216.34:443 HTTP/1.1\r\nHost: x\r\n\r\n", read=-1)
+            self.assertTrue(data.startswith(b"HTTP/1.1 502"), data)
+            w.close()
+        finally:
+            server.close()
+        await asyncio.sleep(0.1)
+        err = [e for e in self.read_log() if e.get("event") == "error"][-1]
+        self.assertTrue(err["reason"].startswith("chain: "), err)
+        self.assertIn(a.label, err["reason"])
+        self.assertIn(b.label, err["reason"])
+
+    async def test_vpn_client_that_cannot_start_is_skipped(self):
+        from envbox.net.chain import Channel
+
+        class Broken:
+            async def start(self):
+                raise OSError("не найдена программа wireproxy")
+
+            def stop(self):
+                pass
+        b_srv, b_port = await self.http_proxy(b"B")
+        vpn = Channel("vpn:x", "vpn", client=Broken())
+        b = Channel("b", "proxy", Upstream(f"http://127.0.0.1:{b_port}"))
+        proxy, server, path = await self.start([vpn, b])
+        proxy.begin()
+        try:
+            self.assertEqual(await self.through(path), b"B:ping")
+        finally:
+            proxy.end()
+            server.close()
+            b_srv.close()
+        self.assertTrue(vpn.broken)
+        await asyncio.sleep(0.1)
+        broken = [e for e in self.read_log() if e.get("state") == "broken"]
+        self.assertIn("wireproxy", broken[0]["reason"])
+
+    async def test_wireguard_client_process_end_to_end(self):
+        # заглушка wireproxy читает НАШ сгенерированный конфиг (порт, логин, пароль) и ведёт себя как SOCKS5 с паролем
+        from envbox.net.chain import Channel
+        from envbox.net.vpn import VpnClient
+        fake = os.path.join(self.tmp, "wireproxy")
+        with open(fake, "w") as f:
+            f.write(FAKE_WIREPROXY)
+        os.chmod(fake, 0o755)
+        src = os.path.join(self.tmp, "wg.conf")
+        with open(src, "w") as f:
+            f.write("[Interface]\nPrivateKey = k\nAddress = 10.0.0.2/32\nPostUp = touch /tmp/pwned\n"
+                    "[Peer]\nPublicKey = p\nEndpoint = 1.2.3.4:51820\nAllowedIPs = 0.0.0.0/0\n"
+                    "[TCPServerTunnel]\nListenPort = 22\nTarget = 127.0.0.1:22\n")
+        async def answer(r, w):
+            await r.read(100)
+            w.write(b"via-vpn:ok")
+            await w.drain()
+            w.close()
+        echo = await asyncio.start_server(answer, "127.0.0.1", 0)
+        eport = echo.sockets[0].getsockname()[1]
+        os.environ["ENVBOX_VPN_WIREPROXY"] = fake
+        self.addCleanup(os.environ.pop, "ENVBOX_VPN_WIREPROXY", None)
+        client = VpnClient("wireguard", src, os.path.join(self.tmp, "vpn.log"))
+        chan = Channel("vpn:wg", "vpn", client=client)
+        proxy, server, path = await self.start([chan])
+        proxy.begin()
+        try:
+            data, r, w = await ask(path, f"CONNECT vpn.test:{eport} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+            self.assertTrue(data.startswith(b"HTTP/1.1 200"), data)
+            w.write(b"hi")
+            await w.drain()
+            self.assertEqual(await asyncio.wait_for(r.read(100), 5), b"via-vpn:ok")
+            w.close()
+            self.assertIsNotNone(client.proc)
+            tmpdir = client.dir
+            self.assertTrue(os.path.isdir(tmpdir))
+        finally:
+            proxy.end()
+            server.close()
+            echo.close()
+        self.assertIsNotNone(client.proc.wait(timeout=5))      # клиент остановлен вместе со шлюзом
+        self.assertFalse(os.path.exists(tmpdir))              # временная конфигурация (с ключами) стёрта
+
+
+class VpnConfigs(unittest.TestCase):
+    WG = ("[Interface]\nPrivateKey = abc\nAddress = 10.0.0.2/32\n[Peer]\nPublicKey = def\n"
+          "Endpoint = 1.2.3.4:51820\nAllowedIPs = 0.0.0.0/0\n")
+    UUID = "12345678-1234-1234-1234-123456789abc"
+
+    def test_kind_detection(self):
+        from envbox.net.vpn import detect_kind
+        self.assertEqual(detect_kind(self.WG), "wireguard")
+        self.assertEqual(detect_kind(f"vless://{self.UUID}@h.example:443?security=tls#x"), "xray")
+        self.assertEqual(detect_kind('{"outbounds":[{"protocol":"vless"}]}'), "xray")
+        self.assertEqual(detect_kind('{"outbounds":[{"type":"vless"}]}'), "singbox")
+        for bad in ("", "hello", "{", '{"a":1}', "[Interface]\nPrivateKey=x"):
+            with self.assertRaises(ValueError):
+                detect_kind(bad)
+
+    def test_wireguard_is_checked_and_stripped(self):
+        from envbox.net.vpn import wg_runtime, wg_validate
+        self.assertEqual(wg_validate(self.WG), "1.2.3.4:51820")
+        with self.assertRaises(ValueError):
+            wg_validate(self.WG.replace("Endpoint = 1.2.3.4:51820\n", ""))
+        text = wg_runtime(self.WG + "PostUp = rm -rf /\n[TCPClientTunnel]\nBindAddress=127.0.0.1:1\n", 1080, "u", "p")
+        self.assertNotIn("PostUp", text)
+        self.assertNotIn("TCPClientTunnel", text)
+        self.assertIn("DNS = 1.1.1.1", text)                         # без DNS внутри туннеля имена утекли бы
+        self.assertIn("BindAddress = 127.0.0.1:1080", text)         # только loopback
+        self.assertIn("Username = u", text)
+
+    def test_vless_link_becomes_an_xray_config_with_a_password_protected_socks_inbound(self):
+        import json as _json
+        from envbox.net.vpn import vpn_validate, xray_runtime
+        link = (f"vless://{self.UUID}@h.example:443?type=ws&security=tls&sni=s.example&path=%2Fw&fp=firefox"
+                "&flow=xtls-rprx-vision#name")
+        self.assertEqual(vpn_validate("xray", link), "h.example:443")
+        cfg = _json.loads(xray_runtime(link, 1080, "u", "p"))
+        inbound = cfg["inbounds"][0]
+        self.assertEqual((inbound["listen"], inbound["port"], inbound["settings"]["auth"]), ("127.0.0.1", 1080, "password"))
+        out = cfg["outbounds"][0]
+        self.assertEqual(out["settings"]["vnext"][0]["users"][0]["flow"], "xtls-rprx-vision")
+        self.assertEqual(out["streamSettings"]["wsSettings"]["path"], "/w")
+        self.assertEqual(out["streamSettings"]["tlsSettings"]["serverName"], "s.example")
+        with self.assertRaises(ValueError):
+            xray_runtime(f"vless://not-a-uuid@h.example:443", 1, "u", "p")
+        with self.assertRaises(ValueError):
+            xray_runtime(f"vless://{self.UUID}@h.example:443?security=reality", 1, "u", "p")   # нет pbk
+
+    def test_json_configs_get_our_inbound_and_lose_control_ports(self):
+        import json as _json
+        from envbox.net.vpn import singbox_runtime, xray_runtime
+        x = _json.loads(xray_runtime('{"api":{"tag":"a"},"inbounds":[{"port":9,"protocol":"http"}],'
+                                      '"outbounds":[{"protocol":"vless"}]}', 1081, "u", "p"))
+        self.assertEqual([i["port"] for i in x["inbounds"]], [1081])
+        self.assertNotIn("api", x)
+        sb = _json.loads(singbox_runtime('{"experimental":{"clash_api":{"external_controller":"0.0.0.0:9090"}},'
+                                          '"inbounds":[{"type":"mixed"}],"outbounds":[{"type":"vless"}]}', 1082, "u", "p"))
+        self.assertEqual([(i["type"], i["listen"], i["listen_port"]) for i in sb["inbounds"]],
+                         [("socks", "127.0.0.1", 1082)])
+        self.assertNotIn("experimental", sb)
+
+    def test_chain_spec(self):
+        from envbox.net.chain import parse_chain_spec
+        self.assertEqual(parse_chain_spec("proxy"), ("proxy", None, None))
+        self.assertEqual(parse_chain_spec("vpn:wireguard:/a b/c.conf"), ("vpn", "wireguard", "/a b/c.conf"))
+        for bad in ("vpn", "vpn:foo:/x", "vpn:xray:rel/path", "socks5://x", ""):
+            with self.assertRaises(ValueError):
+                parse_chain_spec(bad)
+
+
+class VpnStore(unittest.TestCase):
+    WG = VpnConfigs.WG
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="eb")
+        self.addCleanup(shutil.rmtree, self.root, True)
+        patcher = mock.patch("envbox.core.vpn.envbox_root", return_value=self.root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_import_list_replace_delete(self):
+        from envbox.core.vpn import delete_vpn, import_vpn, list_vpns, vpn_source
+        name, kind, server = import_vpn("wg0", self.WG)
+        self.assertEqual((name, kind, server), ("wg0", "wireguard", "1.2.3.4:51820"))
+        path = vpn_source("wg0")[1]
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)                 # в файле приватный ключ
+        self.assertEqual(os.stat(os.path.dirname(path)).st_mode & 0o777, 0o700)
+        with self.assertRaises(ValueError):
+            import_vpn("wg0", self.WG)                                          # молча не затираем
+        import_vpn("wg0", self.WG, replace=True)
+        import_vpn("x", f"vless://{VpnConfigs.UUID}@h.example:443?security=tls")
+        self.assertEqual([(v["name"], v["kind"]) for v in list_vpns()], [("wg0", "wireguard"), ("x", "xray")])
+        import_vpn("x", '{"outbounds":[{"type":"vless"}]}', replace=True)      # тот же ключ, другой вид: старый файл уходит
+        self.assertEqual([(v["name"], v["kind"]) for v in list_vpns()], [("wg0", "wireguard"), ("x", "singbox")])
+        self.assertTrue(delete_vpn("wg0"))
+        self.assertFalse(delete_vpn("wg0"))
+        with self.assertRaises(ValueError):
+            vpn_source("wg0")
+
+    def test_vpn_check_from_the_gui_starts_the_client_and_opens_a_tunnel(self):
+        # кнопка «Проверить» на вкладке VPN: клиент запускается, через него открывается туннель, клиент останавливается
+        import threading
+        from envbox.core.vpn import import_vpn, test_vpn
+        fake = os.path.join(self.root, "wireproxy")
+        with open(fake, "w") as f:
+            f.write(FAKE_WIREPROXY)
+        os.chmod(fake, 0o755)
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(5)
+        port = srv.getsockname()[1]
+        threading.Thread(target=lambda: [srv.accept()[0].close() for _ in range(3)], daemon=True).start()
+        self.addCleanup(srv.close)
+        import_vpn("wg0", self.WG)
+        with mock.patch.dict(os.environ, {"ENVBOX_VPN_WIREPROXY": fake}):
+            ok, msg = test_vpn("wg0", ("vpn.test", port))
+        self.assertTrue(ok, msg)
+        self.assertIn("работает", msg)
+        with mock.patch.dict(os.environ, {"ENVBOX_VPN_WIREPROXY": "/нет/такой/программы"}):
+            ok, msg = test_vpn("wg0")
+        self.assertFalse(ok)
+        self.assertIn("wireproxy", msg)                                      # понятно, что установить
+        self.assertFalse(test_vpn("нет-такого")[0])
+
+    def test_bad_input_is_rejected_with_a_reason(self):
+        from envbox.core.vpn import import_vpn, list_vpns
+        for name, text in (("a/b", self.WG), ("", self.WG), ("ok", "мусор"), ("ok", "[Interface]\nAddress=1\n[Peer]\n"),
+                           ("ok", "x" * 300000)):
+            with self.assertRaises(ValueError):
+                import_vpn(name, text)
+        self.assertEqual(list_vpns(), [])
+
+    def test_profile_chain_validation_and_args(self):
+        from envbox.core.profile import Profile
+        from envbox.core.vpn import import_vpn, vpn_source
+        import_vpn("wg0", self.WG)
+        path = vpn_source("wg0")[1]
+        p = Profile(name="c", net="log", upstream="http://127.0.0.1:9", upstream_auth=True,
+                    upstream_chain=["proxy", "vpn:wg0", "direct"])
+        self.assertEqual([e for e in p.validate() if "цепоч" in e], [])
+        a = p.envbox_args()
+        i = a.index("--upstream")
+        self.assertEqual(a[i:i + 2], ["--upstream", "http://127.0.0.1:9"])
+        chain = [a[j + 1] for j, x in enumerate(a) if x == "--chain"]
+        self.assertEqual(chain, ["proxy", f"vpn:wireguard:{path}", "direct"])    # порядок сохранён
+        self.assertIn("ENVBOX_UPSTREAM_AUTH", p.wrapper_secrets())
+        # VPN первым, прокси исключён из цепочки: --upstream не передаётся и пароль прокси не нужен
+        q = Profile(name="c", net="log", upstream="http://127.0.0.1:9", upstream_auth=True,
+                    upstream_chain=["vpn:wg0", "direct"])
+        a = q.envbox_args()
+        self.assertNotIn("--upstream", a)
+        self.assertNotIn("ENVBOX_UPSTREAM_AUTH", q.wrapper_secrets())
+        # ошибки
+        bad = Profile(name="c", net="log", upstream_chain=["proxy", "vpn:нет", "direct", "direct", "tor"])
+        text = "\n".join(bad.validate())
+        for part in ("«proxy», но свой прокси не задан", "не найден", "указан дважды", "неизвестный канал"):
+            self.assertIn(part, text)
+        self.assertTrue([e for e in Profile(name="c", net="off", upstream_chain=["direct"]).validate() if "цепоч" in e])
+        self.assertTrue([e for e in Profile(name="c", net="log", dns=["1.1.1.1"],
+                                            upstream_chain=["vpn:wg0"]).validate() if "DNS" in e])
+        # без цепочки всё как раньше
+        old = Profile(name="c", net="log", upstream="http://127.0.0.1:9").envbox_args()
+        self.assertIn("--upstream", old)
+        self.assertNotIn("--chain", old)
+        self.assertEqual(Profile.from_dict(p.__dict__).upstream_chain, ["proxy", "vpn:wg0", "direct"])
+
+
 class BrowserLogin(unittest.TestCase):
     def test_chrome_hides_the_automation_flag(self):
         # порт отладки делает navigator.webdriver истинным, и Google/Cloudflare отвечают «браузер не прошёл проверку»

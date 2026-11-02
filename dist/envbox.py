@@ -38,7 +38,7 @@ import time
 
 # ---- version.py: Версия envbox (строка читается регулярным выражением при установке — не менять формат).
 
-ENVBOX_VERSION = "2026.11.02.4"
+ENVBOX_VERSION = "2026.11.02.5"
 
 
 # ---- lazy.py: Ленивые модули стандартной библиотеки: настоящий import происходит при первом обращении к атрибуту.
@@ -552,6 +552,107 @@ def cmd_probe(a):
     print(f"прокси {up.label} работает: туннель до {host}:{port} открыт за {ms} мс")
 
 
+# ---- net/chain.py: Сетевой шлюз: цепочка каналов выхода (прокси, VPN-клиент, прямой выход) с переключением на запасной.
+
+# Как часто в фоне проверяются упавшие каналы и сколько ждать ответа на проверку
+PROBE_EVERY = 5.0
+
+
+PROBE_TIMEOUT = 8.0
+
+
+PROBE_TARGET = ("example.com", 443)
+
+
+CHANNEL_KINDS = ("proxy", "vpn", "direct")
+
+
+class Channel:
+    """Один канал выхода. proxy: вышестоящий прокси; vpn: VPN-клиент (запускается шлюзом); direct: собственный
+    выход этого компьютера (если на нём включён системный VPN, это и есть выход через него)."""
+
+    def __init__(self, name, kind, upstream=None, client=None):
+        if kind not in CHANNEL_KINDS:
+            raise ValueError(f"неизвестный вид канала: {kind}")
+        self.name, self.kind = name, kind
+        self.upstream = upstream      # Upstream (для vpn появляется после запуска клиента); None у direct
+        self.client = client          # VpnClient или None
+        self.down = False             # упал: пропускается, пока проверка в фоне не подтвердит, что он снова отвечает
+        self.error = ""               # почему упал последний раз
+        self.broken = False           # не запустился совсем (нет программы, плохой конфиг): не пробуем
+        self.ready = None             # asyncio.Event: клиент VPN запущен или не запустился
+
+    @property
+    def label(self):
+        if self.kind == "direct":
+            return "direct"
+        return self.name if self.kind == "vpn" else (self.upstream.label if self.upstream else self.name)
+
+
+class Chain:
+    def __init__(self, channels):
+        self.channels = list(channels)
+
+    def __bool__(self):
+        return bool(self.channels)
+
+    @staticmethod
+    def usable(ch):
+        return not ch.broken and not ch.down
+
+    def order(self):
+        """Каналы в порядке попыток: исправные по списку, затем упавшие (последняя надежда). Сломанные — никогда."""
+        live = [c for c in self.channels if self.usable(c)]
+        fallen = [c for c in self.channels if not c.broken and c.down]
+        return live + fallen
+
+    @staticmethod
+    def failed(ch, reason):
+        """Канал не отвечает. Возвращает True, если до этого он считался исправным (стоит записать в журнал)."""
+        was_up = not ch.down
+        ch.down, ch.error = True, reason
+        return was_up
+
+    @staticmethod
+    def worked(ch):
+        """Через канал удалось установить соединение. True, если он до этого числился упавшим."""
+        was_down = ch.down
+        ch.down, ch.error = False, ""
+        return was_down
+
+    def active(self):
+        """Первый исправный канал (его сейчас получают новые соединения) или None."""
+        return next((c for c in self.channels if self.usable(c)), None)
+
+    def describe(self):
+        return " → ".join(c.label for c in self.channels)
+
+
+def parse_chain_spec(spec):
+    """Строка канала из командной строки: proxy, direct или vpn:<вид>:<путь к конфигурации>."""
+    if spec in ("proxy", "direct"):
+        return spec, None, None
+    if spec.startswith("vpn:"):
+        _, _, rest = spec.partition(":")
+        kind, _, path = rest.partition(":")
+        if kind in ("wireguard", "xray", "singbox") and path.startswith("/"):
+            return "vpn", kind, path
+    raise ValueError(f"недопустимый канал '{spec}': нужен proxy, direct или vpn:<wireguard|xray|singbox>:/путь")
+
+
+async def probe(ch):
+    """Ответил ли канал: открыть туннель до PROBE_TARGET. direct и ещё не запущенный VPN считаем ответившими."""
+    up = ch.upstream
+    if up is None:
+        return True
+    try:
+        _r, w = await asyncio.wait_for(up.tunnel(*PROBE_TARGET), PROBE_TIMEOUT)
+    except (OSError, asyncio.TimeoutError):
+        return False
+    w.close()
+    return True
+
+
 # ---- net/connect.py: Сетевой шлюз: подключение к одному из адресов хоста (Happy Eyeballs).
 
 STAGGER = 0.25   # через сколько начинать следующий адрес, если предыдущий ещё не ответил
@@ -977,6 +1078,326 @@ def cmd_gitcheck(a):
         sys.exit(4)
 
 
+# ---- net/vpn.py: Сетевой шлюз: VPN-клиенты как локальные SOCKS-прокси.
+
+VPN_KINDS = ("wireguard", "xray", "singbox")
+
+
+VPN_LABELS = {"wireguard": "WireGuard", "xray": "VLESS / Xray", "singbox": "sing-box"}
+
+
+# Какая программа нужна для каждого вида (искать в PATH; путь можно задать переменной окружения)
+VPN_BINARIES = {"wireguard": "wireproxy", "xray": "xray", "singbox": "sing-box"}
+
+
+VPN_ENV = {"wireguard": "ENVBOX_VPN_WIREPROXY", "xray": "ENVBOX_VPN_XRAY", "singbox": "ENVBOX_VPN_SINGBOX"}
+
+
+VPN_HINTS = {
+    "wireguard": "wireproxy: https://github.com/pufferffish/wireproxy (AUR: wireproxy)",
+    "xray": "Xray-core: https://github.com/XTLS/Xray-core (AUR: xray)",
+    "singbox": "sing-box: https://github.com/SagerNet/sing-box (AUR: sing-box)",
+}
+
+
+# Сколько ждать, пока клиент начнёт слушать порт
+START_TIMEOUT = 20.0
+
+
+# Разделы и ключи WireGuard, которые не нужны клиенту в пространстве пользователя или опасны: сценарии wg-quick
+# (PostUp и др. исполняют команды) и туннели wireproxy, открывающие порты компьютера
+WG_DROP_KEYS = ("preup", "postup", "predown", "postdown", "saveconfig", "table", "fwmark")
+WG_KEEP_SECTIONS = ("interface", "peer")
+
+
+UUID_RE = r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+
+
+def detect_kind(text):
+    """Вид VPN-конфигурации по тексту: wireguard, xray или singbox. Непонятный формат — ValueError."""
+    t = (text or "").strip()
+    if not t:
+        raise ValueError("конфигурация пуста")
+    if t.lower().startswith("vless://"):
+        return "xray"
+    if t.startswith("{"):
+        try:
+            data = json.loads(t)
+        except ValueError:
+            raise ValueError("JSON повреждён") from None
+        outs = data.get("outbounds") if isinstance(data, dict) else None
+        if isinstance(outs, list):
+            if any(isinstance(o, dict) and "protocol" in o for o in outs):
+                return "xray"
+            if any(isinstance(o, dict) and "type" in o for o in outs):
+                return "singbox"
+        raise ValueError("JSON не похож на конфигурацию Xray или sing-box (нет outbounds)")
+    if re.search(r"^\s*\[interface\]", t, re.I | re.M) and re.search(r"^\s*\[peer\]", t, re.I | re.M):
+        return "wireguard"
+    raise ValueError("не удалось определить формат: ожидается WireGuard (.conf с [Interface] и [Peer]), ссылка "
+                     "vless://… или JSON Xray / sing-box")
+
+
+def wg_sections(text):
+    """Разбор WireGuard-конфигурации: [(раздел в нижнем регистре, {ключ в нижнем регистре: значение})]."""
+    out = []
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            out.append((line[1:-1].strip().lower(), {}))
+        elif "=" in line and out:
+            k, _, v = line.partition("=")
+            out[-1][1][k.strip().lower()] = v.strip()
+    return out
+
+
+def wg_validate(text):
+    """Проверка WireGuard-конфигурации: нужные поля есть. Возвращает краткое описание сервера."""
+    secs = wg_sections(text)
+    iface = next((d for n, d in secs if n == "interface"), None)
+    peers = [d for n, d in secs if n == "peer"]
+    if iface is None or not peers:
+        raise ValueError("нужны разделы [Interface] и [Peer]")
+    for key in ("privatekey", "address"):
+        if not iface.get(key):
+            raise ValueError(f"в [Interface] нет {'PrivateKey' if key == 'privatekey' else 'Address'}")
+    peer = peers[0]
+    for key, title in (("publickey", "PublicKey"), ("endpoint", "Endpoint"), ("allowedips", "AllowedIPs")):
+        if not peer.get(key):
+            raise ValueError(f"в [Peer] нет {title}")
+    return peer["endpoint"]
+
+
+def wg_runtime(text, port, user, password):
+    """Конфигурация wireproxy: исходная без сценариев wg-quick и чужих туннелей + наш SOCKS5 на loopback."""
+    keep, section = [], ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip().lower()
+            if section in WG_KEEP_SECTIONS:
+                keep.append(line)
+            continue
+        if section not in WG_KEEP_SECTIONS or not line or line.startswith("#"):
+            continue
+        key = line.split("=", 1)[0].strip().lower()
+        if key in WG_DROP_KEYS:
+            continue
+        keep.append(line)
+    if not any(re.match(r"^dns\s*=", ln, re.I) for ln in keep):
+        # без DNS внутри туннеля имена пришлось бы разрешать у себя (утечка): берём публичный сервер через VPN
+        for i, ln in enumerate(keep):
+            if ln.lower() == "[interface]":
+                keep.insert(i + 1, "DNS = 1.1.1.1")
+                break
+    body = "\n".join(keep)
+    return f"{body}\n\n[Socks5]\nBindAddress = 127.0.0.1:{port}\nUsername = {user}\nPassword = {password}\n"
+
+
+def parse_vless(url):
+    """Ссылка vless://uuid@хост:порт?параметры#имя -> исходящее подключение Xray."""
+    u = urllib_parse.urlsplit(url.strip())
+    if u.scheme.lower() != "vless":
+        raise ValueError("ожидается ссылка vless://")
+    uid, host = urllib_parse.unquote(u.username or ""), u.hostname
+    try:
+        port = u.port
+    except ValueError:
+        port = None
+    if not re.match(UUID_RE, uid):
+        raise ValueError("в ссылке vless:// неверный UUID")
+    if not host or not port or not 0 < port < 65536:
+        raise ValueError("в ссылке vless:// нет адреса сервера или порта")
+    q = {k: v for k, v in urllib_parse.parse_qsl(u.query)}
+    net = (q.get("type") or "tcp").lower()
+    sec = (q.get("security") or "none").lower()
+    stream = {"network": "xhttp" if net == "splithttp" else net, "security": sec}
+    if sec == "tls":
+        tls = {"serverName": q.get("sni") or q.get("host") or host, "fingerprint": q.get("fp") or "chrome"}
+        if q.get("alpn"):
+            tls["alpn"] = q["alpn"].split(",")
+        stream["tlsSettings"] = tls
+    elif sec == "reality":
+        if not q.get("pbk"):
+            raise ValueError("для reality в ссылке нужен параметр pbk (публичный ключ)")
+        stream["realitySettings"] = {"serverName": q.get("sni") or host, "fingerprint": q.get("fp") or "chrome",
+                                     "publicKey": q["pbk"], "shortId": q.get("sid", ""), "spiderX": q.get("spx", "")}
+    elif sec != "none":
+        raise ValueError(f"неподдерживаемая защита транспорта security={sec}")
+    path = q.get("path") or "/"
+    if net == "ws":
+        stream["wsSettings"] = {"path": path, "headers": {"Host": q.get("host") or q.get("sni") or host}}
+    elif net == "grpc":
+        stream["grpcSettings"] = {"serviceName": q.get("serviceName") or q.get("path") or ""}
+    elif net in ("xhttp", "splithttp"):
+        stream["xhttpSettings"] = {"path": path, "host": q.get("host") or "", "mode": q.get("mode") or "auto"}
+    elif net == "httpupgrade":
+        stream["httpupgradeSettings"] = {"path": path, "host": q.get("host") or ""}
+    elif net == "tcp":
+        pass
+    else:
+        raise ValueError(f"неподдерживаемый транспорт type={net}")
+    user = {"id": uid, "encryption": q.get("encryption") or "none"}
+    if q.get("flow"):
+        user["flow"] = q["flow"]
+    return {"protocol": "vless", "tag": "proxy", "streamSettings": stream,
+            "settings": {"vnext": [{"address": host, "port": port, "users": [user]}]}}
+
+
+def xray_runtime(text, port, user, password):
+    """Конфигурация Xray: исходные исходящие подключения + наш SOCKS5 на loopback вместо всех входящих."""
+    t = text.strip()
+    if t.lower().startswith("vless://"):
+        cfg = {"outbounds": [parse_vless(t)]}
+    else:
+        cfg = json.loads(t)
+        for k in ("api", "stats", "metrics"):   # управляющие порты чужого конфига нам не нужны
+            cfg.pop(k, None)
+    cfg["log"] = {"loglevel": "warning"}
+    cfg["inbounds"] = [{"tag": "envbox-in", "listen": "127.0.0.1", "port": port, "protocol": "socks",
+                        "settings": {"auth": "password", "udp": False, "accounts": [{"user": user, "pass": password}]}}]
+    return json.dumps(cfg, ensure_ascii=False, indent=1)
+
+
+def singbox_runtime(text, port, user, password):
+    """Конфигурация sing-box: исходные исходящие подключения + наш SOCKS5 на loopback вместо всех входящих."""
+    cfg = json.loads(text)
+    for k in ("experimental", "ntp"):   # clash_api и подобное открывают порты
+        cfg.pop(k, None)
+    cfg["log"] = {"level": "warn"}
+    cfg["inbounds"] = [{"type": "socks", "tag": "envbox-in", "listen": "127.0.0.1", "listen_port": port,
+                        "users": [{"username": user, "password": password}]}]
+    return json.dumps(cfg, ensure_ascii=False, indent=1)
+
+
+def vpn_validate(kind, text):
+    """Проверка конфигурации при импорте; возвращает короткое описание (сервер). ValueError с понятным текстом."""
+    if kind == "wireguard":
+        return wg_validate(text)
+    if kind == "xray" and text.strip().lower().startswith("vless://"):
+        out = parse_vless(text)
+        v = out["settings"]["vnext"][0]
+        return f"{v['address']}:{v['port']}"
+    try:
+        cfg = json.loads(text)
+    except ValueError:
+        raise ValueError("JSON повреждён") from None
+    outs = cfg.get("outbounds") if isinstance(cfg, dict) else None
+    if not isinstance(outs, list) or not outs:
+        raise ValueError("в конфигурации нет outbounds")
+    return f"исходящих подключений: {len(outs)}"
+
+
+def build_runtime(kind, text, port, user, password):
+    """(имя файла, текст конфигурации, аргументы запуска до пути конфигурации) для клиента вида kind."""
+    if kind == "wireguard":
+        return "wireproxy.conf", wg_runtime(text, port, user, password), ["-c"]
+    if kind == "xray":
+        return "config.json", xray_runtime(text, port, user, password), ["run", "-c"]
+    if kind == "singbox":
+        return "config.json", singbox_runtime(text, port, user, password), ["run", "-c"]
+    raise ValueError(f"неизвестный вид VPN: {kind}")
+
+
+def find_binary(kind):
+    """Путь к программе клиента или None (сначала переменная окружения, потом PATH)."""
+    import shutil
+    own = os.environ.get(VPN_ENV[kind], "")
+    if own:
+        return own if os.access(own, os.X_OK) else None
+    return shutil.which(VPN_BINARIES[kind])
+
+
+def die_with_parent():
+    """Для preexec_fn: клиент получает SIGTERM, если шлюз погиб (иначе VPN остался бы подключённым навсегда)."""
+    try:
+        import ctypes
+        ctypes.CDLL(None).prctl(1, 15)     # PR_SET_PDEATHSIG, SIGTERM
+    except (OSError, AttributeError):
+        pass
+
+
+def free_port():
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
+class VpnClient:
+    """Один запущенный VPN-клиент: процесс, временная конфигурация (0700) и вышестоящий SOCKS5 к нему."""
+
+    def __init__(self, kind, source_path, log_path):
+        self.kind, self.source_path, self.log_path = kind, source_path, log_path
+        self.proc = None
+        self.dir = None
+        self.upstream = None
+
+    async def start(self):
+        """Запустить клиент и дождаться порта. Ошибки — OSError с текстом для журнала."""
+        import secrets
+        import subprocess
+        import tempfile
+        binary = find_binary(self.kind)
+        if binary is None:
+            raise OSError(f"не найдена программа {VPN_BINARIES[self.kind]} ({VPN_HINTS[self.kind]})")
+        try:
+            with open(self.source_path, encoding="utf-8") as f:
+                text = f.read()
+            port, user, password = free_port(), secrets.token_hex(8), secrets.token_hex(16)
+            fname, cfg, args = build_runtime(self.kind, text, port, user, password)
+        except (OSError, ValueError) as e:
+            raise OSError(f"конфигурация VPN не читается: {e}") from None
+        self.dir = tempfile.mkdtemp(prefix="envbox-vpn-")
+        path = os.path.join(self.dir, fname)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(cfg)
+        log = open(self.log_path, "ab")
+        try:
+            self.proc = subprocess.Popen([binary, *args, path], stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                         start_new_session=True, cwd=self.dir,
+                                         preexec_fn=die_with_parent)
+        finally:
+            log.close()
+        deadline = time.monotonic() + START_TIMEOUT
+        while time.monotonic() < deadline:
+            if self.proc.poll() is not None:
+                raise OSError(f"VPN-клиент завершился с кодом {self.proc.returncode} (см. {self.log_path})")
+            try:
+                _r, w = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", port), 1.0)
+                w.close()
+                break
+            except (OSError, asyncio.TimeoutError):
+                await asyncio.sleep(0.2)
+        else:
+            raise OSError(f"VPN-клиент не открыл порт за {int(START_TIMEOUT)} с (см. {self.log_path})")
+        self.upstream = Upstream(f"socks5://127.0.0.1:{port}", f"{user}:{password}")
+
+    def stop(self):
+        """Остановить клиент и стереть временную конфигурацию (в ней ключи)."""
+        import shutil
+        if self.proc is not None and self.proc.poll() is None:
+            try:
+                os.killpg(self.proc.pid, signal.SIGTERM)
+            except OSError:
+                pass
+            try:
+                self.proc.wait(timeout=3)
+            except Exception:  # noqa: BLE001
+                try:
+                    os.killpg(self.proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+        if self.dir:
+            shutil.rmtree(self.dir, ignore_errors=True)
+            self.dir = None
+
+
 # ---- net/proxy.py: Сетевой шлюз: журналирующий прокси (команда proxy).
 
 LOG_LIMIT = 20 * 1024 * 1024        # больше этого размера журнал уходит в .1
@@ -1002,9 +1423,25 @@ def err_text(e):
     return str(e) or type(e).__name__
 
 
+class PrivateAddress(Exception):
+    """Имя ведёт на частный адрес: это решение политики (403), а не сбой канала."""
+
+    def __init__(self, resolved):
+        super().__init__("private address")
+        self.resolved = resolved
+
+
+class OpenFailed(OSError):
+    """Не удалось открыть соединение: причина для журнала, текст для клиента и вышестоящий канал (если был)."""
+
+    def __init__(self, reason, text, via=None):
+        super().__init__(reason)
+        self.reason, self.text, self.via = reason, text, via
+
+
 class Proxy:
     def __init__(self, log_path, allow, allow_private, upstream=None, dns=None, direct=None,
-                 idle=IDLE_TIMEOUT, hedge=HEDGE_DELAY, max_hedges=MAX_HEDGES, max_setups=MAX_SETUPS):
+                 idle=IDLE_TIMEOUT, hedge=HEDGE_DELAY, max_hedges=MAX_HEDGES, max_setups=MAX_SETUPS, chain=None):
         self.log_path = log_path
         self.setups = asyncio.Semaphore(max_setups)   # одновременные установки туннеля к вышестоящему прокси
         self.max_hedges = max_hedges
@@ -1015,13 +1452,17 @@ class Proxy:
         self.allow = [a.lower().rstrip(".") for a in allow]
         self.allow_private = allow_private
         self.upstream = upstream
+        # каналы выхода по порядку; без явной цепочки это один вышестоящий прокси (или прямой выход, если его нет)
+        self.chain = chain if chain is not None else Chain(
+            [Channel("proxy", "proxy", upstream)] if upstream is not None else [])
+        self.tasks = []
         # сайты, к которым прокси подключается сам, минуя вышестоящий прокси (некоторые сайты не пускают его адрес)
         self.direct = [a.lower().rstrip(".") for a in (direct or [])]
         self.dns = list(dns or [])
         self.ids = itertools.count(1)
         self.run_id = os.urandom(3).hex()   # у каждого запуска свои номера соединений
         # прокси на этом же компьютере или в локальной сети разрешает имена у себя: проверяем и здесь
-        self.check_local = bool(upstream is not None and is_private_name(upstream.host))
+        self.check_local = any(c.kind == "proxy" and is_private_name(c.upstream.host) for c in self.chain.channels)
         self.resolver = Resolver(self.dns)
         # проверка «имя не ведёт на частный адрес» не должна задерживать соединения, если локальный DNS
         # не отвечает (сам вышестоящий прокси разрешит имя по-своему): короткий тайм-аут и долгая память об отказе
@@ -1060,8 +1501,8 @@ class Proxy:
         return not self.allow or host_matches(self.allow, host) or host_matches(self.direct, host)
 
     def via_upstream(self, host):
-        """Идёт ли соединение с хостом через вышестоящий прокси (сайты из списка «напрямую» идут мимо него)."""
-        return self.upstream is not None and not host_matches(self.direct, host)
+        """Идёт ли соединение с хостом через цепочку каналов (сайты из списка «напрямую» идут мимо неё)."""
+        return bool(self.chain) and not host_matches(self.direct, host)
 
     @staticmethod
     async def reply(writer, code, text):
@@ -1074,10 +1515,10 @@ class Proxy:
         except (ConnectionError, OSError):
             pass
 
-    async def hedged_tunnel(self, host, port):
-        """Туннель через вышестоящий прокси. Если первая попытка не готова за `hedge` секунд, стартует вторая;
+    async def hedged_tunnel(self, up, host, port):
+        """Туннель через вышестоящий прокси `up`. Если первая попытка не готова за `hedge` секунд, стартует вторая;
         берётся первая удавшаяся, остальные закрываются. Ошибка — только если не удалась ни одна."""
-        first = asyncio.ensure_future(self.upstream.tunnel(host, port))
+        first = asyncio.ensure_future(up.tunnel(host, port))
         done, _ = await asyncio.wait({first}, timeout=self.hedge)
         if done:
             return first.result()
@@ -1085,7 +1526,7 @@ class Proxy:
             return await first          # прокси и так перегружен: вторую попытку не добавляем
         self.hedging += 1
         self.write({"event": "hedge", "host": host, "port": port, "reason": "upstream-slow"})
-        pending = {first, asyncio.ensure_future(self.upstream.tunnel(host, port))}
+        pending = {first, asyncio.ensure_future(up.tunnel(host, port))}
         winner, error = None, None
         try:
             while pending and winner is None:
@@ -1173,6 +1614,106 @@ class Proxy:
         self.write({**rec, "event": "deny" if code == 403 else "error", "reason": reason, **extra})
         await self.reply(writer, code, f"{text}: {rec.get('host', '?')}")
 
+    async def open_direct(self, host, port):
+        """Соединение напрямую (с этого компьютера): имя разрешается у нас, адрес проверяется на частный."""
+        try:
+            addrs = await self.resolver.resolve(host)
+        except (OSError, asyncio.TimeoutError) as e:
+            raise OpenFailed(f"dns: {err_text(e)}", "DNS resolution failed") from None
+        candidates = addrs if self.allow_private else [a for a in addrs if is_public(a)]
+        if not candidates:
+            raise PrivateAddress(addrs)
+        try:  # подключаемся к уже проверенному IP (без повторного DNS), адреса пробуются «наперегонки»
+            return await connect_race(candidates, port)
+        except (OSError, asyncio.TimeoutError) as e:
+            raise OpenFailed(f"connect: {err_text(e)}", "Upstream connection failed") from None
+
+    async def channel_upstream(self, ch):
+        """Вышестоящий прокси канала; у VPN сначала дожидаемся запуска клиента."""
+        if ch.ready is not None and not ch.ready.is_set():
+            await asyncio.wait_for(ch.ready.wait(), START_TIMEOUT + 5)
+        if ch.upstream is None:
+            raise OSError(ch.error or "VPN-клиент не запущен")
+        return ch.upstream
+
+    async def open_channel(self, ch, host, port, method, rec):
+        """Соединение с host:port через канал ch -> (читатель, писатель, туннель?, Upstream, IP)."""
+        if ch.kind == "direct":
+            ip, ur, uw = await self.open_direct(host, port)
+            return ur, uw, True, None, ip
+        up = await self.channel_upstream(ch)
+        if method == "CONNECT" or up.kind == "socks5":
+            queued = time.monotonic()
+            async with self.setups:
+                waited = time.monotonic() - queued
+                ur, uw = await self.hedged_tunnel(up, host, port)
+            if waited > 0.2:
+                rec["wait_ms"] = int(waited * 1000)   # всплеск соединений: ждали своей очереди
+            return ur, uw, True, up, None
+        ur, uw = await up.open()      # обычный HTTP: запрос в абсолютной форме самому прокси
+        return ur, uw, False, up, None
+
+    async def open_chain(self, host, port, method, rec):
+        """Первый отозвавшийся канал цепочки. Упавшие пропускаются; смена канала пишется в журнал."""
+        errors = []
+        for ch in self.chain.order():
+            try:
+                ur, uw, tunnel, up, ip = await self.open_channel(ch, host, port, method, rec)
+            except PrivateAddress:
+                raise
+            except (OSError, asyncio.TimeoutError) as e:
+                why = e.reason if isinstance(e, OpenFailed) else f"upstream: {err_text(e)}"
+                if self.chain.failed(ch, why):
+                    nxt = next((c for c in self.chain.order() if c is not ch), None)
+                    self.write({"event": "channel", "state": "down", "channel": ch.label, "reason": why,
+                                **({"next": nxt.label} if nxt else {})})
+                errors.append((ch, why, e))
+                continue
+            if self.chain.worked(ch):
+                self.write({"event": "channel", "state": "up", "channel": ch.label})
+            return ur, uw, tunnel, up, ip, ch
+        ch, why, e = errors[-1]
+        if len(errors) > 1:
+            why = "chain: " + "; ".join(f"{c.label}: {w}" for c, w, _ in errors)
+        text = e.text if isinstance(e, OpenFailed) else "Upstream proxy failed"
+        via = ch.upstream.label if ch.upstream is not None and ch.kind == "proxy" else None
+        raise OpenFailed(why, text, via)
+
+    async def start_client(self, ch):
+        try:
+            await ch.client.start()
+            ch.upstream = ch.client.upstream
+            self.write({"event": "channel", "state": "started", "channel": ch.label})
+        except OSError as e:
+            ch.broken, ch.error = True, err_text(e)
+            self.write({"event": "channel", "state": "broken", "channel": ch.label, "reason": ch.error})
+        finally:
+            ch.ready.set()
+
+    async def probe_loop(self):
+        """Упавшие каналы проверяются в фоне: как только отвечают, новые соединения возвращаются на них."""
+        while True:
+            await asyncio.sleep(PROBE_EVERY)
+            for ch in self.chain.channels:
+                if ch.down and not ch.broken and await probe(ch) and self.chain.worked(ch):
+                    self.write({"event": "channel", "state": "up", "channel": ch.label})
+
+    def begin(self):
+        """Запустить VPN-клиенты и фоновую проверку каналов (вызывается внутри работающего цикла событий)."""
+        for ch in self.chain.channels:
+            if ch.kind == "vpn":
+                ch.ready = asyncio.Event()
+                self.tasks.append(asyncio.ensure_future(self.start_client(ch)))
+        if len(self.chain.channels) > 1:
+            self.tasks.append(asyncio.ensure_future(self.probe_loop()))
+
+    def end(self):
+        for t in self.tasks:
+            t.cancel()
+        for ch in self.chain.channels:
+            if ch.client is not None:
+                ch.client.stop()
+
     async def handle(self, reader, writer):
         cid = next(self.ids)
         t0 = time.monotonic()
@@ -1225,7 +1766,7 @@ class Proxy:
                 await self.deny(writer, rec, 403, "not-in-allowlist", "Forbidden by envbox allowlist")
                 return
 
-            tunnel = True
+            tunnel, used = True, None     # used — Upstream, через который идёт соединение (нужен для обычного HTTP)
             if self.via_upstream(host):
                 if not self.allow_private and is_private_name(host):
                     await self.deny(writer, rec, 403, "private-address", "Private address forbidden by envbox")
@@ -1241,40 +1782,32 @@ class Proxy:
                                         "Private address forbidden by envbox", resolved=local)
                         return
                 try:
-                    if method == "CONNECT" or self.upstream.kind == "socks5":
-                        queued = time.monotonic()
-                        async with self.setups:
-                            waited = time.monotonic() - queued
-                            ur, upstream = await self.hedged_tunnel(host, port)
-                        if waited > 0.2:
-                            rec["wait_ms"] = int(waited * 1000)   # всплеск соединений: ждали своей очереди
-                    else:
-                        tunnel = False  # обычный HTTP: запрос в абсолютной форме самому прокси
-                        ur, upstream = await self.upstream.open()
-                except (OSError, asyncio.TimeoutError) as e:
-                    await self.deny(writer, rec, 502, f"upstream: {err_text(e)}",
-                                    "Upstream proxy failed", via=self.upstream.label)
+                    ur, upstream, tunnel, used, ip, chan = await self.open_chain(host, port, method, rec)
+                except PrivateAddress as e:
+                    await self.deny(writer, rec, 403, "private-address",
+                                    "Private address forbidden by envbox", resolved=e.resolved)
                     return
-                rec["via"] = self.upstream.label
+                except OpenFailed as e:
+                    await self.deny(writer, rec, 502, e.reason, e.text, **({"via": e.via} if e.via else {}))
+                    return
+                if chan.kind == "direct":
+                    rec["ip"], rec["direct"] = ip, True    # выход этого компьютера (или его системного VPN)
+                else:
+                    rec["via"] = chan.label
+                if len(self.chain.channels) > 1:
+                    rec["chan"] = chan.label
             else:
                 try:
-                    addrs = await self.resolver.resolve(host)
-                except (OSError, asyncio.TimeoutError) as e:
-                    await self.deny(writer, rec, 502, f"dns: {err_text(e)}", "DNS resolution failed")
-                    return
-                candidates = addrs if self.allow_private else [a for a in addrs if is_public(a)]
-                if not candidates:
+                    ip, ur, upstream = await self.open_direct(host, port)
+                except PrivateAddress as e:
                     await self.deny(writer, rec, 403, "private-address",
-                                    "Private address forbidden by envbox", resolved=addrs)
+                                    "Private address forbidden by envbox", resolved=e.resolved)
                     return
-                try:  # подключаемся к уже проверенному IP (без повторного DNS), адреса пробуются «наперегонки»
-                    ip, ur, upstream = await connect_race(candidates, port)
-                except (OSError, asyncio.TimeoutError) as e:
-                    await self.deny(writer, rec, 502, f"connect: {err_text(e)}",
-                                    "Upstream connection failed")
+                except OpenFailed as e:
+                    await self.deny(writer, rec, 502, e.reason, e.text)
                     return
                 rec["ip"] = ip
-                if self.upstream is not None:
+                if self.chain:
                     rec["direct"] = True   # из списка «напрямую»: мимо вышестоящего прокси
 
             self.write({**rec, "event": "open"})
@@ -1292,8 +1825,8 @@ class Proxy:
                 target_line = path
                 if not tunnel:
                     target_line = rec["url"]
-                    if self.upstream.auth:
-                        headers.append(f"Proxy-Authorization: {self.upstream.basic()}")
+                    if used is not None and used.auth:
+                        headers.append(f"Proxy-Authorization: {used.basic()}")
                 req = f"{method} {target_line} HTTP/1.1\r\n" + "".join(h + "\r\n" for h in headers)
                 first = (req + ("" if websocket else "Connection: close\r\n") + "\r\n").encode("latin-1")
             up, down, end, timing = await self.pipe(reader, writer, ur, upstream, first)
@@ -1311,6 +1844,29 @@ class Proxy:
                         pass
 
 
+def build_chain(specs, upstream, log_dir):
+    """Цепочка каналов из --chain: proxy (это --upstream), direct, vpn:<вид>:<путь к конфигурации>."""
+    channels = []
+    for i, spec in enumerate(specs):
+        try:
+            kind, vkind, path = parse_chain_spec(spec)
+        except ValueError as e:
+            sys.exit(f"envbox-net: {e}")
+        if kind == "proxy":
+            if upstream is None:
+                sys.exit("envbox-net: в --chain есть proxy, но не задан --upstream")
+            channels.append(Channel("proxy", "proxy", upstream))
+        elif kind == "direct":
+            channels.append(Channel("direct", "direct"))
+        else:
+            stem = os.path.splitext(os.path.basename(path))[0]
+            channels.append(Channel(f"vpn:{stem}", "vpn",
+                                    client=VpnClient(vkind, path, os.path.join(log_dir, f"vpn-{i}.log"))))
+    if upstream is not None and not any(c.kind == "proxy" for c in channels):
+        sys.exit("envbox-net: задан --upstream, но в --chain нет proxy: прокси не будет использован")
+    return Chain(channels)
+
+
 def cmd_proxy(a):
     signal.signal(signal.SIGINT, signal.SIG_IGN)  # Ctrl+C в терминале не должен терять журнал
     auth = os.environ.pop("ENVBOX_UPSTREAM_AUTH", None)
@@ -1325,7 +1881,8 @@ def cmd_proxy(a):
             ipaddress.ip_address(d)
         except ValueError:
             sys.exit(f"envbox-net: недопустимый DNS-сервер: {d}")
-    proxy = Proxy(a.log, a.allow, a.allow_private, upstream, a.dns, a.direct)
+    chain = build_chain(a.chain, upstream, os.path.dirname(os.path.abspath(a.log))) if a.chain else None
+    proxy = Proxy(a.log, a.allow, a.allow_private, upstream, a.dns, a.direct, chain=chain)
 
     async def main():
         if os.path.lexists(a.socket):
@@ -1338,6 +1895,7 @@ def cmd_proxy(a):
         proxy.write({"event": "proxy-start", "allow": proxy.allow or ["*"],
                      "allow_private": proxy.allow_private,
                      "upstream": upstream.label if upstream else None,
+                     "chain": proxy.chain.describe() if chain is not None else None,
                      "dns": proxy.dns or None, "direct": proxy.direct or None})
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -1351,8 +1909,10 @@ def cmd_proxy(a):
                 await asyncio.sleep(1)
 
         watcher = asyncio.ensure_future(watch_parent())
+        proxy.begin()
         await stop.wait()
         watcher.cancel()
+        proxy.end()
         server.close()
         proxy.write({"event": "proxy-stop"})
 
@@ -1394,11 +1954,18 @@ def _fmt_event(e):
     if ev in ("proxy-start", "proxy-stop"):
         extra = f" разрешено: {', '.join(map(str, e.get('allow', [])))}" if ev == "proxy-start" else ""
         return f"{e.get('ts', '')}  --- {ev}{extra}"
+    if ev == "channel":
+        state = {"down": "ОТКАЗАЛ", "up": "СНОВА РАБОТАЕТ", "started": "ЗАПУЩЕН", "broken": "НЕ ЗАПУСТИЛСЯ"}.get(
+            e.get("state"), e.get("state", "?"))
+        tail = (f"  {e['reason']}" if e.get("reason") else "") + (f"  дальше: {e['next']}" if e.get("next") else "")
+        return f"{e.get('ts', '')}  КАНАЛ    {e.get('channel', '?')} {state}{tail}"
     target = f"{e.get('host', '?')}:{e.get('port', '?')}"
     label = {"open": "ОТКРЫТО", "close": "ЗАКРЫТО", "deny": "ЗАПРЕТ", "error": "ОШИБКА"}.get(ev, ev)
     tail = ""
     if ev == "open":
         tail = f" ({e.get('ip') or 'через ' + str(e.get('via', '?'))}{', напрямую' if e.get('direct') else ''})"
+        if e.get("chan"):
+            tail += f" [канал: {e['chan']}]"
         if e.get("url"):
             tail += f" {e.get('method', '')} {e['url']}"
     elif ev == "close":
@@ -1519,7 +2086,7 @@ def cmd_seccomp(a):
 # Вид: команда -> {параметр: вид}, где вид: str, int, list (повторяемый) или flag.
 NET_OPTIONS = {
     "proxy": {"--socket": "str", "--log": "str", "--allow": "list", "--allow-private": "flag",
-              "--parent-pid": "int", "--upstream": "str", "--dns": "list", "--direct": "list"},
+              "--parent-pid": "int", "--upstream": "str", "--dns": "list", "--direct": "list", "--chain": "list"},
     "wrap": {"--map": "list", "--serve": "list", "--inbox": "str", "--inbox-cmd": "str",
              "--inbox-scheme": "list", "--inbox-callback": "flag"},
     "seccomp": {"--allow": "list"},
@@ -1713,6 +2280,12 @@ usage() {
                           Логин:пароль — только через переменную окружения
                           ENVBOX_UPSTREAM_AUTH=логин:пароль (в argv они были бы видны в ps).
                           Имена хостов тогда разрешает вышестоящий прокси, а не этот компьютер
+  --chain <канал>         канал выхода по порядку (включает --net-log; повторяемый). Первый рабочий
+                          получает все новые соединения, при его отказе берётся следующий, упавший
+                          проверяется в фоне и при возвращении снова становится первым. Каналы:
+                          proxy (это --upstream), direct (выход этого компьютера, в том числе его
+                          системный VPN), vpn:<wireguard|xray|singbox>:/путь/к/конфигурации (клиент
+                          запускается и останавливается вместе со средой, без root)
   --direct-domain <домен> с --upstream: подключаться к этому сайту напрямую, мимо вышестоящего
                           прокси (сайт видит ваш настоящий адрес, а не адрес прокси). Среда по-прежнему
                           выходит только через прокси envbox. Формат как у --allow-domain; в режиме
@@ -1822,6 +2395,8 @@ net_allow_private=0
 net_report=0
 report_mode=""
 upstream=""
+chain_specs=()
+chain_remote=0
 iso_seccomp=1 iso_pid=1 iso_ipc=1 iso_uts=1 iso_cgroup=1 iso_session=1 iso_die_parent=1
 iso_caps=1 iso_ro_root=1 iso_clean_env=1 iso_neutral_dns=1 iso_net_forced=1 iso_home_real=0
 host_files=""
@@ -1880,6 +2455,7 @@ while (( $# )); do
     --net-allow-private) net_allow_private=1; shift ;;
     --direct-domain)  need_arg "$1" $#; direct_domains+=("$2"); shift 2 ;;
     --upstream)      need_arg "$1" $#; upstream=$2; net_log=1; shift 2 ;;
+    --chain)         need_arg "$1" $#; chain_specs+=("$2"); net_log=1; shift 2 ;;
     --iso)            need_arg "$1" $#; set_iso "$2"; shift 2 ;;
     --relaxed)        iso_seccomp=0; iso_neutral_dns=0; iso_net_forced=0; shift ;;
     --host-files)     need_arg "$1" $#; host_files=$2; shift 2 ;;
@@ -2037,13 +2613,33 @@ if [[ -n "$upstream" ]]; then
   [[ "$upstream" =~ $upstream_re ]] \
     || die "недопустимый --upstream '$upstream': нужен http://хост:порт, socks5://хост:порт или socks5h://хост:порт"
 fi
+chain_has_proxy=0
+if (( ${#chain_specs[@]} )); then
+  for c in "${chain_specs[@]}"; do
+    case "$c" in
+      proxy)
+        [[ -n "$upstream" ]] || die "--chain proxy требует --upstream"
+        chain_has_proxy=1; chain_remote=1 ;;
+      direct) ;;
+      vpn:wireguard:/*|vpn:xray:/*|vpn:singbox:/*)
+        [[ "$c" =~ ^vpn:(wireguard|xray|singbox):/[^[:cntrl:]]+$ ]] || die "недопустимый --chain '$c': в пути управляющие символы"
+        [[ -f "${c#vpn:*:}" ]] || die "--chain: нет файла конфигурации VPN: ${c#vpn:*:}"
+        chain_remote=1 ;;
+      *) die "недопустимый --chain '$c': нужен proxy, direct или vpn:<wireguard|xray|singbox>:/путь" ;;
+    esac
+  done
+  if [[ -n "$upstream" ]] && (( ! chain_has_proxy )); then
+    die "задан --upstream, но в --chain нет proxy: прокси не будет использован"
+  fi
+fi
+(( chain_remote )) || [[ -z "$upstream" ]] || chain_remote=1
 if (( ${#direct_domains[@]} )); then
   for d in "${direct_domains[@]}"; do
     [[ "$d" =~ ^(\*\.)?[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$ ]] \
       || die "недопустимый домен для --direct-domain: '$d'"
   done
-  if [[ -z "$upstream" ]]; then
-    warn "--direct-domain имеет смысл только вместе с --upstream (без него все соединения и так идут напрямую) — игнорирую"
+  if (( ! chain_remote )); then
+    warn "--direct-domain имеет смысл только вместе с --upstream или VPN в --chain (без них все соединения и так идут напрямую) — игнорирую"
     direct_domains=()
   fi
 fi
@@ -2096,7 +2692,7 @@ if (( ${#dns_servers[@]} )); then
     valid_ip "$d" || die "недопустимый DNS-сервер '$d': нужен IP-адрес"
   done
   (( net )) || die "--dns не имеет смысла с --no-net: сети нет"
-  [[ -z "$upstream" ]] || die "--dns несовместим с --upstream: имена разрешает вышестоящий прокси"
+  (( ! chain_remote )) || die "--dns несовместим с --upstream и VPN: имена разрешает вышестоящий канал"
 fi
 
 box_dir="$envbox_root/$name"
@@ -2364,6 +2960,7 @@ if (( net_log )); then
     for d in "${allow_domains[@]}"; do proxy_args+=(--allow "$d"); done
     (( net_allow_private )) && proxy_args+=(--allow-private)
     [[ -z "$upstream" ]] || proxy_args+=(--upstream "$upstream")
+    for c in "${chain_specs[@]}"; do proxy_args+=(--chain "$c"); done
     for d in "${direct_domains[@]}"; do proxy_args+=(--direct "$d"); done
     for d in "${dns_servers[@]}"; do proxy_args+=(--dns "$d"); done
     rm -f -- "$sock"
@@ -2957,6 +3554,16 @@ done
 
 via=""
 [[ -z "$upstream" ]] || via=", вышестоящий прокси: $upstream"
+if (( ${#chain_specs[@]} )); then
+  chain_names=()
+  for c in "${chain_specs[@]}"; do
+    case "$c" in
+      vpn:*) b=$(basename -- "${c#vpn:*:}"); chain_names+=("vpn:${b%.*}") ;;
+      *) chain_names+=("$c") ;;
+    esac
+  done
+  via="$via, каналы по порядку: ${chain_names[*]}"
+fi
 if (( ${#allow_domains[@]} )); then
   info "сеть: только через прокси, разрешены: ${allow_domains[*]}$via; журнал: $net_log_file"
 else
@@ -5022,6 +5629,140 @@ def probe_upstream(url, auth="", target="example.com:443"):
     return r.returncode == 0, (r.stdout + r.stderr).strip()
 
 
+# ---- core/vpn.py: Хранилище VPN-конфигураций: импорт, список, удаление и проверка наличия клиента.
+
+VPN_DIR = "_vpn"
+
+
+VPN_EXT = {"wireguard": ".conf", "xray": ".xray", "singbox": ".singbox"}
+
+
+VPN_MAX_BYTES = 256 * 1024
+
+
+def vpn_dir():
+    return os.path.join(envbox_root(), VPN_DIR)
+
+
+def vpn_path(name, kind):
+    return os.path.join(vpn_dir(), name + VPN_EXT[kind])
+
+
+def vpn_name_from_file(filename):
+    """Подходящее имя VPN из имени файла (wg0.conf -> wg0)."""
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    stem = "".join(c if c.isalnum() and c.isascii() or c in "._-" else "-" for c in stem).strip("-._")
+    return stem[:48] or "vpn"
+
+
+def list_vpns():
+    """Сохранённые VPN: [{name, kind, label, path, server, error, binary}] по имени."""
+    out = []
+    try:
+        names = sorted(os.listdir(vpn_dir()))
+    except OSError:
+        return out
+    by_ext = {ext: kind for kind, ext in VPN_EXT.items()}
+    for fname in names:
+        stem, ext = os.path.splitext(fname)
+        kind = by_ext.get(ext)
+        path = os.path.join(vpn_dir(), fname)
+        if kind is None or not NAME_RE.match(stem) or not os.path.isfile(path) or os.path.islink(path):
+            continue
+        server, error = "", ""
+        try:
+            with open(path, encoding="utf-8") as f:
+                server = vpn_validate(kind, f.read(VPN_MAX_BYTES + 1))
+        except (OSError, ValueError) as e:
+            error = str(e)
+        out.append({"name": stem, "kind": kind, "label": VPN_LABELS[kind], "path": path, "server": server,
+                    "error": error, "binary": find_binary(kind) or ""})
+    return out
+
+
+def vpn_source(name):
+    """(вид, путь) сохранённого VPN или ValueError."""
+    for v in list_vpns():
+        if v["name"] == name:
+            return v["kind"], v["path"]
+    raise ValueError(f"VPN «{name}» не найден: добавьте его на вкладке «VPN»")
+
+
+def import_vpn(name, text, replace=False):
+    """Проверить и сохранить конфигурацию. Возвращает (имя, вид, описание сервера). ValueError — понятный текст."""
+    name = (name or "").strip()
+    if not NAME_RE.match(name):
+        raise ValueError("имя VPN: латинские буквы, цифры, точка, дефис и подчёркивание, до 48 знаков")
+    text = (text or "").replace("\r\n", "\n").strip()
+    if len(text.encode("utf-8")) > VPN_MAX_BYTES:
+        raise ValueError("конфигурация слишком большая (больше 256 КБ)")
+    kind = detect_kind(text)
+    server = vpn_validate(kind, text)
+    existing = [v for v in list_vpns() if v["name"] == name]
+    if existing and not replace:
+        raise ValueError(f"VPN «{name}» уже есть: выберите другое имя или замените")
+    os.makedirs(vpn_dir(), mode=0o700, exist_ok=True)
+    path = vpn_path(name, kind)
+    tmp = path + ".new"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)   # ключи: сразу только владельцу
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text + "\n")
+    os.replace(tmp, path)
+    for v in existing:
+        if v["path"] != path:
+            os.unlink(v["path"])    # заменили конфигурацию другого вида под тем же именем
+    return name, kind, server
+
+
+def delete_vpn(name):
+    for v in list_vpns():
+        if v["name"] == name:
+            os.unlink(v["path"])
+            return True
+    return False
+
+
+def vpn_binary_problem(kind):
+    """Пустая строка, если программа клиента есть; иначе подсказка, что установить."""
+    if kind not in VPN_KINDS:
+        return f"неизвестный вид VPN: {kind}"
+    if find_binary(kind):
+        return ""
+    return f"не найдена программа {VPN_BINARIES[kind]}: {VPN_HINTS[kind]}"
+
+
+def test_vpn(name, target=("example.com", 443)):
+    """Запустить клиент VPN, открыть через него туннель до target и остановить клиент -> (получилось, текст)."""
+    import asyncio
+    import time
+    try:
+        kind, path = vpn_source(name)
+    except ValueError as e:
+        return False, str(e)
+    problem = vpn_binary_problem(kind)
+    if problem:
+        return False, problem
+    log = os.path.join(vpn_dir(), name + ".test.log")
+
+    async def run():
+        client = VpnClient(kind, path, log)
+        try:
+            t0 = time.monotonic()
+            await client.start()
+            started = time.monotonic() - t0
+            t1 = time.monotonic()
+            _r, w = await asyncio.wait_for(client.upstream.tunnel(*target), 15)
+            w.close()
+            return True, (f"VPN «{name}» работает: клиент запущен за {started:.1f} с, туннель до {target[0]} "
+                          f"открыт за {int((time.monotonic() - t1) * 1000)} мс")
+        except (OSError, asyncio.TimeoutError) as e:
+            return False, f"VPN «{name}» не работает: {e or type(e).__name__}. Журнал клиента: {log}"
+        finally:
+            client.stop()
+
+    return asyncio.run(run())
+
+
 # ---- core/profile.py: Профиль среды (dataclass Profile) и его проверка.
 
 @dataclass
@@ -5046,6 +5787,9 @@ class Profile:
     kind: str = "app"
     upstream: str = ""
     upstream_auth: bool = False
+    # Каналы выхода по порядку: «proxy» (поле upstream), «vpn:<имя>» (вкладка VPN), «direct» (выход этого компьютера,
+    # в том числе через его системный VPN). Пусто — как раньше: один прокси или прямой выход.
+    upstream_chain: list = field(default_factory=list)
     attach: list = field(default_factory=list)
     browser_bin: str = ""
     browser_start_url: str = "about:blank"
@@ -5203,7 +5947,33 @@ class Profile:
 
     def wrapper_secrets(self):
         """Переменные, которые обёртка достаёт из keyring для envbox.sh (не все уходят в среду)."""
-        return list(self.secrets) + ([UPSTREAM_AUTH_VAR] if self.upstream_auth and self.upstream else [])
+        return list(self.secrets) + ([UPSTREAM_AUTH_VAR] if self.upstream_auth and self.uses_proxy else [])
+
+    @property
+    def chain_on(self):
+        """Цепочка каналов действует (задана и сеть идёт через прокси envbox)."""
+        return bool(self.upstream_chain) and self.net in ("log", "allowlist")
+
+    @property
+    def uses_proxy(self):
+        """Свой прокси участвует в выходе: задан и не исключён из цепочки."""
+        return bool(self.upstream) and (not self.chain_on or "proxy" in self.upstream_chain)
+
+    @property
+    def has_remote(self):
+        """Есть канал, за которым имена разрешает не этот компьютер (прокси или VPN)."""
+        return self.uses_proxy or (self.chain_on and any(c.startswith("vpn:") for c in self.upstream_chain))
+
+    def chain_specs(self):
+        """Каналы для шлюза: proxy, direct, vpn:<вид>:<путь>. ValueError, если VPN не найден."""
+        out = []
+        for item in self.upstream_chain:
+            if item.startswith("vpn:"):
+                kind, path = vpn_source(item[4:])
+                out.append(f"vpn:{kind}:{path}")
+            else:
+                out.append(item)
+        return out
 
     def validate(self):
         """Список ошибок на русском; пустой список — профиль готов к запуску."""
@@ -5275,8 +6045,8 @@ class Profile:
         if self.dns:
             if self.net == "off":
                 err.append("DNS не нужен без сети: уберите серверы или включите сеть")
-            elif self.upstream and self.net in ("log", "allowlist"):
-                err.append("DNS-серверы несовместимы с вышестоящим прокси: имена разрешает он")
+            elif self.has_remote and self.net in ("log", "allowlist"):
+                err.append("DNS-серверы несовместимы с вышестоящим прокси и VPN: имена разрешает он")
         if self.upstream:
             try:
                 split_proxy_url(self.upstream, allow_auth=False)
@@ -5284,6 +6054,26 @@ class Profile:
                 err.append(f"прокси: {e}")
             if self.net not in ("log", "allowlist"):
                 err.append("вышестоящий прокси работает только в режимах сети «через журнал»")
+        if self.upstream_chain:
+            if self.net not in ("log", "allowlist"):
+                err.append("цепочка выхода работает только в режимах сети «через журнал»")
+            seen = set()
+            for item in self.upstream_chain:
+                if item in seen:
+                    err.append(f"цепочка выхода: «{item}» указан дважды")
+                seen.add(item)
+                if item == "proxy":
+                    if not self.upstream:
+                        err.append("цепочка выхода: есть «proxy», но свой прокси не задан")
+                elif item == "direct":
+                    pass
+                elif item.startswith("vpn:"):
+                    try:
+                        vpn_source(item[4:])
+                    except ValueError as e:
+                        err.append(f"цепочка выхода: {e}")
+                else:
+                    err.append(f"цепочка выхода: неизвестный канал '{item}' (proxy, direct или vpn:имя)")
         for spec in self.attach:
             m = ATTACH_RE.match(spec)
             if not m:
@@ -5379,8 +6169,12 @@ class Profile:
         elif self.net == "allowlist":
             for d in self.allow_domains:
                 a += ["--allow-domain", d]
-        if self.upstream and self.net in ("log", "allowlist"):
+        if self.uses_proxy and self.net in ("log", "allowlist"):
             a += ["--upstream", self.upstream]
+        if self.chain_on:
+            for spec in self.chain_specs():
+                a += ["--chain", spec]
+        if self.has_remote and self.net in ("log", "allowlist"):
             for d in self.direct_domains:
                 a += ["--direct-domain", d]
         if self.lang:
@@ -6513,10 +7307,18 @@ def describe(p):
     else:
         out.append(("warn", "Сеть общая с компьютером: доступны все сервисы на localhost "
                             "(базы данных, отладочные порты). Для ИИ этот режим не подходит."))
-    if p.dns and p.net != "off" and not (p.upstream and p.net in ("log", "allowlist")):
+    if p.dns and p.net != "off" and not (p.has_remote and p.net in ("log", "allowlist")):
         out.append(("info", "Имена сайтов разрешают DNS-серверы " + ", ".join(p.dns)
                     + ": запросы идут по сети без шифрования, их видит сеть и владелец сервера."))
-    if p.upstream and p.net in ("log", "allowlist"):
+    if p.chain_on:
+        names = {"proxy": f"ваш прокси {p.upstream}", "direct": "выход этого компьютера (в том числе его системный VPN)"}
+        out.append(("info", "Каналы выхода по порядку: " + " → ".join(
+            names.get(c) or f"VPN «{c[4:]}»" for c in p.upstream_chain) +
+            ". Первый рабочий получает новые соединения, при его отказе берётся следующий; когда он вернётся, "
+            "соединения снова идут через него. Уже открытые соединения при отказе канала обрываются."))
+        if p.has_remote:
+            out.append(("info", "Имена сайтов разрешает прокси или VPN, а не этот компьютер."))
+    elif p.upstream and p.net in ("log", "allowlist"):
         who = "логином и паролем из keyring" if p.upstream_auth else "без логина"
         out.append(("info", f"Дальше трафик идёт через ваш прокси {p.upstream} ({who}); "
                             "имена сайтов разрешает он."))
@@ -9152,6 +9954,8 @@ def _build_gui():
             self.tail = LogTail(net_log_path(p.name))
             mode = NET_LABELS[p.net]
             via = f", через {p.upstream}" if p.upstream and p.net in ("log", "allowlist") else ""
+            if p.chain_on:
+                via = ", каналы по порядку: " + " → ".join(p.upstream_chain)
             if p.net in ("log", "allowlist"):
                 self.lbl_net.set_text(f"Режим сети: {mode}{via}. Журнал: {to_home(net_log_path(p.name))}")
             else:
@@ -9563,6 +10367,29 @@ def _build_gui():
                    "В формате логин:пароль. Они хранятся в системном keyring, не в профиле и не в командной "
                    "строке. Пустое значение удаляет сохранённые данные.", got, secret=True)
 
+        # ---- порядок выхода (прокси, VPN, выход компьютера)
+
+        def refresh_vpn_choices(self):
+            """Список VPN в выпадающем списке «+ VPN» (после загрузки или удаления VPN)."""
+            if not hasattr(self, "dd_vpns"):
+                return
+            names = [v["name"] for v in list_vpns()]
+            self.dd_vpns.set_model(Gtk.StringList.new(["—"] + names))
+
+        def on_chain_add(self, item):
+            lines = get_lines(self.tv_chain)
+            if item not in lines:
+                lines.append(item)
+            set_text(self.tv_chain, "\n".join(lines))
+
+        def on_chain_add_vpn(self, *_):
+            chosen = self.dd_vpns.get_selected_item()
+            name = chosen.get_string() if chosen is not None else "—"
+            if name == "—":
+                alert(self, "Нет VPN", "Сначала загрузите VPN на вкладке «VPN», затем выберите его в списке.")
+                return
+            self.on_chain_add(f"vpn:{name}")
+
         # ---- браузер для ИИ
 
         def on_attach_add(self, *_):
@@ -9772,6 +10599,28 @@ def _build_gui():
             rows.grid.attach(self.lbl_up, 1, rows.r, 1, 1)
             rows.r += 1
             self.e_upstream.connect("changed", lambda *_: self.update_net_sensitivity())
+            # порядок выхода: прокси, VPN, выход этого компьютера; первый рабочий принимает новые соединения
+            self.tv_chain, sw = text_area(height=56)
+            chain_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            chain_box.append(sw)
+            chain_bar = Gtk.Box(spacing=6)
+            for label, item in (("+ proxy", "proxy"), ("+ direct", "direct")):
+                bt = Gtk.Button(label=label)
+                bt.connect("clicked", lambda _b, i=item: self.on_chain_add(i))
+                chain_bar.append(bt)
+            self.dd_vpns = Gtk.DropDown.new_from_strings(["—"])
+            chain_bar.append(self.dd_vpns)
+            bt = Gtk.Button(label="+ VPN")
+            bt.connect("clicked", self.on_chain_add_vpn)
+            chain_bar.append(bt)
+            chain_box.append(chain_bar)
+            self.up_widgets += rows.add(
+                "Порядок выхода", chain_box,
+                "Необязательно. По одному каналу в строке: proxy (свой прокси выше), vpn:имя (вкладка «VPN»), "
+                "direct (выход этого компьютера, в том числе через его системный VPN). Первый рабочий принимает все "
+                "новые соединения; если он не отвечает, берётся следующий, а когда первый вернётся, соединения снова "
+                "идут через него. Пусто: как раньше, один прокси или прямой выход.")
+            self.tv_chain.get_buffer().connect("changed", lambda *_: self.update_net_sensitivity())
             adv.append(box)
 
 
@@ -9930,7 +10779,9 @@ def _build_gui():
             show_all(self.domain_widgets, mode == "allowlist")
             show_all(self.private_widgets, mode in ("log", "allowlist"))
             show_all(self.up_widgets + [self.lbl_up], mode in ("log", "allowlist"))
-            via_upstream = mode in ("log", "allowlist") and bool(self.e_upstream.get_text().strip())
+            chain_items = get_lines(self.tv_chain) if hasattr(self, "tv_chain") else []
+            via_upstream = mode in ("log", "allowlist") and (
+                bool(self.e_upstream.get_text().strip()) or any(c.startswith("vpn:") for c in chain_items))
             show_all(self.dns_widgets, mode in ("log", "allowlist", "host") and not via_upstream)
             if mode == "host":
                 self.lbl_dns.set_text("Серверы запишутся в /etc/resolv.conf среды.")
@@ -9975,6 +10826,8 @@ def _build_gui():
             set_text(self.tv_domains, "\n".join(p.allow_domains))
             self.cb_private.set_active(p.net_allow_private)
             self.e_upstream.set_text(p.upstream)
+            set_text(self.tv_chain, "\n".join(p.upstream_chain))
+            self.refresh_vpn_choices()
             self.e_lang.set_text(p.lang)
             self.e_tz.set_text(p.timezone)
             set_text(self.tv_dns, "\n".join(p.dns))
@@ -10027,6 +10880,7 @@ def _build_gui():
                 net_allow_private=self.cb_private.get_active(),
                 upstream=self.e_upstream.get_text().strip(),
                 upstream_auth=self.current.upstream_auth,
+                upstream_chain=get_lines(self.tv_chain),
                 attach=get_lines(self.tv_attach),
                 expose_ports=get_text(self.tv_expose).replace(",", " ").split(),
                 install_domains=get_lines(self.tv_install_domains),
@@ -10698,6 +11552,161 @@ def _build_gui():
             GLib.timeout_add(900, self.refresh_sessions_once)
 
 
+    # ---- gui/pages/vpn.py: Вкладка «VPN»: загрузка конфигураций (WireGuard, VLESS/Xray, sing-box), проверка и удаление.
+
+    class VpnPageMixin:
+        """VPN-конфигурации общие для всех сред; в настройках среды они ставятся в «Порядок выхода»."""
+
+        def build_vpn_page(self):
+            box = margins(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10), 16)
+            title = Gtk.Label(label="VPN", xalign=0)
+            title.add_css_class("eb-h2")
+            box.append(title)
+            box.append(hint("Загрузите конфигурацию WireGuard (.conf), ссылку vless://… или JSON для Xray / sing-box. "
+                            "envbox сам запускает VPN-клиент вместе со средой и останавливает его вместе с ней, без root: "
+                            "клиент слушает только 127.0.0.1 с одноразовым паролем, а среда по-прежнему выходит только "
+                            "через прокси envbox. Нужна программа клиента: wireproxy для WireGuard, xray или sing-box "
+                            "для остальных. Затем добавьте VPN в «Порядок выхода» на вкладке «Настройки» среды. "
+                            "Если VPN уже запущен на самом компьютере, используйте в порядке выхода «direct»."))
+            bar = Gtk.Box(spacing=8)
+            for label, handler in (("Загрузить из файла…", self.on_vpn_file), ("Вставить ссылку или текст…", self.on_vpn_paste),
+                                   ("Обновить список", lambda *_: self.refresh_vpn_list())):
+                bt = Gtk.Button(label=label)
+                bt.connect("clicked", handler)
+                bar.append(bt)
+            box.append(bar)
+            self.vpn_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            scroll = Gtk.ScrolledWindow(vexpand=True)
+            scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            scroll.set_child(self.vpn_list)
+            box.append(scroll)
+            box.append(hint("Конфигурации лежат в каталоге данных envbox (папка _vpn, права только владельцу): в них "
+                            "приватные ключи. Сценарии wg-quick (PostUp и подобные) и лишние туннели wireproxy при "
+                            "запуске вырезаются."))
+            self.refresh_vpn_list()
+            return box
+
+        def refresh_vpn_list(self):
+            clear_children(self.vpn_list)
+            vpns = list_vpns()
+            if not vpns:
+                self.vpn_list.append(hint("Пока нет ни одного VPN."))
+            for v in vpns:
+                row = Gtk.Box(spacing=8)
+                text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+                name = Gtk.Label(label=v["name"], xalign=0)
+                name.add_css_class("eb-h2")
+                text.append(name)
+                if v["error"]:
+                    info = f"{v['label']}: конфигурация не читается: {v['error']}"
+                else:
+                    info = f"{v['label']} · {v['server']}"
+                    problem = vpn_binary_problem(v["kind"])
+                    if problem:
+                        info += f"\n⚠ {problem}"
+                text.append(hint(info))
+                row.append(text)
+                check = Gtk.Button(label="Проверить")
+                check.connect("clicked", lambda _b, n=v["name"]: self.on_vpn_test(n))
+                row.append(check)
+                drop = Gtk.Button(label="Удалить")
+                drop.connect("clicked", lambda _b, n=v["name"]: self.on_vpn_delete(n))
+                row.append(drop)
+                card = margins(row, 8)
+                card.add_css_class("frame")
+                self.vpn_list.append(card)
+            if hasattr(self, "refresh_vpn_choices"):
+                self.refresh_vpn_choices()
+
+        # ---- добавление
+
+        def on_vpn_file(self, *_):
+            dlg = Gtk.FileDialog(title="Файл конфигурации VPN")
+
+            def done(d, res):
+                try:
+                    f = d.open_finish(res)
+                except GLib.Error:
+                    return
+                path = f.get_path()
+                try:
+                    with open(path, encoding="utf-8") as fh:
+                        text = fh.read(VPN_MAX_BYTES + 1)
+                except (OSError, UnicodeDecodeError) as e:
+                    alert(self, "Не удалось прочитать файл", str(e))
+                    return
+                prompt(self, "Имя VPN", "Как назвать этот VPN (латиница, цифры, точка, дефис):",
+                       lambda name: self.add_vpn(name, text), initial=vpn_name_from_file(path))
+
+            dlg.open(self, None, done)
+
+        def on_vpn_paste(self, *_):
+            win = Gtk.Window(title="Добавить VPN", transient_for=self, modal=True)
+            win.set_default_size(640, -1)
+            box = margins(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10), 16)
+            box.append(hint("Вставьте ссылку vless://…, конфигурацию WireGuard или JSON Xray / sing-box. Вид "
+                            "определяется сам."))
+            name = Gtk.Entry(hexpand=True, placeholder_text="имя, например vpn1")
+            box.append(name)
+            view, sw = text_area(height=160)
+            box.append(sw)
+            buttons = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+            cancel = Gtk.Button(label="Отмена")
+            ok = Gtk.Button(label="Добавить")
+            ok.add_css_class("suggested-action")
+            buttons.append(cancel)
+            buttons.append(ok)
+            box.append(buttons)
+
+            def go(*_a):
+                text, n = get_text(view), name.get_text().strip()
+                win.destroy()
+                self.add_vpn(n, text)
+
+            cancel.connect("clicked", lambda *_a: win.destroy())
+            ok.connect("clicked", go)
+            win.set_child(box)
+            win.present()
+            name.grab_focus()
+
+        def add_vpn(self, name, text, replace=False):
+            try:
+                name, kind, server = import_vpn(name, text, replace=replace)
+            except ValueError as e:
+                if "уже есть" in str(e) and not replace:
+                    choose(self, f"VPN «{name}» уже есть", "Заменить его новой конфигурацией?", ["Отмена", "Заменить"],
+                           lambda idx: self.add_vpn(name, text, True) if idx == 1 else None)
+                    return
+                alert(self, "Не удалось добавить VPN", str(e))
+                return
+            self.refresh_vpn_list()
+            self.status(f"VPN «{name}» добавлен ({server}). Добавьте его в «Порядок выхода» в настройках среды")
+
+        # ---- проверка и удаление
+
+        def on_vpn_test(self, name):
+            self.status(f"Проверяю VPN «{name}»: запускаю клиент и открываю туннель…")
+
+            def done(res):
+                if isinstance(res, Exception):
+                    alert(self, "Проверка не удалась", str(res))
+                    return
+                ok, msg = res
+                self.status(msg if ok else f"VPN «{name}» не работает")
+                alert(self, "VPN работает" if ok else "VPN не работает", msg)
+
+            self.run_async(lambda: test_vpn(name), done)
+
+        def on_vpn_delete(self, name):
+            def go(idx):
+                if idx == 1:
+                    delete_vpn(name)
+                    self.refresh_vpn_list()
+                    self.status(f"VPN «{name}» удалён. Среды, где он стоял в порядке выхода, не запустятся, пока вы его не уберёте")
+
+            choose(self, f"Удалить VPN «{name}»?", "Конфигурация (с ключами) будет стёрта.", ["Отмена", "Удалить"], go)
+
+
     # ---- gui/window.py: Главное окно: собирается из миксинов страниц (gui/pages/*, gui/browser/*).
 
     class EnvboxWindow(
@@ -10714,6 +11723,7 @@ def _build_gui():
         TerminalMixin,
         SettingsMixin,
         NetPageMixin,
+        VpnPageMixin,
         Gtk.ApplicationWindow,
     ):
         """Главное окно."""
@@ -10784,6 +11794,7 @@ def _build_gui():
             self.page_profile = self.build_profile_page()
             self.nb.append_page(self.page_profile, Gtk.Label(label="Настройки"))
             self.nb.append_page(self.build_isolation_page(), Gtk.Label(label="Изоляция"))
+            self.nb.append_page(self.build_vpn_page(), Gtk.Label(label="VPN"))
             self.nb.append_page(self.build_net_page(), Gtk.Label(label="Журнал сети"))
             self.nb.connect("switch-page", self.on_switch_page)
             self.main_stack = Gtk.Stack()

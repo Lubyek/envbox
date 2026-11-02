@@ -62,6 +62,8 @@ class NetPageMixin:
         self.tail = LogTail(net_log_path(p.name))
         mode = NET_LABELS[p.net]
         via = f", через {p.upstream}" if p.upstream and p.net in ("log", "allowlist") else ""
+        if p.chain_on:
+            via = ", каналы по порядку: " + " → ".join(p.upstream_chain)
         if p.net in ("log", "allowlist"):
             self.lbl_net.set_text(f"Режим сети: {mode}{via}. Журнал: {to_home(net_log_path(p.name))}")
         else:

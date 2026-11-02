@@ -43,6 +43,12 @@ usage() {
                           Логин:пароль — только через переменную окружения
                           ENVBOX_UPSTREAM_AUTH=логин:пароль (в argv они были бы видны в ps).
                           Имена хостов тогда разрешает вышестоящий прокси, а не этот компьютер
+  --chain <канал>         канал выхода по порядку (включает --net-log; повторяемый). Первый рабочий
+                          получает все новые соединения, при его отказе берётся следующий, упавший
+                          проверяется в фоне и при возвращении снова становится первым. Каналы:
+                          proxy (это --upstream), direct (выход этого компьютера, в том числе его
+                          системный VPN), vpn:<wireguard|xray|singbox>:/путь/к/конфигурации (клиент
+                          запускается и останавливается вместе со средой, без root)
   --direct-domain <домен> с --upstream: подключаться к этому сайту напрямую, мимо вышестоящего
                           прокси (сайт видит ваш настоящий адрес, а не адрес прокси). Среда по-прежнему
                           выходит только через прокси envbox. Формат как у --allow-domain; в режиме
@@ -152,6 +158,8 @@ net_allow_private=0
 net_report=0
 report_mode=""
 upstream=""
+chain_specs=()
+chain_remote=0
 iso_seccomp=1 iso_pid=1 iso_ipc=1 iso_uts=1 iso_cgroup=1 iso_session=1 iso_die_parent=1
 iso_caps=1 iso_ro_root=1 iso_clean_env=1 iso_neutral_dns=1 iso_net_forced=1 iso_home_real=0
 host_files=""
@@ -210,6 +218,7 @@ while (( $# )); do
     --net-allow-private) net_allow_private=1; shift ;;
     --direct-domain)  need_arg "$1" $#; direct_domains+=("$2"); shift 2 ;;
     --upstream)      need_arg "$1" $#; upstream=$2; net_log=1; shift 2 ;;
+    --chain)         need_arg "$1" $#; chain_specs+=("$2"); net_log=1; shift 2 ;;
     --iso)            need_arg "$1" $#; set_iso "$2"; shift 2 ;;
     --relaxed)        iso_seccomp=0; iso_neutral_dns=0; iso_net_forced=0; shift ;;
     --host-files)     need_arg "$1" $#; host_files=$2; shift 2 ;;
@@ -367,13 +376,33 @@ if [[ -n "$upstream" ]]; then
   [[ "$upstream" =~ $upstream_re ]] \
     || die "недопустимый --upstream '$upstream': нужен http://хост:порт, socks5://хост:порт или socks5h://хост:порт"
 fi
+chain_has_proxy=0
+if (( ${#chain_specs[@]} )); then
+  for c in "${chain_specs[@]}"; do
+    case "$c" in
+      proxy)
+        [[ -n "$upstream" ]] || die "--chain proxy требует --upstream"
+        chain_has_proxy=1; chain_remote=1 ;;
+      direct) ;;
+      vpn:wireguard:/*|vpn:xray:/*|vpn:singbox:/*)
+        [[ "$c" =~ ^vpn:(wireguard|xray|singbox):/[^[:cntrl:]]+$ ]] || die "недопустимый --chain '$c': в пути управляющие символы"
+        [[ -f "${c#vpn:*:}" ]] || die "--chain: нет файла конфигурации VPN: ${c#vpn:*:}"
+        chain_remote=1 ;;
+      *) die "недопустимый --chain '$c': нужен proxy, direct или vpn:<wireguard|xray|singbox>:/путь" ;;
+    esac
+  done
+  if [[ -n "$upstream" ]] && (( ! chain_has_proxy )); then
+    die "задан --upstream, но в --chain нет proxy: прокси не будет использован"
+  fi
+fi
+(( chain_remote )) || [[ -z "$upstream" ]] || chain_remote=1
 if (( ${#direct_domains[@]} )); then
   for d in "${direct_domains[@]}"; do
     [[ "$d" =~ ^(\*\.)?[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$ ]] \
       || die "недопустимый домен для --direct-domain: '$d'"
   done
-  if [[ -z "$upstream" ]]; then
-    warn "--direct-domain имеет смысл только вместе с --upstream (без него все соединения и так идут напрямую) — игнорирую"
+  if (( ! chain_remote )); then
+    warn "--direct-domain имеет смысл только вместе с --upstream или VPN в --chain (без них все соединения и так идут напрямую) — игнорирую"
     direct_domains=()
   fi
 fi
@@ -426,7 +455,7 @@ if (( ${#dns_servers[@]} )); then
     valid_ip "$d" || die "недопустимый DNS-сервер '$d': нужен IP-адрес"
   done
   (( net )) || die "--dns не имеет смысла с --no-net: сети нет"
-  [[ -z "$upstream" ]] || die "--dns несовместим с --upstream: имена разрешает вышестоящий прокси"
+  (( ! chain_remote )) || die "--dns несовместим с --upstream и VPN: имена разрешает вышестоящий канал"
 fi
 
 box_dir="$envbox_root/$name"
@@ -694,6 +723,7 @@ if (( net_log )); then
     for d in "${allow_domains[@]}"; do proxy_args+=(--allow "$d"); done
     (( net_allow_private )) && proxy_args+=(--allow-private)
     [[ -z "$upstream" ]] || proxy_args+=(--upstream "$upstream")
+    for c in "${chain_specs[@]}"; do proxy_args+=(--chain "$c"); done
     for d in "${direct_domains[@]}"; do proxy_args+=(--direct "$d"); done
     for d in "${dns_servers[@]}"; do proxy_args+=(--dns "$d"); done
     rm -f -- "$sock"
@@ -1287,6 +1317,16 @@ done
 
 via=""
 [[ -z "$upstream" ]] || via=", вышестоящий прокси: $upstream"
+if (( ${#chain_specs[@]} )); then
+  chain_names=()
+  for c in "${chain_specs[@]}"; do
+    case "$c" in
+      vpn:*) b=$(basename -- "${c#vpn:*:}"); chain_names+=("vpn:${b%.*}") ;;
+      *) chain_names+=("$c") ;;
+    esac
+  done
+  via="$via, каналы по порядку: ${chain_names[*]}"
+fi
 if (( ${#allow_domains[@]} )); then
   info "сеть: только через прокси, разрешены: ${allow_domains[*]}$via; журнал: $net_log_file"
 else

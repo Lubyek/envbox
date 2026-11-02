@@ -128,6 +128,23 @@ unix-сокет run/proxy.sock → net/proxy.py Proxy.handle (на хосте) �
 (без userinfo), `ip`, `via`, `reason`, `resolved`, при `close`: `up`, `down`, `ms`, метки от начала пересылки в мс `up_end` (клиент договорил запрос), `down_first` и `down_last` (первый и последний байт ответа; нет `down_first` — ответа не было вовсе: у зависшего соединения это сразу показывает, молчит сервер или клиент не дослал запрос). Хранится в
 `<корень>/<имя>/net.log`, ротация >20 МБ → `net.log.1` (и при старте, и по ходу работы).
 
+### 2.2а. Каналы выхода: прокси, VPN, прямой
+
+`--chain КАНАЛ` (повторяемый; `Profile.upstream_chain`) задаёт каналы по порядку: `proxy` (это `--upstream`), `direct`
+(выход самого компьютера: если на нём включён системный VPN, это и есть выход через него), `vpn:<вид>:<путь>`
+(клиент из `<корень>/_vpn/`, запускается самим шлюзом). `Chain.order()` — исправные по списку, затем упавшие (последняя
+надежда), сломанные (нет программы, плохой конфиг) — никогда. Попытка соединения не удалась → канал `down`, событие
+`channel` в журнале, следующий. Фоновая проверка `probe_loop` (каждые 5 с) возвращает ожившие каналы в строй без таймеров
+(иначе первое же соединение платило бы тайм-аут подключения). Уже открытые потоки на другой канал не переносятся.
+Политику (allowlist, частные адреса) канал не меняет: `PrivateAddress` — это 403, а не сбой канала.
+
+VPN-клиенты (`net/vpn.py`): WireGuard через `wireproxy`, VLESS и JSON через `xray`, JSON sing-box через `sing-box`; без root.
+Шлюз генерирует временную конфигурацию (каталог 0700, стирается при остановке) со SOCKS5 на `127.0.0.1:<свободный порт>` с
+одноразовым логином и паролем и подключается к нему как к `socks5://` вышестоящему прокси; имена разрешает VPN. Из
+чужих конфигураций вырезаются сценарии wg-quick (`PostUp` и др.), лишние туннели wireproxy, `api`/`experimental`.
+`PR_SET_PDEATHSIG`: клиент умирает вместе со шлюзом. Программы клиентов ищутся в PATH или в `ENVBOX_VPN_WIREPROXY`,
+`ENVBOX_VPN_XRAY`, `ENVBOX_VPN_SINGBOX`. Реального VPN-сервера в песочнице Claude нет: клиенты проверены заглушкой.
+
 ### 2.3. Ссылки из среды наружу и обратно
 
 - **Наружу** (`xdg-open`, `$BROWSER`): шим `run/bin/open-url` пишет файл в `run/links/` → GUI (`gui/pages/links.py
@@ -165,6 +182,8 @@ unix-сокет run/proxy.sock → net/proxy.py Proxy.handle (на хосте) �
 | DNS: кэш, свои серверы | `net/dns.py` `Resolver`, `dns_lookup`, `_dns_query` | `ResolverTests`, `test_dns_parse_survives_short_rdata` |
 | Подключение к хосту (IPv6/IPv4) | `net/connect.py` `connect_race`, `interleave` | `Connect` |
 | Вышестоящий прокси (socks5/http) | `net/upstream.py` `Upstream`; профильная часть — `core/upstream.py` | `probe` (`net/bridge.py cmd_probe`) |
+| Цепочка каналов выхода (прокси → VPN → прямой), переключение и возврат | `net/chain.py` (`Channel`, `Chain`, `probe`), `net/proxy.py` (`open_chain`, `open_channel`, `probe_loop`, `build_chain`) | `ChainTests` |
+| VPN-клиент как локальный SOCKS (WireGuard через wireproxy, VLESS/Xray, sing-box) | `net/vpn.py` (разбор и генерация конфигураций, `VpnClient`); хранилище — `core/vpn.py`; вкладка — `gui/pages/vpn.py` | `VpnConfigs`, `VpnStore`, `ChainTests.test_wireguard_client_process_end_to_end` |
 | Мост внутри среды, порты, inbox | `net/bridge.py` (`pump`, `cmd_wrap`, `inbox_*`) | рисковый код: форк + потоки |
 | Таймауты/буферы/keepalive сокетов | `net/common.py` (`HEAD_TIMEOUT`, `CONNECT_TIMEOUT`, `BUF`, `tune_socket`) | бенчмарки §11.4 |
 | Проверку Git после работы | `net/gitcheck.py` + вызовы в `envbox.sh` (`gitcheck snapshot/verify`) | `GitCheck` |
@@ -198,11 +217,11 @@ tests/test_structure.py       сборка, версия, импорты без 
 tests/test_net.py             шлюз, прокси, DNS, Git, быстрый вход, GUI-логика, установка, пресеты
 src/envbox/
   version.py lazy.py resources.py selfpath.py        самые нижние модули
-  net/        common dns connect upstream proxy bridge gitcheck report seccomp entry   (шлюз, БЫСТРЫЙ ВХОД)
+  net/        common dns connect upstream chain vpn proxy bridge gitcheck report seccomp entry   (шлюз, БЫСТРЫЙ ВХОД)
   core/       consts fsutil isolation root rootops store profile sessions keyring system browser
-              upstream terminal netlog describe diagnostics desktop links link_handler
+              upstream vpn terminal netlog describe diagnostics desktop links link_handler
   cdp/        http client keys browser viewer
-  gui/        gtk consts widgets tables app window ; pages/ (11 миксинов) ; browser/ (page, view)
+  gui/        gtk consts widgets tables app window ; pages/ (12 миксинов) ; browser/ (page, view)
   install.py  cli.py  appimage.py
   resources/  envbox.sh terminal_wrapper.sh help.txt gui.css icon.svg icon.png.b64 AppRun.sh envbox.desktop
 ```
@@ -322,7 +341,7 @@ src/envbox/
 | Группа | Поля |
 |---|---|
 | Основное | `name` (= имя каталога), `kind` (`app`/`browser`), `workdir`, `no_workdir`, `command`, `shell` (`bash`/`fish`/`zsh`) |
-| Сеть | `net` (`off`/`log`/`allowlist`/`host`), `allow_domains`, `net_allow_private`, `upstream`, `upstream_auth` (пароль в keyring), `dns`, `direct_domains` (вкладка «Изоляция», блок «Сеть») |
+| Сеть | `net` (`off`/`log`/`allowlist`/`host`), `allow_domains`, `net_allow_private`, `upstream`, `upstream_auth` (пароль в keyring), `dns`, `direct_domains` (вкладка «Изоляция», блок «Сеть»), `upstream_chain` (порядок выхода: `proxy`, `vpn:<имя>`, `direct`; пусто — прежнее поведение) |
 | Окружение | `env` (`VAR` или `VAR=значение`), `secrets` (имена; значения из keyring), `path`, `lang`, `timezone` |
 | Файлы | `ro`, `rw`, `global_on`, `global_folders` (`имя:ro|rw`), `ephemeral`, `host_files` (`ro`/`rw`), `host_confirmed` |
 | Изоляция | `isolation` (dict `ключ→bool`, хранятся только отличия от умолчания), `protect_git`, `allow_userns` |
@@ -683,6 +702,8 @@ python3 -I dist/envbox.py wrap --map 3999:/tmp/ebp/p.sock -- curl --noproxy '' -
 | Ссылка из письма (https://claude.ai/magic-link…) не передаётся Claude Desktop | кнопка «Передать приложению» отдаёт приложению https-ссылку, а оно понимает `claude://`; «В браузере компьютера» работает только со связанной схемой | диалог «Ссылка…» (`gui/pages/links.py on_open_link`): «В браузере envbox» открывает ссылку в среде-браузере, `claude://` перехватывается и передаётся приложению |
 | Claude Desktop: «Войти через Google» не работает или предпросмотр/артефакты пустые | в журнале `deny not-in-allowlist` для `accounts.google.com`, `www.google.com`, `*.gstatic.com` (вход идёт окном внутри приложения: `claude.ai/login/popup-google-auth`) или `<случайное>.frame.claudeusercontent.com` | `CLAUDE_DESKTOP_DOMAINS` (миграция прежних списков пресета — `OLD_CLAUDE_DESKTOP_DOMAINS*`); у профиля со своим списком добавить эти сайты вручную |
 | Claude «бесконечно думает» и/или большая загрузка (npm, 330 МБ) обрывается, хотя короткие запросы идут | вышестоящий прокси рвёт каждый туннель ровно через ~60 с после установки, независимо от активности (журнал: `close` с `end=upstream`, `ms` ≈ 60.5–63.3 с и у многих соединений одинаковый; у простаивающих `down_last` задолго до конца; у загрузок `down` десятки–сотни МБ и тот же `ms`; `end=client` у npm с `down=0` — клиент сам сдался) | `python3 -c` по `net.log`: сгруппировать `close` по `ts` и `ms`; проверка без envbox: `curl -x прокси -m 100 https://speed.cloudflare.com/__down?bytes=2000000000` — обрыв на ~60 с подтверждает предел самого прокси. Лечится у поставщика (длинная/«липкая» сессия, статический адрес, другой порт/протокол) или `direct_domains` для сайтов, которым прокси не нужен (npm). Метки `up_end/down_first/down_last` в `close` показывают, кто молчит |
+| «VPN не запустился»/всё через `direct`: в журнале `channel` с `state: broken` | нет программы клиента (wireproxy/xray/sing-box) или конфигурация не читается | `reason` в событии; `vpn-<n>.log` рядом с `net.log`; кнопка «Проверить» на вкладке «VPN» (`core/vpn.py test_vpn`) |
+| Канал «мигает» (`down`/`up` по кругу) | проба `example.com:443` проходит, а рабочие соединения нет (или наоборот) | `PROBE_TARGET`, `PROBE_EVERY` в `net/chain.py`; события `channel` с `reason` |
 | 403 «Private address forbidden» на обычных сайтах | локальный DNS отдаёт частные/нулевые адреса (fake-ip 198.18/15 уже разрешён; `0.0.0.0` от блокировщиков, split-DNS, Tailscale `100.64/10`) | `net.log`: `deny private-address`, поле `resolved`; `--dns`, `--net-allow-private` или чинить DNS |
 | 502 «Upstream proxy failed» | вышестоящий прокси (VPN-клиент) не запущен/не отвечает/требует пароль; цель недоступна (ждёт 15 с) | `net.log`: `error upstream: …`; `envbox.py probe --upstream URL` |
 | 502 «DNS resolution failed» | не работает DNS хоста или заданные `--dns` | `error dns: …`; `Resolver` кэширует отказ 2 с |

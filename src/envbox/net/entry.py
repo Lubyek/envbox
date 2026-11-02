@@ -15,7 +15,7 @@ from .seccomp import cmd_seccomp
 # Вид: команда -> {параметр: вид}, где вид: str, int, list (повторяемый) или flag.
 NET_OPTIONS = {
     "proxy": {"--socket": "str", "--log": "str", "--allow": "list", "--allow-private": "flag",
-              "--parent-pid": "int", "--upstream": "str", "--dns": "list", "--direct": "list"},
+              "--parent-pid": "int", "--upstream": "str", "--dns": "list", "--direct": "list", "--chain": "list"},
     "wrap": {"--map": "list", "--serve": "list", "--inbox": "str", "--inbox-cmd": "str",
              "--inbox-scheme": "list", "--inbox-callback": "flag"},
     "seccomp": {"--allow": "list"},

@@ -27,6 +27,7 @@ python3 -m unittest discover -s tests
 |---|---|
 | Bash-запускатор песочницы (аргументы bwrap, изоляция) | `src/envbox/resources/envbox.sh` |
 | Прокси с журналом, кэш DNS, подключение «наперегонки», вышестоящий прокси, мосты, канал ссылок | `src/envbox/net/` |
+| Цепочка выхода: прокси → VPN → прямой, VPN-клиенты | `net/chain.py`, `net/vpn.py`, `core/vpn.py`, `gui/pages/vpn.py` |
 | seccomp-фильтр, проверка Git после работы | `net/seccomp.py`, `net/gitcheck.py` |
 | Профиль среды (поля, проверка) | `core/profile.py` |
 | Параметры изоляции, пресеты, рецепты установки | `core/isolation.py` |

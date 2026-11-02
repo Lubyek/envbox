@@ -34,6 +34,7 @@ from .isolation import ISO_KEYS, ISO_OPTIONS, ISO_PRESETS, ISO_RISKY_DEFAULT
 from .root import GLOBAL_ENTRY_RE, box_dir, envbox_root, global_path, global_root
 from .system import pkg_hint
 from .upstream import split_proxy_url
+from .vpn import vpn_source
 
 
 @dataclass
@@ -58,6 +59,9 @@ class Profile:
     kind: str = "app"
     upstream: str = ""
     upstream_auth: bool = False
+    # Каналы выхода по порядку: «proxy» (поле upstream), «vpn:<имя>» (вкладка VPN), «direct» (выход этого компьютера,
+    # в том числе через его системный VPN). Пусто — как раньше: один прокси или прямой выход.
+    upstream_chain: list = field(default_factory=list)
     attach: list = field(default_factory=list)
     browser_bin: str = ""
     browser_start_url: str = "about:blank"
@@ -215,7 +219,33 @@ class Profile:
 
     def wrapper_secrets(self):
         """Переменные, которые обёртка достаёт из keyring для envbox.sh (не все уходят в среду)."""
-        return list(self.secrets) + ([UPSTREAM_AUTH_VAR] if self.upstream_auth and self.upstream else [])
+        return list(self.secrets) + ([UPSTREAM_AUTH_VAR] if self.upstream_auth and self.uses_proxy else [])
+
+    @property
+    def chain_on(self):
+        """Цепочка каналов действует (задана и сеть идёт через прокси envbox)."""
+        return bool(self.upstream_chain) and self.net in ("log", "allowlist")
+
+    @property
+    def uses_proxy(self):
+        """Свой прокси участвует в выходе: задан и не исключён из цепочки."""
+        return bool(self.upstream) and (not self.chain_on or "proxy" in self.upstream_chain)
+
+    @property
+    def has_remote(self):
+        """Есть канал, за которым имена разрешает не этот компьютер (прокси или VPN)."""
+        return self.uses_proxy or (self.chain_on and any(c.startswith("vpn:") for c in self.upstream_chain))
+
+    def chain_specs(self):
+        """Каналы для шлюза: proxy, direct, vpn:<вид>:<путь>. ValueError, если VPN не найден."""
+        out = []
+        for item in self.upstream_chain:
+            if item.startswith("vpn:"):
+                kind, path = vpn_source(item[4:])
+                out.append(f"vpn:{kind}:{path}")
+            else:
+                out.append(item)
+        return out
 
     def validate(self):
         """Список ошибок на русском; пустой список — профиль готов к запуску."""
@@ -287,8 +317,8 @@ class Profile:
         if self.dns:
             if self.net == "off":
                 err.append("DNS не нужен без сети: уберите серверы или включите сеть")
-            elif self.upstream and self.net in ("log", "allowlist"):
-                err.append("DNS-серверы несовместимы с вышестоящим прокси: имена разрешает он")
+            elif self.has_remote and self.net in ("log", "allowlist"):
+                err.append("DNS-серверы несовместимы с вышестоящим прокси и VPN: имена разрешает он")
         if self.upstream:
             try:
                 split_proxy_url(self.upstream, allow_auth=False)
@@ -296,6 +326,26 @@ class Profile:
                 err.append(f"прокси: {e}")
             if self.net not in ("log", "allowlist"):
                 err.append("вышестоящий прокси работает только в режимах сети «через журнал»")
+        if self.upstream_chain:
+            if self.net not in ("log", "allowlist"):
+                err.append("цепочка выхода работает только в режимах сети «через журнал»")
+            seen = set()
+            for item in self.upstream_chain:
+                if item in seen:
+                    err.append(f"цепочка выхода: «{item}» указан дважды")
+                seen.add(item)
+                if item == "proxy":
+                    if not self.upstream:
+                        err.append("цепочка выхода: есть «proxy», но свой прокси не задан")
+                elif item == "direct":
+                    pass
+                elif item.startswith("vpn:"):
+                    try:
+                        vpn_source(item[4:])
+                    except ValueError as e:
+                        err.append(f"цепочка выхода: {e}")
+                else:
+                    err.append(f"цепочка выхода: неизвестный канал '{item}' (proxy, direct или vpn:имя)")
         for spec in self.attach:
             m = ATTACH_RE.match(spec)
             if not m:
@@ -391,8 +441,12 @@ class Profile:
         elif self.net == "allowlist":
             for d in self.allow_domains:
                 a += ["--allow-domain", d]
-        if self.upstream and self.net in ("log", "allowlist"):
+        if self.uses_proxy and self.net in ("log", "allowlist"):
             a += ["--upstream", self.upstream]
+        if self.chain_on:
+            for spec in self.chain_specs():
+                a += ["--chain", spec]
+        if self.has_remote and self.net in ("log", "allowlist"):
             for d in self.direct_domains:
                 a += ["--direct-domain", d]
         if self.lang:

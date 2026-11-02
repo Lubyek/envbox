@@ -89,10 +89,18 @@ def describe(p):
     else:
         out.append(("warn", "Сеть общая с компьютером: доступны все сервисы на localhost "
                             "(базы данных, отладочные порты). Для ИИ этот режим не подходит."))
-    if p.dns and p.net != "off" and not (p.upstream and p.net in ("log", "allowlist")):
+    if p.dns and p.net != "off" and not (p.has_remote and p.net in ("log", "allowlist")):
         out.append(("info", "Имена сайтов разрешают DNS-серверы " + ", ".join(p.dns)
                     + ": запросы идут по сети без шифрования, их видит сеть и владелец сервера."))
-    if p.upstream and p.net in ("log", "allowlist"):
+    if p.chain_on:
+        names = {"proxy": f"ваш прокси {p.upstream}", "direct": "выход этого компьютера (в том числе его системный VPN)"}
+        out.append(("info", "Каналы выхода по порядку: " + " → ".join(
+            names.get(c) or f"VPN «{c[4:]}»" for c in p.upstream_chain) +
+            ". Первый рабочий получает новые соединения, при его отказе берётся следующий; когда он вернётся, "
+            "соединения снова идут через него. Уже открытые соединения при отказе канала обрываются."))
+        if p.has_remote:
+            out.append(("info", "Имена сайтов разрешает прокси или VPN, а не этот компьютер."))
+    elif p.upstream and p.net in ("log", "allowlist"):
         who = "логином и паролем из keyring" if p.upstream_auth else "без логина"
         out.append(("info", f"Дальше трафик идёт через ваш прокси {p.upstream} ({who}); "
                             "имена сайтов разрешает он."))

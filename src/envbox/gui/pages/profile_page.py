@@ -164,6 +164,28 @@ class ProfilePageMixin:
         rows.grid.attach(self.lbl_up, 1, rows.r, 1, 1)
         rows.r += 1
         self.e_upstream.connect("changed", lambda *_: self.update_net_sensitivity())
+        # порядок выхода: прокси, VPN, выход этого компьютера; первый рабочий принимает новые соединения
+        self.tv_chain, sw = text_area(height=56)
+        chain_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        chain_box.append(sw)
+        chain_bar = Gtk.Box(spacing=6)
+        for label, item in (("+ proxy", "proxy"), ("+ direct", "direct")):
+            bt = Gtk.Button(label=label)
+            bt.connect("clicked", lambda _b, i=item: self.on_chain_add(i))
+            chain_bar.append(bt)
+        self.dd_vpns = Gtk.DropDown.new_from_strings(["—"])
+        chain_bar.append(self.dd_vpns)
+        bt = Gtk.Button(label="+ VPN")
+        bt.connect("clicked", self.on_chain_add_vpn)
+        chain_bar.append(bt)
+        chain_box.append(chain_bar)
+        self.up_widgets += rows.add(
+            "Порядок выхода", chain_box,
+            "Необязательно. По одному каналу в строке: proxy (свой прокси выше), vpn:имя (вкладка «VPN»), "
+            "direct (выход этого компьютера, в том числе через его системный VPN). Первый рабочий принимает все "
+            "новые соединения; если он не отвечает, берётся следующий, а когда первый вернётся, соединения снова "
+            "идут через него. Пусто: как раньше, один прокси или прямой выход.")
+        self.tv_chain.get_buffer().connect("changed", lambda *_: self.update_net_sensitivity())
         adv.append(box)
 
 
@@ -322,7 +344,9 @@ class ProfilePageMixin:
         show_all(self.domain_widgets, mode == "allowlist")
         show_all(self.private_widgets, mode in ("log", "allowlist"))
         show_all(self.up_widgets + [self.lbl_up], mode in ("log", "allowlist"))
-        via_upstream = mode in ("log", "allowlist") and bool(self.e_upstream.get_text().strip())
+        chain_items = get_lines(self.tv_chain) if hasattr(self, "tv_chain") else []
+        via_upstream = mode in ("log", "allowlist") and (
+            bool(self.e_upstream.get_text().strip()) or any(c.startswith("vpn:") for c in chain_items))
         show_all(self.dns_widgets, mode in ("log", "allowlist", "host") and not via_upstream)
         if mode == "host":
             self.lbl_dns.set_text("Серверы запишутся в /etc/resolv.conf среды.")
@@ -367,6 +391,8 @@ class ProfilePageMixin:
         set_text(self.tv_domains, "\n".join(p.allow_domains))
         self.cb_private.set_active(p.net_allow_private)
         self.e_upstream.set_text(p.upstream)
+        set_text(self.tv_chain, "\n".join(p.upstream_chain))
+        self.refresh_vpn_choices()
         self.e_lang.set_text(p.lang)
         self.e_tz.set_text(p.timezone)
         set_text(self.tv_dns, "\n".join(p.dns))
@@ -419,6 +445,7 @@ class ProfilePageMixin:
             net_allow_private=self.cb_private.get_active(),
             upstream=self.e_upstream.get_text().strip(),
             upstream_auth=self.current.upstream_auth,
+            upstream_chain=get_lines(self.tv_chain),
             attach=get_lines(self.tv_attach),
             expose_ports=get_text(self.tv_expose).replace(",", " ").split(),
             install_domains=get_lines(self.tv_install_domains),

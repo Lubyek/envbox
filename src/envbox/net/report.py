@@ -36,11 +36,18 @@ def _fmt_event(e):
     if ev in ("proxy-start", "proxy-stop"):
         extra = f" разрешено: {', '.join(map(str, e.get('allow', [])))}" if ev == "proxy-start" else ""
         return f"{e.get('ts', '')}  --- {ev}{extra}"
+    if ev == "channel":
+        state = {"down": "ОТКАЗАЛ", "up": "СНОВА РАБОТАЕТ", "started": "ЗАПУЩЕН", "broken": "НЕ ЗАПУСТИЛСЯ"}.get(
+            e.get("state"), e.get("state", "?"))
+        tail = (f"  {e['reason']}" if e.get("reason") else "") + (f"  дальше: {e['next']}" if e.get("next") else "")
+        return f"{e.get('ts', '')}  КАНАЛ    {e.get('channel', '?')} {state}{tail}"
     target = f"{e.get('host', '?')}:{e.get('port', '?')}"
     label = {"open": "ОТКРЫТО", "close": "ЗАКРЫТО", "deny": "ЗАПРЕТ", "error": "ОШИБКА"}.get(ev, ev)
     tail = ""
     if ev == "open":
         tail = f" ({e.get('ip') or 'через ' + str(e.get('via', '?'))}{', напрямую' if e.get('direct') else ''})"
+        if e.get("chan"):
+            tail += f" [канал: {e['chan']}]"
         if e.get("url"):
             tail += f" {e.get('method', '')} {e['url']}"
     elif ev == "close":

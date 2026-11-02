@@ -9,6 +9,7 @@ from ...core.keyring import secret_clear, secret_exists, secret_lookup, secret_s
 from ...core.system import pkg_hint
 from ...core.terminal import dry_run
 from ...core.upstream import probe_upstream, read_proxy_file, split_proxy_url
+from ...core.vpn import list_vpns
 from ..gtk import GLib, Gtk
 from ..widgets import alert, get_lines, hint, margins, prompt, set_text, to_home
 
@@ -163,6 +164,29 @@ class ProfileNetMixin:
         prompt(self, "Логин и пароль прокси",
                "В формате логин:пароль. Они хранятся в системном keyring, не в профиле и не в командной "
                "строке. Пустое значение удаляет сохранённые данные.", got, secret=True)
+
+    # ---- порядок выхода (прокси, VPN, выход компьютера)
+
+    def refresh_vpn_choices(self):
+        """Список VPN в выпадающем списке «+ VPN» (после загрузки или удаления VPN)."""
+        if not hasattr(self, "dd_vpns"):
+            return
+        names = [v["name"] for v in list_vpns()]
+        self.dd_vpns.set_model(Gtk.StringList.new(["—"] + names))
+
+    def on_chain_add(self, item):
+        lines = get_lines(self.tv_chain)
+        if item not in lines:
+            lines.append(item)
+        set_text(self.tv_chain, "\n".join(lines))
+
+    def on_chain_add_vpn(self, *_):
+        chosen = self.dd_vpns.get_selected_item()
+        name = chosen.get_string() if chosen is not None else "—"
+        if name == "—":
+            alert(self, "Нет VPN", "Сначала загрузите VPN на вкладке «VPN», затем выберите его в списке.")
+            return
+        self.on_chain_add(f"vpn:{name}")
 
     # ---- браузер для ИИ
 

@@ -21,6 +21,7 @@ from .pages.profile_page import ProfilePageMixin
 from .pages.settings import SettingsMixin
 from .pages.sidebar import SidebarMixin
 from .pages.terminal import TerminalMixin
+from .pages.vpn import VpnPageMixin
 from .widgets import choose, icon_button, margins
 
 
@@ -38,6 +39,7 @@ class EnvboxWindow(
     TerminalMixin,
     SettingsMixin,
     NetPageMixin,
+    VpnPageMixin,
     Gtk.ApplicationWindow,
 ):
     """Главное окно."""
@@ -108,6 +110,7 @@ class EnvboxWindow(
         self.page_profile = self.build_profile_page()
         self.nb.append_page(self.page_profile, Gtk.Label(label="Настройки"))
         self.nb.append_page(self.build_isolation_page(), Gtk.Label(label="Изоляция"))
+        self.nb.append_page(self.build_vpn_page(), Gtk.Label(label="VPN"))
         self.nb.append_page(self.build_net_page(), Gtk.Label(label="Журнал сети"))
         self.nb.connect("switch-page", self.on_switch_page)
         self.main_stack = Gtk.Stack()
