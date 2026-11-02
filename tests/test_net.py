@@ -697,5 +697,30 @@ class BrowserLogin(unittest.TestCase):
                 c.notify.assert_called_once_with("Page.handleJavaScriptDialog", {"accept": accept})
 
 
+class AppImageBuild(unittest.TestCase):
+    def test_existing_appimage_is_replaced_not_overwritten(self):
+        # запущенный AppImage нельзя открыть на запись («Text file busy»): собираем рядом и подменяем
+        from envbox.appimage import build_appimage
+        d = tempfile.mkdtemp()
+        stub = os.path.join(d, "tool.sh")
+        with open(stub, "w") as f:
+            f.write('#!/bin/sh\n[ -e "$2" ] && { echo "busy" >&2; exit 1; }\necho new > "$2"\n')
+        os.chmod(stub, 0o755)
+        arch = os.uname().machine
+        out = os.path.join(d, f"envbox-{arch}.AppImage")
+        with open(out, "w") as f:
+            f.write("old")
+        cwd = os.getcwd()
+        os.chdir(d)
+        try:
+            with mock.patch.dict(os.environ, {"APPIMAGETOOL": stub}):
+                self.assertEqual(build_appimage(None), 0)
+        finally:
+            os.chdir(cwd)
+        with open(out) as f:
+            self.assertEqual(f.read().strip(), "new")
+        self.assertEqual(os.listdir(d).count(f"envbox-{arch}.AppImage.new"), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

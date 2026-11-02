@@ -3484,7 +3484,21 @@ def build_appimage(args):
             f.write(DESKTOP_TEXT.rstrip("\n") + f"\nX-AppImage-Version={ENVBOX_VERSION}\n")
         _atomic_write(os.path.join(appdir, "AppRun"), APPRUN_TEXT.encode("utf-8"), 0o755)
         env = dict(os.environ, ARCH=arch, APPIMAGE_EXTRACT_AND_RUN="1")
-        rc = subprocess.run([tool, appdir, out], env=env).returncode
+        # Старый AppImage может быть запущен (окно envbox): запись в него даёт «Text file busy». Собираем рядом
+        # под другим именем, а потом подменяем — rename запущенного файла разрешён, процесс держит старый inode.
+        tmp_out = out + ".new"
+        rc = subprocess.run([tool, appdir, tmp_out], env=env).returncode
+        if rc == 0:
+            try:
+                os.replace(tmp_out, out)
+            except OSError as e:
+                print(f"envbox: не удалось заменить {out}: {e}", file=sys.stderr)
+                rc = 1
+        if rc != 0 and os.path.lexists(tmp_out):
+            try:
+                os.unlink(tmp_out)
+            except OSError:
+                pass
     if rc != 0:
         print("envbox: appimagetool завершился с ошибкой", file=sys.stderr)
         return rc
