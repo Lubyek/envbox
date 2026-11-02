@@ -142,6 +142,16 @@ class CdpViewer:
 
     # ---- события страницы
     def _page_event(self, client, method, params):
+        if method == "Page.javascriptDialogOpening":
+            # Пока диалог (alert, confirm, beforeunload) не закрыт, страница стоит и кадры не идут: после входа
+            # через Google окно «зависало». Закрываем в любой вкладке: alert и «уйти со страницы?» принимаем,
+            # confirm и prompt отклоняем.
+            accept = (params or {}).get("type") in ("alert", "beforeunload")
+            try:
+                client.notify("Page.handleJavaScriptDialog", {"accept": accept})
+            except OSError:
+                pass
+            return
         if client is not self.client:
             return
         if method == "Page.screencastFrame":

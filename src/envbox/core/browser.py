@@ -92,7 +92,10 @@ def browser_command(p):
     argv = [exe, f"--user-data-dir={profile_dir}", f"--remote-debugging-port={CDP_PORT}",
             "--no-first-run", "--no-default-browser-check", "--disable-gpu",
             "--disable-background-networking", "--disable-component-update", "--disable-sync",
-            "--disable-breakpad", "--password-store=basic"]
+            "--disable-breakpad", "--password-store=basic",
+            # Порт отладки включает признак автоматизации (navigator.webdriver = true); Google и Cloudflare по нему
+            # отвечают «браузер не прошёл проверку» (this browser may not be secure). Флаг убирает признак.
+            "--disable-blink-features=AutomationControlled"]
     if p.net != "off":
         argv.append("--proxy-server=http://127.0.0.1:3128")
     argv.append(browser_display_flag(p))

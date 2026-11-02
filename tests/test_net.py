@@ -675,5 +675,27 @@ class Presets(unittest.TestCase):
         self.assertTrue([e for e in p.validate() if "прямого" in e])
 
 
+class BrowserLogin(unittest.TestCase):
+    def test_chrome_hides_the_automation_flag(self):
+        # порт отладки делает navigator.webdriver истинным, и Google/Cloudflare отвечают «браузер не прошёл проверку»
+        from envbox.core.browser import browser_command
+        from envbox.core.profile import Profile
+        argv = browser_command(Profile(name="b", kind="browser", browser_bin="/usr/bin/chromium"))
+        self.assertIn("--disable-blink-features=AutomationControlled", argv)
+        self.assertFalse([a for a in argv if a.startswith("--headless")])    # «HeadlessChrome» в User-Agent
+
+    def test_viewer_closes_javascript_dialogs(self):
+        # открытый диалог (после входа через Google) останавливает страницу и кадры: окно «зависает»
+        from envbox.cdp.viewer import CdpViewer
+        v = CdpViewer("/nonexistent.sock", lambda *_: None)
+        other, sent = mock.Mock(), mock.Mock()
+        v.client = sent
+        for kind, accept in (("alert", True), ("beforeunload", True), ("confirm", False), ("prompt", False)):
+            for c in (sent, other):                  # и в активной вкладке, и в фоновой
+                c.reset_mock()
+                v._page_event(c, "Page.javascriptDialogOpening", {"type": kind, "message": "x"})
+                c.notify.assert_called_once_with("Page.handleJavaScriptDialog", {"accept": accept})
+
+
 if __name__ == "__main__":
     unittest.main()
