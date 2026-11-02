@@ -96,6 +96,40 @@ def summarize(events):
     return s.rows()
 
 
+def filter_net_log(name, hosts):
+    """Убрать из журнала записи про выбранные хосты, остальное оставить -> сколько записей убрано.
+
+    Файл переписывается на месте (тот же inode): прокси среды держит его открытым на дозапись и продолжит писать
+    туда же. Что дописано за время чтения, сохраняется (окно между проверкой размера и записью — миллисекунды)."""
+    hosts = set(hosts)
+    path = net_log_path(name)
+    try:
+        f = open(path, "r+b")
+    except OSError:
+        return 0
+    with f:
+        data = f.read()
+        removed, keep = 0, []
+        for line in data.split(b"\n"):
+            try:
+                host = json.loads(line).get("host") if line.strip() else None
+            except (ValueError, AttributeError):
+                host = None
+            if host in hosts:
+                removed += 1
+            elif line.strip():
+                keep.append(line)
+        extra = b""
+        size_now = os.fstat(f.fileno()).st_size
+        if size_now > len(data):                      # пока фильтровали, прокси дописал новые записи
+            f.seek(len(data))
+            extra = f.read()
+        f.seek(0)
+        f.write((b"\n".join(keep) + b"\n" if keep else b"") + extra)
+        f.truncate()
+    return removed
+
+
 def clear_net_log(name):
     p = net_log_path(name)
     if os.path.exists(p):

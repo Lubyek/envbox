@@ -38,7 +38,7 @@ import time
 
 # ---- version.py: Версия envbox (строка читается регулярным выражением при установке — не менять формат).
 
-ENVBOX_VERSION = "2026.11.02.13"
+ENVBOX_VERSION = "2026.11.02.14"
 
 
 # ---- lazy.py: Ленивые модули стандартной библиотеки: настоящий import происходит при первом обращении к атрибуту.
@@ -6245,6 +6245,31 @@ def delete_vpn(name):
     return False
 
 
+def delete_vpns(names):
+    """Удалить выделенные VPN одним действием. Возвращает, сколько удалено."""
+    names = set(names)
+    done = 0
+    for v in list_vpns():
+        if v["name"] in names:
+            os.unlink(v["path"])
+            done += 1
+    meta = load_meta()
+    for n in names:
+        meta["vpns"].pop(n, None)
+    # папки, в которых не осталось серверов, не висят
+    used = {m.get("folder") for m in meta["vpns"].values()}
+    meta["folders"] = {f: i for f, i in meta["folders"].items() if f in used}
+    save_meta(meta)
+    return done
+
+
+def clear_vpns():
+    """Удалить все VPN и все папки (идентификатор устройства HWID остаётся). Возвращает, сколько VPN удалено."""
+    done = delete_vpns([v["name"] for v in list_vpns()])
+    save_meta({"folders": {}, "vpns": {}})
+    return done
+
+
 def vpn_binary_problem(kind):
     """Пустая строка, если программа клиента есть; иначе подсказка, что установить."""
     if kind not in VPN_KINDS:
@@ -8372,6 +8397,40 @@ def summarize(events):
     return s.rows()
 
 
+def filter_net_log(name, hosts):
+    """Убрать из журнала записи про выбранные хосты, остальное оставить -> сколько записей убрано.
+
+    Файл переписывается на месте (тот же inode): прокси среды держит его открытым на дозапись и продолжит писать
+    туда же. Что дописано за время чтения, сохраняется (окно между проверкой размера и записью — миллисекунды)."""
+    hosts = set(hosts)
+    path = net_log_path(name)
+    try:
+        f = open(path, "r+b")
+    except OSError:
+        return 0
+    with f:
+        data = f.read()
+        removed, keep = 0, []
+        for line in data.split(b"\n"):
+            try:
+                host = json.loads(line).get("host") if line.strip() else None
+            except (ValueError, AttributeError):
+                host = None
+            if host in hosts:
+                removed += 1
+            elif line.strip():
+                keep.append(line)
+        extra = b""
+        size_now = os.fstat(f.fileno()).st_size
+        if size_now > len(data):                      # пока фильтровали, прокси дописал новые записи
+            f.seek(len(data))
+            extra = f.read()
+        f.seek(0)
+        f.write((b"\n".join(keep) + b"\n" if keep else b"") + extra)
+        f.truncate()
+    return removed
+
+
 def clear_net_log(name):
     p = net_log_path(name)
     if os.path.exists(p):
@@ -8672,6 +8731,317 @@ def format_report(report, title=""):
     final = {"ok": "ИТОГ: подходит для Claude", "warn": "ИТОГ: работать можно, но есть риски (см. ⚠)",
              "bad": "ИТОГ: для Claude не подходит или не защищает (см. ✖)"}[report["verdict"]]
     return "\n".join(lines + ["", final])
+
+
+# ---- core/proxies.py: Хранилище прокси: список, папки (сервисы), поиск, пинг, проверка и проверка «для Claude».
+
+PX_DIR = "_proxy"
+
+
+PX_FILE = "proxies.json"
+
+
+PX_MAX_LINES = 1000
+
+
+PX_SCHEMES = ("http", "socks5", "socks5h")
+
+
+PX_LABELS = {"http": "HTTP", "socks5": "SOCKS5", "socks5h": "SOCKS5"}
+
+
+def px_path():
+    return os.path.join(envbox_root(), PX_DIR, PX_FILE)
+
+
+def load_px():
+    """{"proxies": {имя: {url, auth, folder, title, added}}, "folders": {папка: сведения списка}}."""
+    try:
+        with open(px_path(), encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        d = {}
+    if not isinstance(d, dict):
+        d = {}
+    d["proxies"] = d["proxies"] if isinstance(d.get("proxies"), dict) else {}
+    d["folders"] = d["folders"] if isinstance(d.get("folders"), dict) else {}
+    return d
+
+
+def save_px(d):
+    path = px_path()
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    fd = os.open(path + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=1)
+    os.replace(path + ".new", path)
+
+
+def parse_proxy_line(line, default="http"):
+    """Одна строка -> (адрес без пароля, 'логин:пароль' или '', пометка из #…).
+
+    Понимает схема://[логин:пароль@]хост:порт, [логин:пароль@]хост:порт, хост:порт:логин:пароль и хост:порт;
+    без схемы берётся `default`. ValueError с понятным текстом."""
+    import urllib.parse
+    text, _, remark = line.strip().partition("#")
+    text, remark = text.strip(), urllib.parse.unquote(remark.strip())
+    if not text:
+        raise ValueError("пустая строка")
+    if "://" not in text:
+        parts = text.split(":")
+        if len(parts) == 4 and parts[1].isdigit():             # хост:порт:логин:пароль (в пароле может быть @)
+            host, port, user, password = parts
+            text = f"{default}://{urllib.parse.quote(user, safe='')}:{urllib.parse.quote(password, safe='')}@{host}:{port}"
+        elif "@" in text or len(parts) == 2:
+            text = f"{default}://{text}"
+        else:
+            raise ValueError(f"не понял формат «{text[:40]}»: нужен хост:порт, хост:порт:логин:пароль или схема://…")
+    url, auth = split_proxy_url(text)
+    return url, auth, remark
+
+
+def proxy_lines(text):
+    """Строки с прокси из текста: пустые и комментарии (# в начале) пропускаются."""
+    return [ln.strip() for ln in (text or "").splitlines() if ln.strip() and not ln.strip().startswith("#")]
+
+
+def is_proxy_list_url(text):
+    """Ссылка на список прокси (её нужно скачать), а не сам прокси: http://хост:порт — это прокси."""
+    import urllib.parse
+    t = (text or "").strip().strip("\"'<>")
+    if not re.match(r"^https?://\S+$", t):
+        return False
+    u = urllib.parse.urlsplit(t)
+    return not (u.port and u.path in ("", "/") and not u.query)
+
+
+def px_name_free(base, taken, single):
+    """Свободное имя: base (один прокси) или base-1, base-2…"""
+    if single and base not in taken:
+        return base
+    i = 1
+    while f"{base}-{i}" in taken:
+        i += 1
+    return f"{base}-{i}"
+
+
+def import_proxies(base, text, default_scheme="http", folder=None, replace=False):
+    """Добавить прокси из текста (по одному в строке). -> ([(имя, адрес, «хост:порт»)], [причины пропуска]).
+
+    Уже имеющийся такой же прокси (адрес и логин совпали) не дублируется. replace=True (обновление списка)
+    пишет в имена base-1, base-2… по номеру строки, затирая прежние."""
+    lines = proxy_lines(text)
+    if not lines:
+        raise ValueError("в тексте нет ни одного прокси")
+    base = normalize_name(base, "") or "proxy"
+    base = base[:40]
+    folder = clean_folder(folder) if folder is not None else None
+    data = load_px()
+    existing = {(v.get("url"), v.get("auth", "")): n for n, v in data["proxies"].items()}
+    done, skipped = [], []
+    for i, line in enumerate(lines[:PX_MAX_LINES], 1):
+        try:
+            url, auth, remark = parse_proxy_line(line, default_scheme)
+        except ValueError as e:
+            skipped.append(f"строка {i}: {e}")
+            continue
+        hostport = url.split("://", 1)[1]
+        if not replace and (url, auth) in existing:
+            skipped.append(f"{hostport} уже есть как «{existing[(url, auth)]}»")
+            continue
+        if replace:
+            name = base if len(lines) == 1 else f"{base}-{i}"
+        else:
+            name = px_name_free(base, set(data["proxies"]), len(lines) == 1)
+        old = data["proxies"].get(name, {})
+        data["proxies"][name] = {"url": url, "auth": auth, "title": remark,
+                                 "folder": old.get("folder", "") if folder is None else folder,
+                                 "added": int(time.time())}
+        existing[(url, auth)] = name
+        done.append((name, url, hostport))
+    if len(lines) > PX_MAX_LINES:
+        skipped.append(f"взяты первые {PX_MAX_LINES} строк из {len(lines)}")
+    if not done:
+        raise ValueError("ни один прокси не добавлен: " + "; ".join(skipped[:3]))
+    if folder:
+        data["folders"].setdefault(folder, {})
+    save_px(data)
+    return done, skipped
+
+
+def list_proxies():
+    """Сохранённые прокси: [{name, url, kind, label, host, port, udp, has_auth, folder, title, error}] по имени.
+
+    Пароль в список не попадает: он нужен только запуску (proxy_credentials)."""
+    import urllib.parse
+    out = []
+    for name, v in sorted(load_px()["proxies"].items(), key=lambda kv: natural_key(kv[0])):
+        try:
+            u = urllib.parse.urlsplit(v.get("url", ""))
+            host, port, scheme = u.hostname or "", u.port or 0, u.scheme
+            error = "" if scheme in PX_SCHEMES and host and port else "адрес повреждён"
+        except ValueError:
+            host, port, scheme, error = "", 0, "", "адрес повреждён"
+        out.append({"name": name, "url": v.get("url", ""), "kind": scheme, "label": PX_LABELS.get(scheme, "?"),
+                    "host": host, "port": port, "udp": False, "has_auth": bool(v.get("auth")),
+                    "folder": v.get("folder", ""), "title": v.get("title", ""), "error": error})
+    return out
+
+
+def proxy_credentials(name):
+    """(адрес, 'логин:пароль' или '') сохранённого прокси; ValueError, если такого нет."""
+    v = load_px()["proxies"].get(name)
+    if not v:
+        raise ValueError(f"прокси «{name}» не найден: добавьте его на вкладке «Прокси»")
+    return v["url"], v.get("auth", "")
+
+
+def proxy_url_with_auth(name):
+    """Адрес прокси с логином и паролем внутри (схема://логин:пароль@хост:порт) — для поля прокси среды: профиль сам
+    перенесёт пароль в keyring и оставит в профиле чистый адрес. Только для передачи в окно: нигде не сохранять."""
+    import urllib.parse
+    url, auth = proxy_credentials(name)
+    if not auth:
+        return url
+    user, _, password = auth.partition(":")
+    scheme, _, rest = url.partition("://")
+    return f"{scheme}://{urllib.parse.quote(user, safe='')}:{urllib.parse.quote(password, safe='')}@{rest}"
+
+
+def delete_proxies(names):
+    """Удалить выделенные прокси одним действием. Возвращает, сколько удалено."""
+    data = load_px()
+    done = sum(1 for n in set(names) if data["proxies"].pop(n, None) is not None)
+    used = {v.get("folder") for v in data["proxies"].values()}
+    data["folders"] = {f: i for f, i in data["folders"].items() if f in used}
+    save_px(data)
+    return done
+
+
+def clear_proxies():
+    """Удалить все прокси и папки. Возвращает, сколько прокси удалено."""
+    n = len(load_px()["proxies"])
+    save_px({"proxies": {}, "folders": {}})
+    return n
+
+
+def set_px_folder(name, folder):
+    data = load_px()
+    if name not in data["proxies"]:
+        raise ValueError(f"прокси «{name}» не найден")
+    folder = clean_folder(folder)
+    data["proxies"][name]["folder"] = folder
+    if folder:
+        data["folders"].setdefault(folder, {})
+    used = {v.get("folder") for v in data["proxies"].values()}
+    data["folders"] = {f: i for f, i in data["folders"].items() if f in used}
+    save_px(data)
+
+
+def list_px_folders():
+    """Папки с прокси: {название: сведения списка}; пустые не показываются."""
+    data = load_px()
+    used = {v.get("folder") for v in data["proxies"].values()}
+    return {f: i for f, i in sorted(data["folders"].items()) if f in used}
+
+
+def delete_px_folder(folder):
+    """Удалить папку вместе с прокси в ней. Возвращает, сколько прокси удалено."""
+    names = [n for n, v in load_px()["proxies"].items() if v.get("folder") == folder]
+    return delete_proxies(names)
+
+
+def fetch_proxy_list(url, proxy="", auth="", timeout=20):
+    """Скачать список прокси по ссылке (напрямую или через прокси `proxy`). ValueError с понятным текстом."""
+    import socket
+    import urllib.parse
+    url = (url or "").strip().strip("\"'<>")
+    for _hop in range(5):
+        host = urllib.parse.urlsplit(url).hostname or ""
+        try:
+            status, headers, body, _ms = http_request(url, proxy, auth, timeout, max_bytes=SUB_MAX_BYTES + 1)
+        except socket.gaierror:
+            raise ValueError(f"не удалось найти сайт «{host}»: DNS компьютера не отвечает или сайт заблокирован") from None
+        except http_errors() as e:
+            raise ValueError(f"не удалось скачать список: {e or type(e).__name__}") from None
+        if status in (301, 302, 303, 307, 308) and headers.get("location"):
+            url = urllib.parse.urljoin(url, headers["location"])
+            continue
+        if status >= 400:
+            raise ValueError(f"сервер ответил: HTTP {status}")
+        if len(body) > SUB_MAX_BYTES:
+            raise ValueError("ответ слишком большой (больше 2 МБ): это не список прокси")
+        return body.decode("utf-8", "replace")
+    raise ValueError("слишком много перенаправлений")
+
+
+def import_proxy_url(base, url, default_scheme="http", folder=None, proxy="", auth="", via=""):
+    """Скачать список прокси по ссылке и добавить в папку (запоминается адрес для «Обновить»)."""
+    url = (url or "").strip().strip("\"'<>")
+    text = fetch_proxy_list(url, proxy, auth)
+    base = base or base_name_from_url(url)
+    folder = clean_folder(folder if folder is not None else base)
+    done, skipped = import_proxies(base, text, default_scheme, folder=folder, replace=True)
+    data = load_px()
+    data["folders"][folder] = {"url": url, "scheme": default_scheme, "via": via, "base": base,
+                               "updated": int(time.time()), "count": len(done)}
+    save_px(data)
+    return done, skipped
+
+
+def refresh_px_folder(folder, proxy="", auth=""):
+    """Обновить папку по сохранённому адресу списка: пропавшие прокси удаляются. -> (добавлено, пропущено, удалено)."""
+    sub = load_px()["folders"].get(folder) or {}
+    if not sub.get("url"):
+        raise ValueError(f"у папки «{folder}» нет адреса списка: прокси добавлены вручную")
+    before = {n for n, v in load_px()["proxies"].items() if v.get("folder") == folder}
+    done, skipped = import_proxy_url(sub.get("base") or "", sub["url"], sub.get("scheme", "http"), folder=folder,
+                                     proxy=proxy, auth=auth, via=sub.get("via", ""))
+    gone = sorted(before - {n for n, _u, _h in done})
+    delete_proxies(gone)
+    return done, skipped, gone
+
+
+def test_proxy(name, target=("example.com", 443)):
+    """Открыть через прокси туннель до target -> (получилось, текст)."""
+    import asyncio
+    try:
+        url, auth = proxy_credentials(name)
+    except ValueError as e:
+        return False, str(e)
+
+    async def run():
+        t0 = time.monotonic()
+        _r, w = await asyncio.wait_for(Upstream(url, auth or None).tunnel(*target), 20)
+        w.close()
+        return int((time.monotonic() - t0) * 1000)
+
+    try:
+        ms = asyncio.run(run())
+    except (OSError, ValueError, asyncio.TimeoutError) as e:
+        return False, f"прокси «{name}» не работает: {e or type(e).__name__}"
+    return True, f"прокси «{name}» работает: туннель до {target[0]} открыт за {ms} мс"
+
+
+def proxy_transport_report(url, has_auth):
+    """Безопасность самого канала до прокси: [(уровень, текст)]."""
+    kind = "HTTP-прокси" if url.startswith("http:") else "SOCKS5-прокси"
+    out = [("ok", f"{kind}: HTTPS шифруется до самого сайта, прокси видит только адреса сайтов и объёмы")]
+    out.append(("warn", f"канал до {kind} не шифруется: ваш провайдер видит, что вы пользуетесь этим прокси"
+                        + (", а логин и пароль передаются открытым текстом" if has_auth else "")))
+    if not has_auth:
+        out.append(("warn", "прокси без логина и пароля: им может воспользоваться любой, кто знает адрес "
+                            "(платные обычно привязаны к вашему IP)"))
+    return out
+
+
+def check_proxy(name, env_tz="", compare_real=True, timeout=15):
+    """Проверка выхода сохранённого прокси «для Claude» (см. vpncheck.check_exit) + безопасность канала."""
+    url, auth = proxy_credentials(name)
+    report = check_exit(url, auth, timeout, compare_real=compare_real, env_tz=env_tz)
+    report["transport"] = proxy_transport_report(url, bool(auth))
+    report["verdict"] = verdict(report["findings"] + report["transport"])
+    return report
 
 
 # ---- gui/*: графический интерфейс. Классы требуют импортированного GTK, поэтому
@@ -10958,12 +11328,13 @@ def _build_gui():
 
 
     class Table:
-        """ColumnView из строковых ячеек; при обновлении сохраняет выбор по ключу."""
+        """ColumnView из строковых ячеек с выбором нескольких строк (Ctrl/Shift-клик, рамка); при обновлении
+    сохраняет выбор по ключу."""
 
         def __init__(self, titles, expand_col=0, empty_text="Пока пусто"):
             self.store = Gio.ListStore(item_type=Row)
-            self.sel = Gtk.SingleSelection(model=self.store, autoselect=False, can_unselect=True)
-            self.view = Gtk.ColumnView(model=self.sel, show_row_separators=True)
+            self.sel = Gtk.MultiSelection(model=self.store)
+            self.view = Gtk.ColumnView(model=self.sel, show_row_separators=True, enable_rubberband=True)
             for i, title in enumerate(titles):
                 factory = Gtk.SignalListItemFactory()
                 factory.connect("setup", self._setup)
@@ -10992,20 +11363,30 @@ def _build_gui():
         def _bind(_factory, item, i):
             item.get_child().set_text(item.get_item().cells[i])
 
+        def selected_rows(self):
+            """Все выбранные строки."""
+            bits = self.sel.get_selection()
+            return [self.sel.get_item(bits.get_nth(i)) for i in range(bits.get_size())]
+
         def selected(self):
-            return self.sel.get_selected_item()
+            """Первая из выбранных строк или None."""
+            rows = self.selected_rows()
+            return rows[0] if rows else None
+
+        def select_all(self):
+            self.sel.select_all()
+
+        def unselect_all(self):
+            self.sel.unselect_all()
 
         def set_rows(self, rows):
-            cur = self.selected()
-            key = cur.key if cur is not None else None
+            keys = {r.key for r in self.selected_rows() if r.key is not None}
             self.store.splice(0, self.store.get_n_items(), rows)
             self.stack.set_visible_child_name("table" if rows else "empty")
-            pos = Gtk.INVALID_LIST_POSITION
+            self.sel.unselect_all()
             for n, r in enumerate(rows):
-                if key is not None and r.key == key:
-                    pos = n
-                    break
-            self.sel.set_selected(pos)
+                if r.key is not None and r.key in keys:
+                    self.sel.select_item(n, False)
 
 
     # ---- gui/pages/net_page.py: Вкладка «Сеть»: журнал, фильтр, разрешение доменов, сеансы.
@@ -11025,12 +11406,18 @@ def _build_gui():
                                    empty_text="Пока ни одного обращения.\nЗапустите среду в режиме "
                                               "«через прокси с журналом» — здесь появится, куда она ходит.")
             buttons = Gtk.Box(spacing=8)
-            b_allow = Gtk.Button(label="Разрешить выбранный домен")
+            b_all = Gtk.Button(label="Выбрать все")
+            b_all.connect("clicked", lambda *_: self.net_table.select_all())
+            b_none = Gtk.Button(label="Снять выбор")
+            b_none.connect("clicked", lambda *_: self.net_table.unselect_all())
+            b_allow = Gtk.Button(label="Разрешить выбранные домены")
             b_allow.connect("clicked", self.on_allow_domain)
-            b_clear = Gtk.Button(label="Очистить журнал")
+            b_clear_sel = Gtk.Button(label="Убрать выбранные из журнала")
+            b_clear_sel.connect("clicked", self.on_clear_selected)
+            b_clear = Gtk.Button(label="Очистить весь журнал")
             b_clear.connect("clicked", self.on_clear_log)
-            buttons.append(b_allow)
-            buttons.append(b_clear)
+            for b in (b_all, b_none, b_allow, b_clear_sel, b_clear):
+                buttons.append(b)
             self.tv_events, sw = text_area(editable=False, height=120)
             buf = self.tv_events.get_buffer()
             self.events_end = buf.create_mark("end", buf.get_end_iter(), False)
@@ -11103,24 +11490,52 @@ def _build_gui():
             self.tv_events.scroll_mark_onscreen(self.events_end)
             self.render_summary()
 
+        def selected_hosts(self):
+            """Хосты выбранных строк таблицы без повторов (одна строка — хост:порт, хосты могут повторяться)."""
+            return sorted({row.data for row in self.net_table.selected_rows() if row.data})
+
         def on_allow_domain(self, *_):
-            row = self.net_table.selected()
-            if row is None or not self.current:
-                alert(self, "Выберите строку в таблице")
+            hosts = self.selected_hosts()
+            if not hosts or not self.current:
+                alert(self, "Выберите строки в таблице", "Несколько строк: Ctrl или Shift + клик, рамка мышью или "
+                                                         "«Выбрать все» (после фильтра по хосту — только найденные).")
                 return
-            host = row.data
-            if not DOMAIN_RE.match(host):
-                alert(self, f"«{host}» нельзя добавить как домен", "Поддерживаются имена и IPv4-адреса.")
+            valid = [h for h in hosts if DOMAIN_RE.match(h)]
+            invalid = [h for h in hosts if h not in valid]
+            if not valid:
+                alert(self, "Эти строки нельзя добавить как домены", ", ".join(invalid[:8]) +
+                      "\nПоддерживаются имена и IPv4-адреса.")
                 return
             lines = get_lines(self.tv_domains)
-            if host not in lines:
-                lines.append(host)
-            set_text(self.tv_domains, "\n".join(lines))
+            added = [h for h in valid if h not in lines]
+            set_text(self.tv_domains, "\n".join(lines + added))
             self.dd_net.set_selected(NET_MODES.index("allowlist"))
             if self.save_current(quiet=True):
-                alert(self, f"Домен {host} разрешён",
-                      "Режим сети переключён на «только разрешённые домены». "
+                more = f"\nНе добавлены (не домены): {', '.join(invalid[:8])}" if invalid else ""
+                alert(self, f"Разрешено доменов: {len(valid)} (новых {len(added)})",
+                      ", ".join(valid[:12]) + (" …" if len(valid) > 12 else "") + more +
+                      "\n\nРежим сети переключён на «только разрешённые домены». "
                       "Изменение вступит в силу при следующем запуске среды.")
+
+        def on_clear_selected(self, *_):
+            hosts = self.selected_hosts()
+            if not hosts or not self.current:
+                alert(self, "Выберите строки в таблице")
+                return
+            name = self.current.name
+
+            def done(idx):
+                if idx == 1:
+                    try:
+                        removed = filter_net_log(name, hosts)
+                    except OSError as e:
+                        alert(self, "Не удалось изменить журнал", str(e))
+                        return
+                    self.status(f"Из журнала убрано записей: {removed} (хостов: {len(hosts)})")
+                    self.reset_net_view()
+
+            choose(self, f"Убрать из журнала записи по выбранным хостам ({len(hosts)})?",
+                   ", ".join(hosts[:10]) + (" …" if len(hosts) > 10 else ""), ["Отмена", "Убрать"], done)
 
         def on_clear_log(self, *_):
             if not self.current:
@@ -11135,7 +11550,7 @@ def _build_gui():
                         alert(self, "Не удалось очистить журнал", str(e))
                     self.reset_net_view()
 
-            choose(self, "Очистить сетевой журнал?", to_home(net_log_path(name)),
+            choose(self, "Очистить весь сетевой журнал?", to_home(net_log_path(name)),
                    ["Отмена", "Очистить"], done)
 
         def refresh_sessions_async(self):
@@ -12211,6 +12626,461 @@ def _build_gui():
             set_text(self.tv_rw, "\n".join(lines))
 
 
+    # ---- gui/pages/proxies.py: Вкладка «Прокси»: список прокси по папкам (сервисам), поиск, пинг, проверка, проверка для Claude, выделение.
+
+    class ProxyPageMixin:
+        """Прокси общие для всех сред; «В среду…» подставляет выбранный в настройки текущей среды."""
+
+        def build_px_page(self):
+            self.px_query = ""
+            self.px_ping = {}           # имя -> миллисекунды или None (не ответил)
+            self.px_open = {}           # папка -> раскрыта ли
+            self.px_by_ping = False
+            self.px_sel = set()         # имена выделенных галочками прокси
+            self.px_note = {}           # имя -> короткая сводка последней проверки «для Claude»
+            box = margins(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10), 16)
+            title = Gtk.Label(label="Прокси", xalign=0)
+            title.add_css_class("eb-h2")
+            box.append(title)
+            box.append(hint("Добавьте прокси (HTTP или SOCKS5): по одному в строке, форматы схема://логин:пароль@хост:порт, "
+                            "хост:порт:логин:пароль или просто хост:порт, либо ссылку на список (https://…). Прокси из списка "
+                            "складываются в папку-сервис. «В среду…» подставляет выбранный прокси в настройки текущей среды "
+                            "(пароль уходит в keyring среды). «Для Claude» показывает страну, регион, город, провайдера, "
+                            "репутацию адреса, утечку настоящего адреса и доступность claude.ai и api.anthropic.com. "
+                            "Пароли хранятся в каталоге данных envbox (папка _proxy, права только владельцу)."))
+            bar = Gtk.Box(spacing=8)
+            for label, handler in (("Загрузить из файла…", self.on_px_file), ("Вставить прокси или ссылку…", self.on_px_paste)):
+                bt = Gtk.Button(label=label)
+                bt.connect("clicked", handler)
+                bar.append(bt)
+            box.append(bar)
+            search = Gtk.Box(spacing=8)
+            self.px_search = Gtk.SearchEntry(hexpand=True, placeholder_text="Поиск: название, адрес, порт, папка, HTTP/SOCKS5")
+            self.px_search.connect("search-changed", self.on_px_search)
+            search.append(self.px_search)
+            ping_all = Gtk.Button(label="Измерить пинг")
+            ping_all.connect("clicked", lambda *_: self.on_px_ping(None))
+            search.append(ping_all)
+            by_ping = Gtk.CheckButton(label="Сначала быстрые")
+            by_ping.connect("toggled", self.on_px_sort)
+            search.append(by_ping)
+            box.append(search)
+            bulk = Gtk.Box(spacing=8)
+            for label, handler in (("Выбрать все", self.on_px_select_all), ("Снять выбор", self.on_px_unselect)):
+                bt = Gtk.Button(label=label)
+                bt.connect("clicked", handler)
+                bulk.append(bt)
+            self.btn_px_del = Gtk.Button(label="Удалить выбранные (0)")
+            self.btn_px_del.connect("clicked", self.on_px_delete_selected)
+            bulk.append(self.btn_px_del)
+            clear_all = Gtk.Button(label="Очистить всё")
+            clear_all.add_css_class("destructive-action")
+            clear_all.connect("clicked", self.on_px_clear_all)
+            bulk.append(clear_all)
+            box.append(bulk)
+            self.px_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            scroll = Gtk.ScrolledWindow(vexpand=True)
+            scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            scroll.set_child(self.px_list)
+            box.append(scroll)
+            box.append(hint("Пинг — время TCP-подключения к прокси с вашего компьютера. «Проверить» открывает через прокси "
+                            "туннель до example.com."))
+            self.refresh_px_list()
+            return box
+
+        # ---- список: папки, поиск, пинг
+
+        def on_px_search(self, entry):
+            self.px_query = entry.get_text().strip()
+            self.refresh_px_list()
+
+        def on_px_sort(self, button):
+            self.px_by_ping = button.get_active()
+            self.refresh_px_list()
+
+        def px_ping_text(self, p):
+            if p["name"] not in self.px_ping:
+                return "—"
+            ms = self.px_ping[p["name"]]
+            return f"{ms} мс" if ms is not None else "нет ответа"
+
+        def px_sort_key(self, p):
+            if self.px_by_ping:
+                ms = self.px_ping.get(p["name"])
+                return (ms is None, ms or 0, natural_key(p["name"]))
+            return natural_key(p["name"])
+
+        def refresh_px_list(self):
+            clear_children(self.px_list)
+            everything = list_proxies()
+            self.px_sel &= {p["name"] for p in everything}
+            self.update_px_sel()
+            shown = search_vpns(everything, self.px_query)
+            if not everything:
+                self.px_list.append(hint("Пока нет ни одного прокси."))
+            elif not shown:
+                self.px_list.append(hint(f"По запросу «{self.px_query}» ничего не найдено."))
+            groups = {}
+            for p in shown:
+                groups.setdefault(p["folder"], []).append(p)
+            folders = list_px_folders()
+            for folder in sorted(f for f in groups if f) + ([""] if "" in groups else []):
+                self.px_list.append(self.px_folder(folder, sorted(groups[folder], key=self.px_sort_key),
+                                                   folders.get(folder, {}),
+                                                   sum(1 for p in everything if p["folder"] == folder)))
+
+        def px_folder(self, folder, items, info, total):
+            exp = Gtk.Expander()
+            exp.set_expanded(self.px_open.get(folder, True) or bool(self.px_query))
+            exp.connect("notify::expanded", lambda e, _p, f=folder: self.px_open.__setitem__(f, e.get_expanded()))
+            head = Gtk.Box(spacing=8, hexpand=True)
+            text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+            count = f"{len(items)} из {total}" if len(items) != total else str(total)
+            name = Gtk.Label(label=f"{folder or 'Без папки'} · {count}", xalign=0)
+            name.add_css_class("eb-h2")
+            text.append(name)
+            summary = folder_summary(info)
+            if summary:
+                text.append(hint(summary))
+            head.append(text)
+            names = [p["name"] for p in items]
+            pick = Gtk.Button(label="Выбрать")
+            pick.connect("clicked", lambda _b, n=names: self.on_px_select_names(n))
+            head.append(pick)
+            ping = Gtk.Button(label="Пинг")
+            ping.connect("clicked", lambda _b, n=names: self.on_px_ping(n))
+            head.append(ping)
+            if info.get("url"):
+                upd = Gtk.Button(label="Обновить")
+                upd.connect("clicked", lambda _b, f=folder: self.on_px_folder_update(f))
+                head.append(upd)
+            if folder:
+                drop = Gtk.Button(label="Удалить папку")
+                drop.connect("clicked", lambda _b, f=folder, n=total: self.on_px_folder_delete(f, n))
+                head.append(drop)
+            exp.set_label_widget(head)
+            rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            for p in items:
+                rows.append(self.px_row(p))
+            exp.set_child(margins(rows, 6))
+            return exp
+
+        def px_row(self, p):
+            row = Gtk.Box(spacing=8)
+            chk = Gtk.CheckButton(active=p["name"] in self.px_sel)
+            chk.connect("toggled", lambda b, n=p["name"]: self.on_px_toggle(n, b.get_active()))
+            row.append(chk)
+            text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+            name = Gtk.Label(label=p["title"] or p["name"], xalign=0)
+            name.add_css_class("eb-h2")
+            text.append(name)
+            if p["error"]:
+                info = f"{p['name']} · {p['error']}"
+            else:
+                info = f"{p['name']} · {p['label']} · {p['host']}:{p['port']} · " + ("с логином" if p["has_auth"] else "без логина")
+                if self.px_note.get(p["name"]):
+                    info += "\n" + self.px_note[p["name"]]
+            text.append(hint(info))
+            row.append(text)
+            ping = Gtk.Label(label=self.px_ping_text(p), width_chars=10)
+            ping.add_css_class("dim-label")
+            row.append(ping)
+            for label, handler in (("Проверить", lambda _b, n=p["name"]: self.on_px_test(n)),
+                                   ("Для Claude", lambda _b, n=p["name"]: self.on_px_check(n)),
+                                   ("В среду…", lambda _b, n=p["name"]: self.on_px_apply(n)),
+                                   ("В папку…", lambda _b, n=p["name"], f=p["folder"]: self.on_px_move(n, f)),
+                                   ("Удалить", lambda _b, n=p["name"]: self.on_px_delete(n))):
+                bt = Gtk.Button(label=label)
+                bt.connect("clicked", handler)
+                row.append(bt)
+            card = margins(row, 8)
+            card.add_css_class("frame")
+            return card
+
+        # ---- выделение и массовые действия
+
+        def update_px_sel(self):
+            n = len(self.px_sel)
+            self.btn_px_del.set_label(f"Удалить выбранные ({n})")
+            self.btn_px_del.set_sensitive(n > 0)
+
+        def on_px_toggle(self, name, on):
+            (self.px_sel.add if on else self.px_sel.discard)(name)
+            self.update_px_sel()
+
+        def on_px_select_names(self, names):
+            self.px_sel |= set(names)
+            self.refresh_px_list()
+
+        def on_px_select_all(self, *_):
+            """Выбрать все показанные (после поиска — только найденные)."""
+            self.on_px_select_names([p["name"] for p in search_vpns(list_proxies(), self.px_query)])
+
+        def on_px_unselect(self, *_):
+            self.px_sel.clear()
+            self.refresh_px_list()
+
+        def on_px_delete_selected(self, *_):
+            names = sorted(self.px_sel)
+            if not names:
+                return
+
+            def go(idx):
+                if idx == 1:
+                    n = delete_proxies(names)
+                    for x in names:
+                        self.px_ping.pop(x, None)
+                        self.px_note.pop(x, None)
+                    self.px_sel.clear()
+                    self.refresh_px_list()
+                    self.status(f"Удалено прокси: {n}")
+
+            choose(self, f"Удалить выбранные прокси ({len(names)})?",
+                   ", ".join(names[:8]) + (" …" if len(names) > 8 else "") + "\n\nЛогины и пароли будут стёрты.",
+                   ["Отмена", "Удалить"], go)
+
+        def on_px_clear_all(self, *_):
+            total = len(list_proxies())
+            if not total:
+                self.status("Список прокси уже пуст")
+                return
+
+            def go(idx):
+                if idx == 1:
+                    n = clear_proxies()
+                    self.px_ping.clear()
+                    self.px_note.clear()
+                    self.px_sel.clear()
+                    self.refresh_px_list()
+                    self.status(f"Список прокси очищен: удалено {n}")
+
+            choose(self, "Очистить весь список прокси?",
+                   f"Будут удалены все прокси ({total}) и папки вместе с логинами и паролями. Прокси, уже подставленные в "
+                   "настройки сред, не меняются. Это нельзя отменить.", ["Отмена", "Очистить всё"], go)
+
+        # ---- пинг, проверка, перенос, удаление
+
+        def on_px_ping(self, names):
+            proxies = list_proxies()
+            proxies = search_vpns(proxies, self.px_query) if names is None else [p for p in proxies if p["name"] in names]
+            self.status(f"Измеряю пинг: прокси {len(proxies)}…")
+
+            def done(res):
+                if isinstance(res, Exception):
+                    alert(self, "Не удалось измерить пинг", str(res))
+                    return
+                self.px_ping.update(res)
+                ok = sum(1 for ms in res.values() if ms is not None)
+                self.status(f"Пинг измерен: ответили {ok} из {len(res)}")
+                self.refresh_px_list()
+
+            self.run_async(lambda: ping_vpns(proxies), done)
+
+        def on_px_test(self, name):
+            self.status(f"Проверяю прокси «{name}»…")
+
+            def done(res):
+                if isinstance(res, Exception):
+                    alert(self, "Проверка не удалась", str(res))
+                    return
+                ok, msg = res
+                self.status(msg if ok else f"Прокси «{name}» не работает")
+                alert(self, "Прокси работает" if ok else "Прокси не работает", msg)
+
+            self.run_async(lambda: test_proxy(name), done)
+
+        def on_px_check(self, name):
+            """Проверка выхода для Claude: адрес, страна, репутация, утечка, claude.ai и api.anthropic.com, канал до прокси."""
+            self.status(f"Проверяю прокси «{name}» для Claude…")
+            tz = self.e_tz.get_text().strip() if hasattr(self, "e_tz") and self.current else ""
+
+            def done(res):
+                if isinstance(res, Exception):
+                    alert(self, "Проверка не удалась", str(res))
+                    return
+                verdict = {"ok": "подходит", "warn": "есть риски", "bad": "не подходит"}[res["verdict"]]
+                e = res.get("exit") or {}
+                self.px_note[name] = f"Claude: {verdict}" + (f" · {e.get('code', '')} {e.get('city', '')} · {e['ip']}"
+                                                             if e.get("ip") else "")
+                self.status(f"Для Claude: {verdict} (прокси «{name}»)")
+                self.refresh_px_list()
+                self.show_report(f"Прокси «{name}» для Claude", format_report(res, f"Прокси «{name}»"))
+
+            self.run_async(lambda: check_proxy(name, env_tz=tz), done)
+
+        def on_px_apply(self, name):
+            """Подставить прокси в настройки текущей среды; логин и пароль профиль сам перенесёт в keyring."""
+            if not self.current:
+                alert(self, "Выберите среду", "Слева выберите среду, для которой нужен этот прокси.")
+                return
+            env = self.current.name
+
+            def go(idx):
+                if idx != 1:
+                    return
+                try:
+                    self.e_upstream.set_text(proxy_url_with_auth(name))
+                except ValueError as e:
+                    alert(self, "Не удалось подставить прокси", str(e))
+                    return
+                if "@" not in self.e_upstream.get_text() and secret_tool_available():
+                    try:
+                        secret_clear(env, UPSTREAM_AUTH_VAR)       # прежний пароль от другого прокси не нужен
+                    except OSError:
+                        pass
+                    self.current.upstream_auth = False
+                self.save_current(quiet=False)
+                self.update_upstream_status()
+                self.status(f"Прокси «{name}» подставлен в среду «{env}»; изменение вступит в силу при её запуске")
+
+            choose(self, f"Сделать прокси «{name}» прокси среды «{env}»?",
+                   "Прежний прокси этой среды будет заменён. Логин и пароль уйдут в keyring среды (нужен secret-tool).",
+                   ["Отмена", "Подставить"], go)
+
+        def on_px_move(self, name, folder):
+            def got(value):
+                try:
+                    set_px_folder(name, value)
+                except ValueError as e:
+                    alert(self, "Не удалось переместить", str(e))
+                    return
+                self.refresh_px_list()
+
+            prompt(self, "Папка", "Название папки (сервиса). Пусто — вынуть из папки.", got, initial=folder)
+
+        def on_px_delete(self, name):
+            def go(idx):
+                if idx == 1:
+                    delete_proxies([name])
+                    self.px_ping.pop(name, None)
+                    self.px_note.pop(name, None)
+                    self.px_sel.discard(name)
+                    self.refresh_px_list()
+                    self.status(f"Прокси «{name}» удалён")
+
+            choose(self, f"Удалить прокси «{name}»?", "Логин и пароль будут стёрты.", ["Отмена", "Удалить"], go)
+
+        def on_px_folder_delete(self, folder, total):
+            def go(idx):
+                if idx == 1:
+                    delete_px_folder(folder)
+                    self.refresh_px_list()
+                    self.status(f"Папка «{folder}» удалена вместе с прокси ({total})")
+
+            choose(self, f"Удалить папку «{folder}»?", f"Будут удалены все прокси в ней ({total}).", ["Отмена", "Удалить"], go)
+
+        def on_px_folder_update(self, folder):
+            self.status(f"Обновляю список «{folder}»…")
+
+            def work():
+                via = (list_px_folders().get(folder) or {}).get("via", "")
+                proxy, auth = self.env_proxy(via) if via else ("", "")
+                return refresh_px_folder(folder, proxy=proxy, auth=auth)
+
+            def done(res):
+                if isinstance(res, Exception):
+                    alert(self, "Не удалось обновить список", str(res))
+                    return
+                added, skipped, gone = res
+                self.refresh_px_list()
+                self.status(f"Список «{folder}» обновлён: прокси {len(added)}" + (f", убрано пропавших: {len(gone)}" if gone else ""))
+                if skipped:
+                    alert(self, "Часть строк пропущена", "\n".join(skipped[:10]))
+
+            self.run_async(work, done)
+
+        # ---- добавление
+
+        def on_px_file(self, *_):
+            dlg = Gtk.FileDialog(title="Файл со списком прокси")
+
+            def done(d, res):
+                try:
+                    f = d.open_finish(res)
+                except GLib.Error:
+                    return
+                try:
+                    with open(f.get_path(), encoding="utf-8", errors="replace") as fh:
+                        text = fh.read(2 * 1024 * 1024)
+                except OSError as e:
+                    alert(self, "Не удалось прочитать файл", str(e))
+                    return
+                self.add_px("", text)
+
+            dlg.open(self, None, done)
+
+        def on_px_paste(self, *_):
+            win = Gtk.Window(title="Добавить прокси", transient_for=self, modal=True)
+            win.set_default_size(660, -1)
+            box = margins(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10), 16)
+            box.append(hint("По одному прокси в строке или ссылка на список (https://…). Форматы: "
+                            "схема://логин:пароль@хост:порт, хост:порт:логин:пароль, хост:порт; после # — пометка. "
+                            "Без схемы берётся тип из списка ниже. Повторы пропускаются."))
+            name = Gtk.Entry(hexpand=True, placeholder_text="имя, например proxy (можно не указывать)")
+            box.append(name)
+            folder = Gtk.Entry(hexpand=True, placeholder_text="папка (сервис), необязательно")
+            box.append(folder)
+            scheme = Gtk.DropDown.new_from_strings(["Строки без схемы — HTTP", "Строки без схемы — SOCKS5"])
+            box.append(scheme)
+            view, sw = text_area(height=160)
+            box.append(sw)
+            envs = self.proxy_envs()
+            via = Gtk.DropDown.new_from_strings(["Список по ссылке: напрямую с этого компьютера"]
+                                                + [f"Список по ссылке: через прокси среды «{n}»" for n in envs])
+            if envs:
+                box.append(via)
+            buttons = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+            cancel = Gtk.Button(label="Отмена")
+            ok = Gtk.Button(label="Добавить")
+            ok.add_css_class("suggested-action")
+            buttons.append(cancel)
+            buttons.append(ok)
+            box.append(buttons)
+
+            def go(*_a):
+                text, n, fld = get_text(view), name.get_text().strip(), folder.get_text().strip()
+                sch = "socks5" if scheme.get_selected() == 1 else "http"
+                idx = via.get_selected() if envs else 0
+                win.destroy()
+                self.add_px(n, text, sch, fld, envs[idx - 1] if idx > 0 else None)
+
+            cancel.connect("clicked", lambda *_a: win.destroy())
+            ok.connect("clicked", go)
+            win.set_child(box)
+            win.present()
+            name.grab_focus()
+
+        def add_px(self, name, text, scheme="http", folder="", via=None):
+            text = (text or "").strip()
+            if is_proxy_list_url(text):
+                self.status("Скачиваю список прокси" + (f" через прокси среды «{via}»" if via else "") + "…")
+
+                def work():
+                    proxy, auth = self.env_proxy(via) if via else ("", "")
+                    return import_proxy_url(name, text, scheme, folder=folder or None, proxy=proxy, auth=auth, via=via or "")
+
+                def done(res):
+                    if isinstance(res, Exception):
+                        alert(self, "Не удалось загрузить список", str(res))
+                        return
+                    self.px_imported(*res)
+
+                self.run_async(work, done)
+                return
+            try:
+                imported, skipped = import_proxies(name, text, scheme, folder=folder or None)
+            except ValueError as e:
+                alert(self, "Не удалось добавить прокси", str(e))
+                return
+            self.px_imported(imported, skipped)
+
+        def px_imported(self, imported, skipped):
+            self.refresh_px_list()
+            self.status(f"Добавлено прокси: {len(imported)}. «Для Claude» покажет, подходит ли каждый")
+            if skipped:
+                alert(self, "Часть строк пропущена", "\n".join(skipped[:10]))
+
+
     # ---- gui/pages/settings.py: Настройки приложения, диагностика, ярлык.
 
     def version_line():
@@ -12789,6 +13659,7 @@ def _build_gui():
             self.vpn_ping = {}          # имя -> миллисекунды или None (не ответил); у не измеренных нет записи
             self.vpn_open = {}          # папка -> раскрыта ли
             self.vpn_by_ping = False
+            self.vpn_sel = set()        # имена выделенных галочками VPN
             box = margins(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10), 16)
             title = Gtk.Label(label="VPN", xalign=0)
             title.add_css_class("eb-h2")
@@ -12817,6 +13688,19 @@ def _build_gui():
             by_ping.connect("toggled", self.on_vpn_sort)
             search.append(by_ping)
             box.append(search)
+            bulk = Gtk.Box(spacing=8)
+            for label, handler in (("Выбрать все", self.on_vpn_select_all), ("Снять выбор", self.on_vpn_unselect)):
+                bt = Gtk.Button(label=label)
+                bt.connect("clicked", handler)
+                bulk.append(bt)
+            self.btn_vpn_del = Gtk.Button(label="Удалить выбранные (0)")
+            self.btn_vpn_del.connect("clicked", self.on_vpn_delete_selected)
+            bulk.append(self.btn_vpn_del)
+            clear_all = Gtk.Button(label="Очистить всё")
+            clear_all.add_css_class("destructive-action")
+            clear_all.connect("clicked", self.on_vpn_clear_all)
+            bulk.append(clear_all)
+            box.append(bulk)
             self.vpn_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
             scroll = Gtk.ScrolledWindow(vexpand=True)
             scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -12856,6 +13740,8 @@ def _build_gui():
         def refresh_vpn_list(self):
             clear_children(self.vpn_list)
             everything = list_vpns()
+            self.vpn_sel &= {v["name"] for v in everything}
+            self.update_vpn_sel()
             shown = search_vpns(everything, self.vpn_query)
             if not everything:
                 self.vpn_list.append(hint("Пока нет ни одного VPN."))
@@ -12887,6 +13773,9 @@ def _build_gui():
                 text.append(hint(summary))
             head.append(text)
             names = [v["name"] for v in items]
+            pick = Gtk.Button(label="Выбрать")
+            pick.connect("clicked", lambda _b, n=names: self.on_vpn_select_names(n))
+            head.append(pick)
             ping = Gtk.Button(label="Пинг")
             ping.connect("clicked", lambda _b, n=names: self.on_vpn_ping(n))
             head.append(ping)
@@ -12907,6 +13796,9 @@ def _build_gui():
 
         def vpn_row(self, v):
             row = Gtk.Box(spacing=8)
+            chk = Gtk.CheckButton(active=v["name"] in self.vpn_sel)
+            chk.connect("toggled", lambda b, n=v["name"]: self.on_vpn_toggle(n, b.get_active()))
+            row.append(chk)
             text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
             name = Gtk.Label(label=v["title"] or v["name"], xalign=0)
             name.add_css_class("eb-h2")
@@ -12934,6 +13826,66 @@ def _build_gui():
             card = margins(row, 8)
             card.add_css_class("frame")
             return card
+
+        # ---- выделение и массовые действия
+
+        def update_vpn_sel(self):
+            n = len(self.vpn_sel)
+            self.btn_vpn_del.set_label(f"Удалить выбранные ({n})")
+            self.btn_vpn_del.set_sensitive(n > 0)
+
+        def on_vpn_toggle(self, name, on):
+            (self.vpn_sel.add if on else self.vpn_sel.discard)(name)
+            self.update_vpn_sel()
+
+        def on_vpn_select_names(self, names):
+            self.vpn_sel |= set(names)
+            self.refresh_vpn_list()
+
+        def on_vpn_select_all(self, *_):
+            """Выбрать все показанные (после поиска — только найденные)."""
+            self.on_vpn_select_names([v["name"] for v in search_vpns(list_vpns(), self.vpn_query)])
+
+        def on_vpn_unselect(self, *_):
+            self.vpn_sel.clear()
+            self.refresh_vpn_list()
+
+        def on_vpn_delete_selected(self, *_):
+            names = sorted(self.vpn_sel)
+            if not names:
+                return
+
+            def go(idx):
+                if idx == 1:
+                    n = delete_vpns(names)
+                    for x in names:
+                        self.vpn_ping.pop(x, None)
+                    self.vpn_sel.clear()
+                    self.refresh_vpn_list()
+                    self.status(f"Удалено VPN: {n}")
+
+            choose(self, f"Удалить выбранные VPN ({len(names)})?",
+                   ", ".join(names[:8]) + (" …" if len(names) > 8 else "") +
+                   "\n\nКонфигурации (с ключами) будут стёрты. Среды, где они выбраны в «Выход в интернет», не запустятся, "
+                   "пока вы не выберете другой выход.", ["Отмена", "Удалить"], go)
+
+        def on_vpn_clear_all(self, *_):
+            total = len(list_vpns())
+            if not total:
+                self.status("Список VPN уже пуст")
+                return
+
+            def go(idx):
+                if idx == 1:
+                    n = clear_vpns()
+                    self.vpn_ping.clear()
+                    self.vpn_sel.clear()
+                    self.refresh_vpn_list()
+                    self.status(f"Список VPN очищен: удалено {n}")
+
+            choose(self, "Очистить весь список VPN?",
+                   f"Будут удалены все VPN ({total}) и все папки вместе с ключами и адресами подписок. Это нельзя отменить.",
+                   ["Отмена", "Очистить всё"], go)
 
         def on_vpn_ping(self, names):
             """Измерить пинг: names — какие VPN (None — все, подходящие под поиск)."""
@@ -13171,6 +14123,7 @@ def _build_gui():
                 if idx == 1:
                     delete_vpn(name)
                     self.vpn_ping.pop(name, None)
+                    self.vpn_sel.discard(name)
                     self.refresh_vpn_list()
                     self.status(f"VPN «{name}» удалён. Среды, где он выбран, не запустятся, пока вы не выберете другой выход")
 
@@ -13194,6 +14147,7 @@ def _build_gui():
         SettingsMixin,
         NetPageMixin,
         VpnPageMixin,
+        ProxyPageMixin,
         Gtk.ApplicationWindow,
     ):
         """Главное окно."""
@@ -13265,6 +14219,7 @@ def _build_gui():
             self.nb.append_page(self.page_profile, Gtk.Label(label="Настройки"))
             self.nb.append_page(self.build_isolation_page(), Gtk.Label(label="Изоляция"))
             self.nb.append_page(self.build_vpn_page(), Gtk.Label(label="VPN"))
+            self.nb.append_page(self.build_px_page(), Gtk.Label(label="Прокси"))
             self.nb.append_page(self.build_net_page(), Gtk.Label(label="Журнал сети"))
             self.nb.connect("switch-page", self.on_switch_page)
             self.main_stack = Gtk.Stack()

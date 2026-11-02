@@ -324,6 +324,31 @@ def delete_vpn(name):
     return False
 
 
+def delete_vpns(names):
+    """Удалить выделенные VPN одним действием. Возвращает, сколько удалено."""
+    names = set(names)
+    done = 0
+    for v in list_vpns():
+        if v["name"] in names:
+            os.unlink(v["path"])
+            done += 1
+    meta = load_meta()
+    for n in names:
+        meta["vpns"].pop(n, None)
+    # папки, в которых не осталось серверов, не висят
+    used = {m.get("folder") for m in meta["vpns"].values()}
+    meta["folders"] = {f: i for f, i in meta["folders"].items() if f in used}
+    save_meta(meta)
+    return done
+
+
+def clear_vpns():
+    """Удалить все VPN и все папки (идентификатор устройства HWID остаётся). Возвращает, сколько VPN удалено."""
+    done = delete_vpns([v["name"] for v in list_vpns()])
+    save_meta({"folders": {}, "vpns": {}})
+    return done
+
+
 def vpn_binary_problem(kind):
     """Пустая строка, если программа клиента есть; иначе подсказка, что установить."""
     if kind not in VPN_KINDS:

@@ -1,7 +1,7 @@
 """Вкладка «Сеть»: журнал, фильтр, разрешение доменов, сеансы."""
 
 from ...core.consts import DOMAIN_RE, NET_LABELS, NET_MODES
-from ...core.netlog import LogTail, NetSummary, clear_net_log, format_event, human_size, net_log_path
+from ...core.netlog import LogTail, NetSummary, clear_net_log, filter_net_log, format_event, human_size, net_log_path
 from ...core.sessions import list_sessions
 from ..gtk import Gtk
 from ..tables import Row, Table
@@ -23,12 +23,18 @@ class NetPageMixin:
                                empty_text="Пока ни одного обращения.\nЗапустите среду в режиме "
                                           "«через прокси с журналом» — здесь появится, куда она ходит.")
         buttons = Gtk.Box(spacing=8)
-        b_allow = Gtk.Button(label="Разрешить выбранный домен")
+        b_all = Gtk.Button(label="Выбрать все")
+        b_all.connect("clicked", lambda *_: self.net_table.select_all())
+        b_none = Gtk.Button(label="Снять выбор")
+        b_none.connect("clicked", lambda *_: self.net_table.unselect_all())
+        b_allow = Gtk.Button(label="Разрешить выбранные домены")
         b_allow.connect("clicked", self.on_allow_domain)
-        b_clear = Gtk.Button(label="Очистить журнал")
+        b_clear_sel = Gtk.Button(label="Убрать выбранные из журнала")
+        b_clear_sel.connect("clicked", self.on_clear_selected)
+        b_clear = Gtk.Button(label="Очистить весь журнал")
         b_clear.connect("clicked", self.on_clear_log)
-        buttons.append(b_allow)
-        buttons.append(b_clear)
+        for b in (b_all, b_none, b_allow, b_clear_sel, b_clear):
+            buttons.append(b)
         self.tv_events, sw = text_area(editable=False, height=120)
         buf = self.tv_events.get_buffer()
         self.events_end = buf.create_mark("end", buf.get_end_iter(), False)
@@ -101,24 +107,52 @@ class NetPageMixin:
         self.tv_events.scroll_mark_onscreen(self.events_end)
         self.render_summary()
 
+    def selected_hosts(self):
+        """Хосты выбранных строк таблицы без повторов (одна строка — хост:порт, хосты могут повторяться)."""
+        return sorted({row.data for row in self.net_table.selected_rows() if row.data})
+
     def on_allow_domain(self, *_):
-        row = self.net_table.selected()
-        if row is None or not self.current:
-            alert(self, "Выберите строку в таблице")
+        hosts = self.selected_hosts()
+        if not hosts or not self.current:
+            alert(self, "Выберите строки в таблице", "Несколько строк: Ctrl или Shift + клик, рамка мышью или "
+                                                     "«Выбрать все» (после фильтра по хосту — только найденные).")
             return
-        host = row.data
-        if not DOMAIN_RE.match(host):
-            alert(self, f"«{host}» нельзя добавить как домен", "Поддерживаются имена и IPv4-адреса.")
+        valid = [h for h in hosts if DOMAIN_RE.match(h)]
+        invalid = [h for h in hosts if h not in valid]
+        if not valid:
+            alert(self, "Эти строки нельзя добавить как домены", ", ".join(invalid[:8]) +
+                  "\nПоддерживаются имена и IPv4-адреса.")
             return
         lines = get_lines(self.tv_domains)
-        if host not in lines:
-            lines.append(host)
-        set_text(self.tv_domains, "\n".join(lines))
+        added = [h for h in valid if h not in lines]
+        set_text(self.tv_domains, "\n".join(lines + added))
         self.dd_net.set_selected(NET_MODES.index("allowlist"))
         if self.save_current(quiet=True):
-            alert(self, f"Домен {host} разрешён",
-                  "Режим сети переключён на «только разрешённые домены». "
+            more = f"\nНе добавлены (не домены): {', '.join(invalid[:8])}" if invalid else ""
+            alert(self, f"Разрешено доменов: {len(valid)} (новых {len(added)})",
+                  ", ".join(valid[:12]) + (" …" if len(valid) > 12 else "") + more +
+                  "\n\nРежим сети переключён на «только разрешённые домены». "
                   "Изменение вступит в силу при следующем запуске среды.")
+
+    def on_clear_selected(self, *_):
+        hosts = self.selected_hosts()
+        if not hosts or not self.current:
+            alert(self, "Выберите строки в таблице")
+            return
+        name = self.current.name
+
+        def done(idx):
+            if idx == 1:
+                try:
+                    removed = filter_net_log(name, hosts)
+                except OSError as e:
+                    alert(self, "Не удалось изменить журнал", str(e))
+                    return
+                self.status(f"Из журнала убрано записей: {removed} (хостов: {len(hosts)})")
+                self.reset_net_view()
+
+        choose(self, f"Убрать из журнала записи по выбранным хостам ({len(hosts)})?",
+               ", ".join(hosts[:10]) + (" …" if len(hosts) > 10 else ""), ["Отмена", "Убрать"], done)
 
     def on_clear_log(self, *_):
         if not self.current:
@@ -133,7 +167,7 @@ class NetPageMixin:
                     alert(self, "Не удалось очистить журнал", str(e))
                 self.reset_net_view()
 
-        choose(self, "Очистить сетевой журнал?", to_home(net_log_path(name)),
+        choose(self, "Очистить весь сетевой журнал?", to_home(net_log_path(name)),
                ["Отмена", "Очистить"], done)
 
     def refresh_sessions_async(self):

@@ -1559,9 +1559,10 @@ class VpnCheck(unittest.TestCase):
         import threading
         self.root = tempfile.mkdtemp(prefix="eb")
         self.addCleanup(shutil.rmtree, self.root, True)
-        patcher = mock.patch("envbox.core.vpn.envbox_root", return_value=self.root)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for target in ("envbox.core.vpn.envbox_root", "envbox.core.proxies.envbox_root"):
+            patcher = mock.patch(target, return_value=self.root)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         outer = self
         self.state = {"api": 401, "site_loc": "/login", "site_status": 302, "real": "198.51.100.7", "exit": "203.0.113.5"}
 
@@ -1652,6 +1653,20 @@ class VpnCheck(unittest.TestCase):
             report = transport_report("xray", cfg)
             self.assertTrue(report and all(lvl in ("ok", "warn", "bad") for lvl, _t in report), cfg)
 
+    def test_saved_proxy_check_for_claude(self):
+        from envbox.core.proxies import check_proxy, import_proxies
+        proxy, _seen = VpnSubscriptions.connect_proxy({"geo.test": self.port})
+        self.addCleanup(proxy.shutdown)
+        import_proxies("px", f"http://u:secret@127.0.0.1:{proxy.server_address[1]}#мой")
+        r = check_proxy("px", compare_real=False)
+        self.assertEqual(r["exit"]["city"], "Frankfurt")
+        text = " ".join(t for _l, t in r["transport"])
+        self.assertIn("HTTP-прокси", text)
+        self.assertIn("логин и пароль передаются открытым текстом", text)       # канал до прокси не шифруется
+        self.assertIn("ИТОГ", self.vc.format_report(r))
+        with self.assertRaises(ValueError):
+            check_proxy("нет-такого")
+
     def test_claude_verdicts(self):
         j, a = self.vc.judge_claude_site, self.vc.judge_claude_api
         self.assertEqual(j(302, {"location": "/login"}, b"")[0], "ok")
@@ -1734,6 +1749,159 @@ class VpnCheck(unittest.TestCase):
             with self.assertRaises(ValueError) as cm:
                 check_vpn("wg0")
         self.assertIn("wireproxy", str(cm.exception))
+
+
+class NetLogEdit(unittest.TestCase):
+    def test_remove_selected_hosts_in_place(self):
+        import json as _json
+        from envbox.core.netlog import filter_net_log, net_log_path
+        d = tempfile.mkdtemp(prefix="eb")
+        self.addCleanup(shutil.rmtree, d, True)
+        with mock.patch("envbox.core.netlog.box_dir", return_value=d):
+            path = net_log_path("x")
+            rows = [{"event": "proxy-start"}] + [{"event": ev, "host": h, "port": 443}
+                                                 for h in ("a.example", "b.example", "c.example") for ev in ("open", "close")]
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(_json.dumps(r) for r in rows) + "\n")
+            inode = os.stat(path).st_ino
+            held = open(path, "a")                                       # как прокси среды: файл открыт на дозапись
+            self.addCleanup(held.close)
+            self.assertEqual(filter_net_log("x", ["a.example", "c.example", "нет-такого"]), 4)
+            self.assertEqual(os.stat(path).st_ino, inode)                # тот же файл: прокси продолжит писать в него
+            held.write(_json.dumps({"event": "open", "host": "d.example"}) + "\n")
+            held.flush()
+            with open(path, encoding="utf-8") as f:
+                left = [_json.loads(x) for x in f if x.strip()]
+            self.assertEqual([(r.get("host"), r["event"]) for r in left],
+                             [(None, "proxy-start"), ("b.example", "open"), ("b.example", "close"), ("d.example", "open")])
+            self.assertEqual(filter_net_log("x", []), 0)
+            self.assertEqual(filter_net_log("нет-журнала", ["a"]), 0)    # нет файла: ничего не делаем, без ошибки
+
+
+class ProxyStore(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="eb")
+        self.addCleanup(shutil.rmtree, self.root, True)
+        for target in ("envbox.core.vpn.envbox_root", "envbox.core.proxies.envbox_root"):
+            patcher = mock.patch(target, return_value=self.root)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_line_formats(self):
+        from envbox.core.proxies import parse_proxy_line
+        for line, want in (
+                ("http://1.2.3.4:8080", ("http://1.2.3.4:8080", "", "")),
+                ("socks5://u:p@1.2.3.4:1080#Берлин", ("socks5://1.2.3.4:1080", "u:p", "Берлин")),
+                ("1.2.3.4:3128", ("http://1.2.3.4:3128", "", "")),
+                ("u:p@h.example:3128", ("http://h.example:3128", "u:p", "")),
+                ("h.example:3128:us%er:pa@ss", ("http://h.example:3128", "us%er:pa@ss", "")),
+                ("socks5h://h.example:1080", ("socks5h://h.example:1080", "", ""))):
+            self.assertEqual(parse_proxy_line(line), want, line)
+        self.assertEqual(parse_proxy_line("1.2.3.4:1080", "socks5")[0], "socks5://1.2.3.4:1080")   # схема по умолчанию
+        for bad in ("", "#только пометка", "ftp://h:21", "1.2.3.4", "1.2.3.4:abc", "a:b:c", "http://h"):
+            with self.assertRaises(ValueError, msg=bad):
+                parse_proxy_line(bad)
+
+    def test_import_list_folders_and_secrets(self):
+        from envbox.core.proxies import (delete_px_folder, import_proxies, list_proxies, list_px_folders,
+                                         proxy_credentials, px_path, set_px_folder)
+        text = "# мои прокси\n1.2.3.4:8080\nsocks5://u:pw@5.6.7.8:1080#DE\nмусор\n1.2.3.4:8080\n"
+        done, skipped = import_proxies("Сервис А", text, folder="Сервис А")
+        self.assertEqual([n for n, _u, _h in done], ["proxy-1", "proxy-2"])
+        self.assertTrue(any("строка" in x for x in skipped))                    # «мусор» назван
+        self.assertTrue(any("уже есть как «proxy-1»" in x for x in skipped))     # дубль внутри текста не добавлен
+        with self.assertRaises(ValueError):
+            import_proxies("proxy", "1.2.3.4:8080")                             # и повторный импорт того же — тоже
+        listing = list_proxies()
+        self.assertTrue(all("auth" not in p and "pw" not in str(p) for p in listing))   # пароль в список не попадает
+        self.assertEqual(next(p for p in listing if p["host"] == "5.6.7.8")["has_auth"], True)
+        by = {p["name"]: p for p in listing}
+        name = next(n for n, p in by.items() if p["host"] == "5.6.7.8")
+        self.assertEqual(proxy_credentials(name), ("socks5://5.6.7.8:1080", "u:pw"))
+        self.assertEqual(os.stat(px_path()).st_mode & 0o777, 0o600)
+        self.assertEqual(list(list_px_folders()), ["Сервис А"])
+        set_px_folder(name, "")                                                  # вынули из папки
+        self.assertEqual(delete_px_folder("Сервис А"), 1)                       # удаляется только то, что осталось в папке
+        self.assertEqual([p["name"] for p in list_proxies()], [name])
+
+    def test_bulk_delete_and_clear(self):
+        from envbox.core.proxies import clear_proxies, delete_proxies, import_proxies, list_proxies, list_px_folders
+        import_proxies("a", "1.1.1.1:1\n2.2.2.2:2\n3.3.3.3:3\n4.4.4.4:4", folder="Папка")
+        names = [p["name"] for p in list_proxies()]
+        self.assertEqual(len(names), 4)
+        self.assertEqual(delete_proxies(names[:2] + ["нет-такого"]), 2)           # выделенные; лишнее имя не мешает
+        self.assertEqual(len(list_proxies()), 2)
+        self.assertEqual(list(list_px_folders()), ["Папка"])
+        self.assertEqual(delete_proxies(names[2:]), 2)
+        self.assertEqual(list(list_px_folders()), [])                           # пустая папка не висит
+        import_proxies("b", "5.5.5.5:5\n6.6.6.6:6")
+        self.assertEqual(clear_proxies(), 2)
+        self.assertEqual(list_proxies(), [])
+
+    def test_vpn_bulk_delete_and_clear(self):
+        from envbox.core.vpn import clear_vpns, delete_vpns, import_many, list_folders, list_vpns
+        u = VpnConfigs.UUID
+        import_many("s", "\n".join(f"vless://{u}@h{i}.example:443#n{i}" for i in range(5)), folder="Сервис")
+        names = [v["name"] for v in list_vpns()]
+        self.assertEqual(len(names), 5)
+        self.assertEqual(delete_vpns(names[:3]), 3)
+        self.assertEqual([v["name"] for v in list_vpns()], names[3:])
+        self.assertEqual(list(list_folders()), ["Сервис"])                       # в папке ещё есть серверы
+        self.assertEqual(delete_vpns(names[3:]), 2)
+        self.assertEqual(list(list_folders()), [])
+        import_many("t", f"vless://{u}@a.example:443\nvless://{u}@b.example:443", folder="Другая")
+        self.assertEqual(clear_vpns(), 2)
+        self.assertEqual(list_vpns(), [])
+        self.assertEqual(list_folders(), {})
+
+    def test_list_url_vs_proxy_url(self):
+        from envbox.core.proxies import is_proxy_list_url
+        for yes in ("https://api.example.com/list.txt", "http://example.com/proxies?token=1", '"https://x.example/a"'):
+            self.assertTrue(is_proxy_list_url(yes), yes)
+        for no in ("http://1.2.3.4:8080", "http://h.example:3128/", "socks5://h:1080", "1.2.3.4:80", "просто текст"):
+            self.assertFalse(is_proxy_list_url(no), no)
+
+    def test_list_from_a_link_refresh_and_test(self):
+        import http.server
+        import socket as _socket
+        import threading
+        from envbox.core.proxies import (import_proxy_url, list_proxies, list_px_folders, refresh_px_folder,
+                                         test_proxy)
+        body = {"text": "1.1.1.1:81\n2.2.2.2:82\n3.3.3.3:83"}
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(body["text"].encode())
+
+            def log_message(self, *a):
+                pass
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        url = f"http://127.0.0.1:{srv.server_address[1]}/list.txt"
+        done, _ = import_proxy_url("", url, "socks5")
+        self.assertEqual(len(done), 3)
+        self.assertEqual({p["kind"] for p in list_proxies()}, {"socks5"})        # схема по умолчанию из окна добавления
+        folder = next(iter(list_px_folders()))
+        self.assertEqual(list_px_folders()[folder]["url"], url)
+        body["text"] = "1.1.1.1:81\n9.9.9.9:99"                                  # у провайдера один пропал, один новый
+        added, _skipped, gone = refresh_px_folder(folder)
+        self.assertEqual(len(added), 2)
+        self.assertEqual(len(gone), 1)                                          # пропавший удалён
+        self.assertEqual(sorted(p["host"] for p in list_proxies()), ["1.1.1.1", "9.9.9.9"])
+        # проверка работоспособности: поднимаем настоящий «прокси» (HTTP CONNECT) на этом же компьютере
+        fake, _seen = VpnSubscriptions.connect_proxy({"example.com": srv.server_address[1]})
+        self.addCleanup(fake.shutdown)
+        from envbox.core.proxies import import_proxies
+        import_proxies("live", f"http://127.0.0.1:{fake.server_address[1]}")
+        ok, text = test_proxy("live")
+        self.assertTrue(ok, text)
+        self.assertIn("работает", text)
+        ok, text = test_proxy("proxy-1")                                         # 1.1.1.1:81 недоступен
+        self.assertEqual(ok, False)
+        self.assertFalse(test_proxy("нет-такого")[0])
 
 
 class VpnStore(unittest.TestCase):

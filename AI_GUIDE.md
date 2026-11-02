@@ -172,6 +172,19 @@ claude.ai и api.anthropic.com без ключа (401 — регион разр�
 `PR_SET_PDEATHSIG`: клиент умирает вместе со шлюзом. Программы клиентов ищутся в PATH или в `ENVBOX_VPN_WIREPROXY`,
 `ENVBOX_VPN_XRAY`, `ENVBOX_VPN_SINGBOX`. Реального VPN-сервера в песочнице Claude нет: клиенты проверены заглушкой.
 
+### 2.2б. Списки VPN и прокси, массовые действия, журнал сети
+
+Вкладки «VPN» (`gui/pages/vpn.py`, ядро `core/vpn.py`) и «Прокси» (`gui/pages/proxies.py`, ядро `core/proxies.py`) устроены
+одинаково: папки-сервисы (`Gtk.Expander`), поиск (`search_vpns` работает и для прокси: те же ключи `kind/label/host/port`), пинг
+(`ping_vpns`), «Для Claude» (`core/vpncheck.py`), галочки у строк, «Выбрать все» (показанные), «Снять выбор», «Удалить выбранные (N)»
+(`delete_vpns`/`delete_proxies`), «Очистить всё» (`clear_vpns`/`clear_proxies`; HWID остаётся). Прокси хранятся в
+`<корень>/_proxy/proxies.json` (0600, там пароли): форматы `схема://логин:пароль@хост:порт`, `хост:порт:логин:пароль`, `хост:порт`
+(`parse_proxy_line`), ссылка на список (`is_proxy_list_url`: `http://хост:порт` — это прокси, остальное — список). «В среду…»
+(`on_px_apply`) кладёт в поле прокси текущей среды адрес с логином и паролем: профиль сам переносит пароль в keyring
+(`commit_upstream`). Журнал сети: `gui/tables.py Table` — мультивыбор (`Gtk.MultiSelection`, рамка, Ctrl/Shift), «Разрешить
+выбранные домены» (`on_allow_domain`), «Убрать выбранные из журнала» (`core/netlog.py filter_net_log`: правит файл на месте, прокси
+продолжает писать в тот же inode), «Очистить весь журнал».
+
 ### 2.3. Ссылки из среды наружу и обратно
 
 - **Наружу** (`xdg-open`, `$BROWSER`): шим `run/bin/open-url` пишет файл в `run/links/` → GUI (`gui/pages/links.py
@@ -246,9 +259,9 @@ src/envbox/
   version.py lazy.py resources.py selfpath.py        самые нижние модули
   net/        common dns connect upstream chain vpn proxy bridge gitcheck report seccomp entry   (шлюз, БЫСТРЫЙ ВХОД)
   core/       consts fsutil isolation root rootops store profile sessions keyring system browser
-              upstream vpn terminal netlog describe diagnostics desktop links link_handler
+              upstream vpn vpncheck proxies terminal netlog describe diagnostics desktop links link_handler
   cdp/        http client keys browser viewer
-  gui/        gtk consts widgets tables app window ; pages/ (12 миксинов) ; browser/ (page, view)
+  gui/        gtk consts widgets tables app window ; pages/ (14 миксинов) ; browser/ (page, view)
   install.py  cli.py  appimage.py
   resources/  envbox.sh terminal_wrapper.sh help.txt gui.css icon.svg icon.png.b64 AppRun.sh envbox.desktop
 ```

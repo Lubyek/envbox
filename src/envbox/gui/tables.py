@@ -12,12 +12,13 @@ class Row(GObject.Object):
 
 
 class Table:
-    """ColumnView из строковых ячеек; при обновлении сохраняет выбор по ключу."""
+    """ColumnView из строковых ячеек с выбором нескольких строк (Ctrl/Shift-клик, рамка); при обновлении
+    сохраняет выбор по ключу."""
 
     def __init__(self, titles, expand_col=0, empty_text="Пока пусто"):
         self.store = Gio.ListStore(item_type=Row)
-        self.sel = Gtk.SingleSelection(model=self.store, autoselect=False, can_unselect=True)
-        self.view = Gtk.ColumnView(model=self.sel, show_row_separators=True)
+        self.sel = Gtk.MultiSelection(model=self.store)
+        self.view = Gtk.ColumnView(model=self.sel, show_row_separators=True, enable_rubberband=True)
         for i, title in enumerate(titles):
             factory = Gtk.SignalListItemFactory()
             factory.connect("setup", self._setup)
@@ -46,17 +47,27 @@ class Table:
     def _bind(_factory, item, i):
         item.get_child().set_text(item.get_item().cells[i])
 
+    def selected_rows(self):
+        """Все выбранные строки."""
+        bits = self.sel.get_selection()
+        return [self.sel.get_item(bits.get_nth(i)) for i in range(bits.get_size())]
+
     def selected(self):
-        return self.sel.get_selected_item()
+        """Первая из выбранных строк или None."""
+        rows = self.selected_rows()
+        return rows[0] if rows else None
+
+    def select_all(self):
+        self.sel.select_all()
+
+    def unselect_all(self):
+        self.sel.unselect_all()
 
     def set_rows(self, rows):
-        cur = self.selected()
-        key = cur.key if cur is not None else None
+        keys = {r.key for r in self.selected_rows() if r.key is not None}
         self.store.splice(0, self.store.get_n_items(), rows)
         self.stack.set_visible_child_name("table" if rows else "empty")
-        pos = Gtk.INVALID_LIST_POSITION
+        self.sel.unselect_all()
         for n, r in enumerate(rows):
-            if key is not None and r.key == key:
-                pos = n
-                break
-        self.sel.set_selected(pos)
+            if r.key is not None and r.key in keys:
+                self.sel.select_item(n, False)

@@ -35,10 +35,12 @@
   link_handler_desktop(), install_link_handler(), link_handler_installed(), remove_link_handler(), cmd_open_link()
 - `src/envbox/core/links.py` (313 стр.) — Ссылки из среды: очередь, выбор браузера, отправка в среду.
   parse_link(), link_spool_dir(), read_link_spool(), link_spool_pending(), cdp_open_url(), browser_profiles_names(), url_scheme(), parse_inbound(), inbox_dir(), send_link(), inbox_result(), env_running(), find_env_for_url(), open_link_in_env() …
-- `src/envbox/core/netlog.py` (103 стр.) — Журнал сети среды: чтение с хвоста, сводка, очистка.
-  net_log_path(), LogTail (2 методов), NetSummary (3 методов), summarize(), clear_net_log()
+- `src/envbox/core/netlog.py` (137 стр.) — Журнал сети среды: чтение с хвоста, сводка, очистка.
+  net_log_path(), LogTail (2 методов), NetSummary (3 методов), summarize(), filter_net_log(), clear_net_log()
 - `src/envbox/core/profile.py` (572 стр.) — Профиль среды (dataclass Profile) и его проверка.
   Profile (20 методов), locale_available(), timezone_exists(), new_profile()
+- `src/envbox/core/proxies.py` (325 стр.) — Хранилище прокси: список, папки (сервисы), поиск, пинг, проверка и проверка «для Claude».
+  px_path(), load_px(), save_px(), parse_proxy_line(), proxy_lines(), is_proxy_list_url(), px_name_free(), import_proxies(), list_proxies(), proxy_credentials(), proxy_url_with_auth(), delete_proxies(), clear_proxies(), set_px_folder() …
 - `src/envbox/core/root.py` (139 стр.) — Каталог данных envbox и глобальные папки (_global): выбор, создание, перенос.
   default_root(), root_pointer_path(), configured_root(), root_error(), envbox_root(), reset_root_cache(), set_root(), box_dir(), global_root(), global_path(), list_global_folders(), create_global_folder()
 - `src/envbox/core/rootops.py` (129 стр.) — Операции над каталогом данных и глобальными папками, затрагивающие профили и сеансы: перенос, удаление, список пользователей.
@@ -53,7 +55,7 @@
   detect_terminal(), terminal_argv(), dry_run(), launch_background(), read_tail()
 - `src/envbox/core/upstream.py` (70 стр.) — Вышестоящий прокси профиля: разбор URL, чтение из файла, проверка.
   split_proxy_url(), read_proxy_file(), probe_upstream()
-- `src/envbox/core/vpn.py` (647 стр.) — Хранилище VPN-конфигураций: импорт, список, удаление и проверка наличия клиента.
+- `src/envbox/core/vpn.py` (672 стр.) — Хранилище VPN-конфигураций: импорт, список, удаление и проверка наличия клиента.
   vpn_dir(), vpn_path(), vpn_name_from_file(), exit_chain(), exit_mode(), normalize_name(), free_name(), looks_like_source(), is_subscription_url(), clean_folder(), load_meta(), save_meta(), set_folder(), human_bytes() …
 - `src/envbox/core/vpncheck.py` (308 стр.) — Проверка выхода в интернет (VPN, прокси, этот компьютер) с точки зрения Claude.
   judge_claude_site(), judge_claude_api(), utc_hours(), merge_geo(), assess(), verdict(), check_exit(), check_vpn(), format_report()
@@ -73,27 +75,29 @@
   LaunchMixin (7 методов)
 - `src/envbox/gui/pages/links.py` (502 стр.) — Ссылки: очередь запросов, выбор браузера, привязка схем.
   LinksMixin (16 методов)
-- `src/envbox/gui/pages/net_page.py` (166 стр.) — Вкладка «Сеть»: журнал, фильтр, разрешение доменов, сеансы.
-  NetPageMixin (11 методов)
+- `src/envbox/gui/pages/net_page.py` (200 стр.) — Вкладка «Сеть»: журнал, фильтр, разрешение доменов, сеансы.
+  NetPageMixin (13 методов)
 - `src/envbox/gui/pages/overview.py` (162 стр.) — Страницы «Добро пожаловать» и «Обзор».
   OverviewMixin (3 методов)
 - `src/envbox/gui/pages/profile_net.py` (359 стр.) — Настройки сети среды: секрет, прокси, подключение приложений, CDP.
   ProfileNetMixin (19 методов)
 - `src/envbox/gui/pages/profile_page.py` (570 стр.) — Страница настроек среды: сбор формы, сохранение.
   ProfilePageMixin (10 методов)
+- `src/envbox/gui/pages/proxies.py` (476 стр.) — Вкладка «Прокси»: список прокси по папкам (сервисам), поиск, пинг, проверка, проверка для Claude, выделение.
+  ProxyPageMixin (27 методов)
 - `src/envbox/gui/pages/settings.py` (114 стр.) — Настройки приложения, диагностика, ярлык.
   version_line(), SettingsMixin (5 методов)
 - `src/envbox/gui/pages/sidebar.py` (212 стр.) — Боковая панель: список сред, создание, копирование, удаление.
   SidebarMixin (6 методов)
 - `src/envbox/gui/pages/terminal.py` (276 стр.) — Встроенный терминал (VTE).
   TerminalMixin (9 методов)
-- `src/envbox/gui/pages/vpn.py` (427 стр.) — Вкладка «VPN»: серверы по папкам (сервисам), поиск, пинг, загрузка, проверка и удаление.
-  VpnPageMixin (23 методов)
-- `src/envbox/gui/tables.py` (62 стр.) — Таблицы и строки списков GUI.
-  Row (1 методов), Table (5 методов)
+- `src/envbox/gui/pages/vpn.py` (512 стр.) — Вкладка «VPN»: серверы по папкам (сервисам), поиск, пинг, загрузка, проверка и удаление.
+  VpnPageMixin (30 методов)
+- `src/envbox/gui/tables.py` (73 стр.) — Таблицы и строки списков GUI.
+  Row (1 методов), Table (8 методов)
 - `src/envbox/gui/widgets.py` (222 стр.) — Мелкие виджеты и диалоги GTK: кнопки, карточки, переключатели, alert/choose/prompt.
   to_home(), margins(), text_area(), get_text(), get_lines(), set_text(), hint(), alert(), choose(), prompt(), icon_button(), set_button_text(), badge(), card() …
-- `src/envbox/gui/window.py` (234 стр.) — Главное окно: собирается из миксинов страниц (gui/pages/*, gui/browser/*).
+- `src/envbox/gui/window.py` (237 стр.) — Главное окно: собирается из миксинов страниц (gui/pages/*, gui/browser/*).
   EnvboxWindow (10 методов)
 - `src/envbox/install.py` (128 стр.) — Установка: самокопирование в ~/.local/share/envbox, извлечение envbox.sh, команда envbox.
   file_version_text(), file_version(), compile_installed(), ensure_installed()

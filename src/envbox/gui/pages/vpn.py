@@ -8,7 +8,9 @@ from ...core.store import list_profiles, load_profile
 from ...core.upstream import split_proxy_url
 from ...core.vpn import (
     VPN_MAX_BYTES,
+    clear_vpns,
     delete_folder,
+    delete_vpns,
     delete_vpn,
     folder_summary,
     import_many,
@@ -39,6 +41,7 @@ class VpnPageMixin:
         self.vpn_ping = {}          # имя -> миллисекунды или None (не ответил); у не измеренных нет записи
         self.vpn_open = {}          # папка -> раскрыта ли
         self.vpn_by_ping = False
+        self.vpn_sel = set()        # имена выделенных галочками VPN
         box = margins(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10), 16)
         title = Gtk.Label(label="VPN", xalign=0)
         title.add_css_class("eb-h2")
@@ -67,6 +70,19 @@ class VpnPageMixin:
         by_ping.connect("toggled", self.on_vpn_sort)
         search.append(by_ping)
         box.append(search)
+        bulk = Gtk.Box(spacing=8)
+        for label, handler in (("Выбрать все", self.on_vpn_select_all), ("Снять выбор", self.on_vpn_unselect)):
+            bt = Gtk.Button(label=label)
+            bt.connect("clicked", handler)
+            bulk.append(bt)
+        self.btn_vpn_del = Gtk.Button(label="Удалить выбранные (0)")
+        self.btn_vpn_del.connect("clicked", self.on_vpn_delete_selected)
+        bulk.append(self.btn_vpn_del)
+        clear_all = Gtk.Button(label="Очистить всё")
+        clear_all.add_css_class("destructive-action")
+        clear_all.connect("clicked", self.on_vpn_clear_all)
+        bulk.append(clear_all)
+        box.append(bulk)
         self.vpn_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         scroll = Gtk.ScrolledWindow(vexpand=True)
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -106,6 +122,8 @@ class VpnPageMixin:
     def refresh_vpn_list(self):
         clear_children(self.vpn_list)
         everything = list_vpns()
+        self.vpn_sel &= {v["name"] for v in everything}
+        self.update_vpn_sel()
         shown = search_vpns(everything, self.vpn_query)
         if not everything:
             self.vpn_list.append(hint("Пока нет ни одного VPN."))
@@ -137,6 +155,9 @@ class VpnPageMixin:
             text.append(hint(summary))
         head.append(text)
         names = [v["name"] for v in items]
+        pick = Gtk.Button(label="Выбрать")
+        pick.connect("clicked", lambda _b, n=names: self.on_vpn_select_names(n))
+        head.append(pick)
         ping = Gtk.Button(label="Пинг")
         ping.connect("clicked", lambda _b, n=names: self.on_vpn_ping(n))
         head.append(ping)
@@ -157,6 +178,9 @@ class VpnPageMixin:
 
     def vpn_row(self, v):
         row = Gtk.Box(spacing=8)
+        chk = Gtk.CheckButton(active=v["name"] in self.vpn_sel)
+        chk.connect("toggled", lambda b, n=v["name"]: self.on_vpn_toggle(n, b.get_active()))
+        row.append(chk)
         text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
         name = Gtk.Label(label=v["title"] or v["name"], xalign=0)
         name.add_css_class("eb-h2")
@@ -184,6 +208,66 @@ class VpnPageMixin:
         card = margins(row, 8)
         card.add_css_class("frame")
         return card
+
+    # ---- выделение и массовые действия
+
+    def update_vpn_sel(self):
+        n = len(self.vpn_sel)
+        self.btn_vpn_del.set_label(f"Удалить выбранные ({n})")
+        self.btn_vpn_del.set_sensitive(n > 0)
+
+    def on_vpn_toggle(self, name, on):
+        (self.vpn_sel.add if on else self.vpn_sel.discard)(name)
+        self.update_vpn_sel()
+
+    def on_vpn_select_names(self, names):
+        self.vpn_sel |= set(names)
+        self.refresh_vpn_list()
+
+    def on_vpn_select_all(self, *_):
+        """Выбрать все показанные (после поиска — только найденные)."""
+        self.on_vpn_select_names([v["name"] for v in search_vpns(list_vpns(), self.vpn_query)])
+
+    def on_vpn_unselect(self, *_):
+        self.vpn_sel.clear()
+        self.refresh_vpn_list()
+
+    def on_vpn_delete_selected(self, *_):
+        names = sorted(self.vpn_sel)
+        if not names:
+            return
+
+        def go(idx):
+            if idx == 1:
+                n = delete_vpns(names)
+                for x in names:
+                    self.vpn_ping.pop(x, None)
+                self.vpn_sel.clear()
+                self.refresh_vpn_list()
+                self.status(f"Удалено VPN: {n}")
+
+        choose(self, f"Удалить выбранные VPN ({len(names)})?",
+               ", ".join(names[:8]) + (" …" if len(names) > 8 else "") +
+               "\n\nКонфигурации (с ключами) будут стёрты. Среды, где они выбраны в «Выход в интернет», не запустятся, "
+               "пока вы не выберете другой выход.", ["Отмена", "Удалить"], go)
+
+    def on_vpn_clear_all(self, *_):
+        total = len(list_vpns())
+        if not total:
+            self.status("Список VPN уже пуст")
+            return
+
+        def go(idx):
+            if idx == 1:
+                n = clear_vpns()
+                self.vpn_ping.clear()
+                self.vpn_sel.clear()
+                self.refresh_vpn_list()
+                self.status(f"Список VPN очищен: удалено {n}")
+
+        choose(self, "Очистить весь список VPN?",
+               f"Будут удалены все VPN ({total}) и все папки вместе с ключами и адресами подписок. Это нельзя отменить.",
+               ["Отмена", "Очистить всё"], go)
 
     def on_vpn_ping(self, names):
         """Измерить пинг: names — какие VPN (None — все, подходящие под поиск)."""
@@ -421,6 +505,7 @@ class VpnPageMixin:
             if idx == 1:
                 delete_vpn(name)
                 self.vpn_ping.pop(name, None)
+                self.vpn_sel.discard(name)
                 self.refresh_vpn_list()
                 self.status(f"VPN «{name}» удалён. Среды, где он выбран, не запустятся, пока вы не выберете другой выход")
 
