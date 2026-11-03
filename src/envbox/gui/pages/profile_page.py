@@ -90,6 +90,13 @@ class ProfilePageMixin:
             "Нужны вложенные user namespaces. Если браузер сразу закрывается — выключите "
             f"(причина будет в {to_home(envbox_root())}/<имя>/launch.log).")
         self.browser_only += rows.add(None, line)
+        line, self.cb_claude_ext = toggle(
+            "Установить расширение «Claude in Chrome»",
+            "Политика браузера ставит расширение при запуске (без окна подтвердить установку нельзя). Затем "
+            "откройте в браузере claude.ai и расширение и войдите в тот же аккаунт, что и Claude Code; команда "
+            "в среде Claude — «claude --chrome». Нужен доступ к clients2.google.com (для списка сайтов он "
+            "добавляется сам). Браузеру показывается «Управляется вашей организацией».")
+        self.browser_only += rows.add(None, line)
         page.append(box)
 
         # --- Папки: доступ к дополнительным каталогам и глобальные папки
@@ -415,6 +422,7 @@ class ProfilePageMixin:
         self.e_browser_bin.set_text(p.browser_bin)
         self.cb_visible.set_active(p.browser_visible)
         self.cb_chrome_sandbox.set_active(p.browser_chrome_sandbox)
+        self.cb_claude_ext.set_active(p.browser_claude_ext)
         self.dd_net.set_selected(NET_MODES.index(p.net))
         set_text(self.tv_domains, "\n".join(p.allow_domains))
         self.cb_private.set_active(p.net_allow_private)
@@ -498,6 +506,7 @@ class ProfilePageMixin:
             browser_start_url=self.e_start_url.get_text().strip() or "about:blank",
             browser_visible=self.cb_visible.get_active(),
             browser_chrome_sandbox=self.cb_chrome_sandbox.get_active(),
+            browser_claude_ext=self.cb_claude_ext.get_active(),
             lang=self.e_lang.get_text().strip(),
             timezone=self.e_tz.get_text().strip(),
             dns=get_text(self.tv_dns).replace(",", " ").split(),

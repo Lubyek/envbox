@@ -688,6 +688,28 @@ class Presets(unittest.TestCase):
         self.assertNotIn("bridge.claudeusercontent.com", custom.allow_domains)          # свои списки не трогаем
         self.assertIn("claude --chrome", [t for _, t in attach_snippets("браузер")])
 
+    def test_browser_installs_claude_extension_by_policy(self):
+        from envbox.core.browser import browser_command
+        from envbox.core.consts import CLAUDE_CHROME_EXT_ID
+        from envbox.core.profile import Profile, new_profile
+        b = new_profile("browser", "br")
+        self.assertTrue(b.browser_claude_ext)
+        a = b.envbox_args()
+        self.assertEqual(a[a.index("--chrome-extension") + 1], CLAUDE_CHROME_EXT_ID)
+        self.assertNotIn("--disable-background-networking", browser_command(b))   # иначе политика не скачает расширение
+        # в режиме «список» политике открывается скачивание, остальное закрыто
+        b.net, b.allow_domains = "allowlist", ["example.com"]
+        args = b.envbox_args()
+        doms = [args[i + 1] for i, x in enumerate(args) if x == "--allow-domain"]
+        for d in ("example.com", "clients2.google.com", "bridge.claudeusercontent.com"):
+            self.assertIn(d, doms)
+        self.assertEqual(len(doms), len(set(doms)))
+        b.browser_claude_ext = False
+        self.assertNotIn("--chrome-extension", b.envbox_args())
+        self.assertIn("--disable-background-networking", browser_command(b))
+        self.assertNotIn("clients2.google.com", b.envbox_args())    # без расширения список не расширяется
+        self.assertNotIn("--chrome-extension", Profile(name="x", kind="app", browser_claude_ext=True).envbox_args())
+
     def test_desktop_preset_allows_the_claude_bridge(self):
         # без bridge.claudeusercontent.com Claude Desktop повторяет попытку каждые секунды: «Connection problem»
         from envbox.core.consts import CLAUDE_DOMAINS, OLD_CLAUDE_DOMAINS

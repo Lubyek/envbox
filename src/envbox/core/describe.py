@@ -143,6 +143,10 @@ def describe(p):
                               "unix-сокету)."))
         if not p.browser_chrome_sandbox:
             out.append(("warn", "Встроенный sandbox Chrome выключен: защита держится только на bubblewrap."))
+        if p.browser_claude_ext:
+            out.append(("info", "Расширение «Claude in Chrome» ставится политикой браузера при запуске (нужен доступ "
+                                "к clients2.google.com). Claude Code в другой среде находит его через "
+                                "bridge.claudeusercontent.com, если вы вошли в тот же аккаунт claude.ai."))
     else:
         if p.protect_git:
             out.append(("ok", "Хуки и config в .git защищены от записи, сам .git нельзя заменить; "

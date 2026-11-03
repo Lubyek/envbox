@@ -38,7 +38,7 @@ import time
 
 # ---- version.py: Версия envbox (строка читается регулярным выражением при установке — не менять формат).
 
-ENVBOX_VERSION = "2026.11.03.1"
+ENVBOX_VERSION = "2026.11.03.2"
 
 
 # ---- lazy.py: Ленивые модули стандартной библиотеки: настоящий import происходит при первом обращении к атрибуту.
@@ -3022,6 +3022,8 @@ usage() {
                           каталог — домашний каталог среды
   --wayland               пробросить сокет Wayland хоста (для окна браузера; ослабляет
                           изоляцию: композитор может отдавать снимки экрана любому клиенту)
+  --chrome-extension <id> установить расширение Chrome Web Store (32 буквы a–p) политикой браузера:
+                          для Chrome/Chromium внутри среды; повторяемый, не больше 4
   --net-allow-private     разрешить прокси соединяться с частными и loopback-
                           адресами (по умолчанию запрещено: это путь к сервисам хоста)
   --env VAR              передать переменную VAR со значением из окружения хоста
@@ -3101,6 +3103,7 @@ dns_servers=()
 expose_ports=()
 attach_specs=()
 wayland=0
+chrome_exts=()
 no_workdir=0
 allow_domains=()
 direct_domains=()
@@ -3161,6 +3164,7 @@ while (( $# )); do
     --expose-port)    need_arg "$1" $#; expose_ports+=("$2"); shift 2 ;;
     --attach)         need_arg "$1" $#; attach_specs+=("$2"); shift 2 ;;
     --wayland)        wayland=1; shift ;;
+    --chrome-extension) need_arg "$1" $#; chrome_exts+=("$2"); shift 2 ;;
     --no-workdir)     no_workdir=1; shift ;;
     --net-report)     net_report=1; shift ;;
     --follow)         report_mode=--follow; shift ;;
@@ -3410,6 +3414,12 @@ else
 fi
 # true, если путь лежит внутри смонтированного рабочего каталога
 in_workdir() { (( ! no_workdir )) && is_under "$1" "$workdir"; }
+
+# --chrome-extension: идентификатор Chrome Web Store (граница доверия: он попадает в JSON политики)
+(( ${#chrome_exts[@]} <= 4 )) || die "--chrome-extension: не больше 4 расширений"
+for ext in "${chrome_exts[@]}"; do
+  [[ "$ext" =~ ^[a-p]{32}$ ]] || die "недопустимый идентификатор для --chrome-extension: '$ext' (нужно 32 буквы a–p)"
+done
 
 # --expose-port и --attach
 valid_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 > 0 && 10#$1 < 65536 )); }
@@ -3713,6 +3723,23 @@ write_file "$box_dir/etc/hosts" \
 write_file "$box_dir/etc/hostname" "$hostname
 "
 
+# Политика браузера: расширения из Chrome Web Store ставятся сами (в безоконном Chrome подтверждение установки
+# нажать негде). Файл читают Google Chrome (/etc/opt/chrome) и Chromium (/etc/chromium).
+chrome_policy=0
+if (( ${#chrome_exts[@]} )); then
+  if [[ -n "$host_files" ]]; then
+    warn "--chrome-extension не действует вместе с --host-files (настоящий /etc только на чтение)"
+  else
+    chrome_policy=1
+    policy_list=""
+    for ext in "${chrome_exts[@]}"; do
+      policy_list+="${policy_list:+, }\"$ext;https://clients2.google.com/service/update2/crx\""
+    done
+    write_file "$box_dir/etc/chrome-policy.json" "{\"ExtensionInstallForcelist\": [$policy_list]}
+"
+  fi
+fi
+
 # --- PATH внутри среды -------------------------------------------------------
 
 # каталоги, куда ставятся Node, Go, Rust, Bun, Deno из рецептов установки (если их нет — не мешают)
@@ -3936,6 +3963,11 @@ if [[ -z "$host_files" ]]; then
   for f in passwd group hosts hostname; do
     args+=(--ro-bind "$box_dir/etc/$f" "/etc/$f")
   done
+  if (( chrome_policy )); then
+    for d in /etc/opt/chrome/policies/managed /etc/chromium/policies/managed; do
+      args+=(--ro-bind "$box_dir/etc/chrome-policy.json" "$d/envbox.json")
+    done
+  fi
 elif [[ -n "$resolv" ]]; then
   # настоящий /etc виден; подменяем только файл DNS (по ссылке, если это ссылка)
   args+=(--ro-bind "$box_dir/etc/resolv.conf" "$(realpath -m /etc/resolv.conf)")
@@ -4578,6 +4610,10 @@ KIND_LABELS = {"app": "Приложение (терминал)", "browser": "Б�
 CDP_PORT = 9222
 
 
+# Расширение «Claude in Chrome» в Chrome Web Store (его ставит политика браузера, см. envbox.sh --chrome-extension).
+CLAUDE_CHROME_EXT_ID = "fcoeoabgfenejglbffodgkkbkcdhcgfn"
+
+
 BROWSER_NAMES = ("google-chrome-stable", "google-chrome", "chromium", "chromium-browser", "chrome")
 
 
@@ -4605,6 +4641,11 @@ NET_MODES = ("off", "log", "allowlist", "host")
 # сокетов у сред нет, native messaging между ними не работает). Без него `claude --chrome` отвечает «Browser extension
 # is not connected» / «No browsers are connected».
 CLAUDE_DOMAINS = ("*.anthropic.com", "*.claude.ai", "*.claude.com", "bridge.claudeusercontent.com")
+
+
+# Что нужно браузеру-среде в режиме «только выбранные сайты», чтобы политика поставила расширение (список обновлений и
+# скачивание .crx) и оно заработало (вход в claude.ai, API, мост к Claude Code). Добавляется к флагам автоматически.
+CLAUDE_CHROME_EXT_DOMAINS = ("clients2.google.com", "clients2.googleusercontent.com") + CLAUDE_DOMAINS
 
 
 # Claude Desktop (мост bridge.claudeusercontent.com уже входит в CLAUDE_DOMAINS: если его закрыть, приложение
@@ -5059,11 +5100,15 @@ def browser_command(p):
     profile_dir = os.path.join(os.path.realpath(os.path.expanduser("~")), "chrome-profile")
     argv = [exe, f"--user-data-dir={profile_dir}", f"--remote-debugging-port={CDP_PORT}",
             "--no-first-run", "--no-default-browser-check", "--disable-gpu",
-            "--disable-background-networking", "--disable-component-update", "--disable-sync",
+            "--disable-component-update", "--disable-sync",
             "--disable-breakpad", "--password-store=basic",
             # Порт отладки включает признак автоматизации (navigator.webdriver = true); Google и Cloudflare по нему
             # отвечают «браузер не прошёл проверку» (this browser may not be secure). Флаг убирает признак.
             "--disable-blink-features=AutomationControlled"]
+    if not p.browser_claude_ext:
+        # С политикой установки расширений этот флаг нельзя: он выключает фоновые запросы, а среди них — загрузку
+        # расширений, которые ставит политика (Chrome сам обращается к clients2.google.com через прокси envbox).
+        argv.append("--disable-background-networking")
     if p.net != "off":
         argv.append("--proxy-server=http://127.0.0.1:3128")
     argv.append(browser_display_flag(p))
@@ -7029,6 +7074,8 @@ class Profile:
     browser_start_url: str = "about:blank"
     browser_visible: bool = False
     browser_chrome_sandbox: bool = True
+    # Поставить «Claude in Chrome» политикой браузера (без окна подтвердить установку нельзя); включено у новых браузеров
+    browser_claude_ext: bool = False
     lang: str = ""
     timezone: str = ""
     dns: list = field(default_factory=list)
@@ -7402,7 +7449,10 @@ class Profile:
         elif self.net == "log":
             a.append("--net-log")
         elif self.net == "allowlist":
-            for d in self.allow_domains:
+            domains = list(self.allow_domains)
+            if self.is_browser and self.browser_claude_ext:   # иначе политика молча не сможет скачать расширение
+                domains += [d for d in CLAUDE_CHROME_EXT_DOMAINS if d not in domains]
+            for d in domains:
                 a += ["--allow-domain", d]
         if self.uses_proxy and self.net in ("log", "allowlist"):
             a += ["--upstream", self.upstream]
@@ -7430,6 +7480,8 @@ class Profile:
                 if d not in ro:
                     ro.append(d)
             a += ["--expose-port", str(CDP_PORT)]
+            if self.browser_claude_ext:
+                a += ["--chrome-extension", CLAUDE_CHROME_EXT_ID]
             if self.browser_visible:
                 a.append("--wayland")
         else:
@@ -7534,6 +7586,7 @@ def new_profile(kind_key, name):
     if kind_key == "browser":
         p.env = ["LANG"]
         p.protect_git = False
+        p.browser_claude_ext = True
     return p
 
 
@@ -8598,6 +8651,10 @@ def describe(p):
                               "unix-сокету)."))
         if not p.browser_chrome_sandbox:
             out.append(("warn", "Встроенный sandbox Chrome выключен: защита держится только на bubblewrap."))
+        if p.browser_claude_ext:
+            out.append(("info", "Расширение «Claude in Chrome» ставится политикой браузера при запуске (нужен доступ "
+                                "к clients2.google.com). Claude Code в другой среде находит его через "
+                                "bridge.claudeusercontent.com, если вы вошли в тот же аккаунт claude.ai."))
     else:
         if p.protect_git:
             out.append(("ok", "Хуки и config в .git защищены от записи, сам .git нельзя заменить; "
@@ -12698,9 +12755,9 @@ def _build_gui():
             box = margins(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10))
             box.append(hint("Команды выполняются внутри ИИ-среды (Claude Code хранит настройки MCP в её "
                             "домашнем каталоге). Для npx нужен доступ к registry.npmjs.org в списке сети. "
-                            "Параметры MCP-серверов проверьте по их документации. Для «Claude in Chrome» один раз "
-                            "поставьте расширение в браузере-среде (запустите её с видимым окном) и войдите в тот же "
-                            "аккаунт claude.ai, что и Claude Code."))
+                            "Параметры MCP-серверов проверьте по их документации. Для «Claude in Chrome» в настройках "
+                            "браузера-среды включите установку расширения и войдите в нём в тот же аккаунт claude.ai, "
+                            "что и Claude Code."))
             for label, text in attach_snippets(spec):
                 box.append(Gtk.Label(label=label, xalign=0))
                 line = Gtk.Box(spacing=6)
@@ -12812,6 +12869,13 @@ def _build_gui():
                 "Встроенная защита Chrome (sandbox)",
                 "Нужны вложенные user namespaces. Если браузер сразу закрывается — выключите "
                 f"(причина будет в {to_home(envbox_root())}/<имя>/launch.log).")
+            self.browser_only += rows.add(None, line)
+            line, self.cb_claude_ext = toggle(
+                "Установить расширение «Claude in Chrome»",
+                "Политика браузера ставит расширение при запуске (без окна подтвердить установку нельзя). Затем "
+                "откройте в браузере claude.ai и расширение и войдите в тот же аккаунт, что и Claude Code; команда "
+                "в среде Claude — «claude --chrome». Нужен доступ к clients2.google.com (для списка сайтов он "
+                "добавляется сам). Браузеру показывается «Управляется вашей организацией».")
             self.browser_only += rows.add(None, line)
             page.append(box)
 
@@ -13138,6 +13202,7 @@ def _build_gui():
             self.e_browser_bin.set_text(p.browser_bin)
             self.cb_visible.set_active(p.browser_visible)
             self.cb_chrome_sandbox.set_active(p.browser_chrome_sandbox)
+            self.cb_claude_ext.set_active(p.browser_claude_ext)
             self.dd_net.set_selected(NET_MODES.index(p.net))
             set_text(self.tv_domains, "\n".join(p.allow_domains))
             self.cb_private.set_active(p.net_allow_private)
@@ -13221,6 +13286,7 @@ def _build_gui():
                 browser_start_url=self.e_start_url.get_text().strip() or "about:blank",
                 browser_visible=self.cb_visible.get_active(),
                 browser_chrome_sandbox=self.cb_chrome_sandbox.get_active(),
+                browser_claude_ext=self.cb_claude_ext.get_active(),
                 lang=self.e_lang.get_text().strip(),
                 timezone=self.e_tz.get_text().strip(),
                 dns=get_text(self.tv_dns).replace(",", " ").split(),

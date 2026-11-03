@@ -34,6 +34,10 @@ KIND_LABELS = {"app": "Приложение (терминал)", "browser": "Б�
 CDP_PORT = 9222
 
 
+# Расширение «Claude in Chrome» в Chrome Web Store (его ставит политика браузера, см. envbox.sh --chrome-extension).
+CLAUDE_CHROME_EXT_ID = "fcoeoabgfenejglbffodgkkbkcdhcgfn"
+
+
 BROWSER_NAMES = ("google-chrome-stable", "google-chrome", "chromium", "chromium-browser", "chrome")
 
 
@@ -61,6 +65,11 @@ NET_MODES = ("off", "log", "allowlist", "host")
 # сокетов у сред нет, native messaging между ними не работает). Без него `claude --chrome` отвечает «Browser extension
 # is not connected» / «No browsers are connected».
 CLAUDE_DOMAINS = ("*.anthropic.com", "*.claude.ai", "*.claude.com", "bridge.claudeusercontent.com")
+
+
+# Что нужно браузеру-среде в режиме «только выбранные сайты», чтобы политика поставила расширение (список обновлений и
+# скачивание .crx) и оно заработало (вход в claude.ai, API, мост к Claude Code). Добавляется к флагам автоматически.
+CLAUDE_CHROME_EXT_DOMAINS = ("clients2.google.com", "clients2.googleusercontent.com") + CLAUDE_DOMAINS
 
 
 # Claude Desktop (мост bridge.claudeusercontent.com уже входит в CLAUDE_DOMAINS: если его закрыть, приложение

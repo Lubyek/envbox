@@ -12,6 +12,8 @@ from .browser import browser_command, browser_mounts, find_browser, host_program
 from .consts import (
     ATTACH_RE,
     CDP_PORT,
+    CLAUDE_CHROME_EXT_DOMAINS,
+    CLAUDE_CHROME_EXT_ID,
     CLAUDE_DESKTOP_DOMAINS,
     CLAUDE_DOMAINS,
     DOMAIN_RE,
@@ -70,6 +72,8 @@ class Profile:
     browser_start_url: str = "about:blank"
     browser_visible: bool = False
     browser_chrome_sandbox: bool = True
+    # Поставить «Claude in Chrome» политикой браузера (без окна подтвердить установку нельзя); включено у новых браузеров
+    browser_claude_ext: bool = False
     lang: str = ""
     timezone: str = ""
     dns: list = field(default_factory=list)
@@ -443,7 +447,10 @@ class Profile:
         elif self.net == "log":
             a.append("--net-log")
         elif self.net == "allowlist":
-            for d in self.allow_domains:
+            domains = list(self.allow_domains)
+            if self.is_browser and self.browser_claude_ext:   # иначе политика молча не сможет скачать расширение
+                domains += [d for d in CLAUDE_CHROME_EXT_DOMAINS if d not in domains]
+            for d in domains:
                 a += ["--allow-domain", d]
         if self.uses_proxy and self.net in ("log", "allowlist"):
             a += ["--upstream", self.upstream]
@@ -471,6 +478,8 @@ class Profile:
                 if d not in ro:
                     ro.append(d)
             a += ["--expose-port", str(CDP_PORT)]
+            if self.browser_claude_ext:
+                a += ["--chrome-extension", CLAUDE_CHROME_EXT_ID]
             if self.browser_visible:
                 a.append("--wayland")
         else:
@@ -575,4 +584,5 @@ def new_profile(kind_key, name):
     if kind_key == "browser":
         p.env = ["LANG"]
         p.protect_git = False
+        p.browser_claude_ext = True
     return p

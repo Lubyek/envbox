@@ -91,11 +91,15 @@ def browser_command(p):
     profile_dir = os.path.join(os.path.realpath(os.path.expanduser("~")), "chrome-profile")
     argv = [exe, f"--user-data-dir={profile_dir}", f"--remote-debugging-port={CDP_PORT}",
             "--no-first-run", "--no-default-browser-check", "--disable-gpu",
-            "--disable-background-networking", "--disable-component-update", "--disable-sync",
+            "--disable-component-update", "--disable-sync",
             "--disable-breakpad", "--password-store=basic",
             # Порт отладки включает признак автоматизации (navigator.webdriver = true); Google и Cloudflare по нему
             # отвечают «браузер не прошёл проверку» (this browser may not be secure). Флаг убирает признак.
             "--disable-blink-features=AutomationControlled"]
+    if not p.browser_claude_ext:
+        # С политикой установки расширений этот флаг нельзя: он выключает фоновые запросы, а среди них — загрузку
+        # расширений, которые ставит политика (Chrome сам обращается к clients2.google.com через прокси envbox).
+        argv.append("--disable-background-networking")
     if p.net != "off":
         argv.append("--proxy-server=http://127.0.0.1:3128")
     argv.append(browser_display_flag(p))

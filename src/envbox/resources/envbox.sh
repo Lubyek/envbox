@@ -95,6 +95,8 @@ usage() {
                           каталог — домашний каталог среды
   --wayland               пробросить сокет Wayland хоста (для окна браузера; ослабляет
                           изоляцию: композитор может отдавать снимки экрана любому клиенту)
+  --chrome-extension <id> установить расширение Chrome Web Store (32 буквы a–p) политикой браузера:
+                          для Chrome/Chromium внутри среды; повторяемый, не больше 4
   --net-allow-private     разрешить прокси соединяться с частными и loopback-
                           адресами (по умолчанию запрещено: это путь к сервисам хоста)
   --env VAR              передать переменную VAR со значением из окружения хоста
@@ -174,6 +176,7 @@ dns_servers=()
 expose_ports=()
 attach_specs=()
 wayland=0
+chrome_exts=()
 no_workdir=0
 allow_domains=()
 direct_domains=()
@@ -234,6 +237,7 @@ while (( $# )); do
     --expose-port)    need_arg "$1" $#; expose_ports+=("$2"); shift 2 ;;
     --attach)         need_arg "$1" $#; attach_specs+=("$2"); shift 2 ;;
     --wayland)        wayland=1; shift ;;
+    --chrome-extension) need_arg "$1" $#; chrome_exts+=("$2"); shift 2 ;;
     --no-workdir)     no_workdir=1; shift ;;
     --net-report)     net_report=1; shift ;;
     --follow)         report_mode=--follow; shift ;;
@@ -483,6 +487,12 @@ else
 fi
 # true, если путь лежит внутри смонтированного рабочего каталога
 in_workdir() { (( ! no_workdir )) && is_under "$1" "$workdir"; }
+
+# --chrome-extension: идентификатор Chrome Web Store (граница доверия: он попадает в JSON политики)
+(( ${#chrome_exts[@]} <= 4 )) || die "--chrome-extension: не больше 4 расширений"
+for ext in "${chrome_exts[@]}"; do
+  [[ "$ext" =~ ^[a-p]{32}$ ]] || die "недопустимый идентификатор для --chrome-extension: '$ext' (нужно 32 буквы a–p)"
+done
 
 # --expose-port и --attach
 valid_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 > 0 && 10#$1 < 65536 )); }
@@ -786,6 +796,23 @@ write_file "$box_dir/etc/hosts" \
 write_file "$box_dir/etc/hostname" "$hostname
 "
 
+# Политика браузера: расширения из Chrome Web Store ставятся сами (в безоконном Chrome подтверждение установки
+# нажать негде). Файл читают Google Chrome (/etc/opt/chrome) и Chromium (/etc/chromium).
+chrome_policy=0
+if (( ${#chrome_exts[@]} )); then
+  if [[ -n "$host_files" ]]; then
+    warn "--chrome-extension не действует вместе с --host-files (настоящий /etc только на чтение)"
+  else
+    chrome_policy=1
+    policy_list=""
+    for ext in "${chrome_exts[@]}"; do
+      policy_list+="${policy_list:+, }\"$ext;https://clients2.google.com/service/update2/crx\""
+    done
+    write_file "$box_dir/etc/chrome-policy.json" "{\"ExtensionInstallForcelist\": [$policy_list]}
+"
+  fi
+fi
+
 # --- PATH внутри среды -------------------------------------------------------
 
 # каталоги, куда ставятся Node, Go, Rust, Bun, Deno из рецептов установки (если их нет — не мешают)
@@ -1009,6 +1036,11 @@ if [[ -z "$host_files" ]]; then
   for f in passwd group hosts hostname; do
     args+=(--ro-bind "$box_dir/etc/$f" "/etc/$f")
   done
+  if (( chrome_policy )); then
+    for d in /etc/opt/chrome/policies/managed /etc/chromium/policies/managed; do
+      args+=(--ro-bind "$box_dir/etc/chrome-policy.json" "$d/envbox.json")
+    done
+  fi
 elif [[ -n "$resolv" ]]; then
   # настоящий /etc виден; подменяем только файл DNS (по ссылке, если это ссылка)
   args+=(--ro-bind "$box_dir/etc/resolv.conf" "$(realpath -m /etc/resolv.conf)")
