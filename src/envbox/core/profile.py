@@ -22,6 +22,7 @@ from .consts import (
     OLD_CLAUDE_DESKTOP_DOMAINS,
     OLD_CLAUDE_DESKTOP_DOMAINS_V2,
     OLD_CLAUDE_DOMAINS,
+    OLD_CLAUDE_DOMAINS_V2,
     RESERVED_VARS,
     SCHEME_RE,
     SHELLS,
@@ -154,8 +155,9 @@ class Profile:
             p.isolation = {"host_net_forbidden": False, "seccomp": False, "neutral_dns": False}
         if p.net not in NET_MODES:
             p.net = "log"
-        if p.net == "allowlist" and p.allow_domains == OLD_CLAUDE_DOMAINS:
-            p.allow_domains = list(CLAUDE_DOMAINS)   # старый пресет не пускал обновление токена на claude.com
+        if p.net == "allowlist" and p.allow_domains in (OLD_CLAUDE_DOMAINS, OLD_CLAUDE_DOMAINS_V2):
+            # старые пресеты не пускали обновление токена на claude.com и мост Claude in Chrome
+            p.allow_domains = list(CLAUDE_DOMAINS)
         if (p.net == "allowlist" and p.link_handler == "claude-desktop"
                 and p.allow_domains in (list(CLAUDE_DOMAINS), OLD_CLAUDE_DOMAINS, OLD_CLAUDE_DESKTOP_DOMAINS,
                                         OLD_CLAUDE_DESKTOP_DOMAINS_V2)):

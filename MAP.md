@@ -16,9 +16,9 @@
   external_scheme(), local_callback_url(), CdpViewer (35 методов)
 - `src/envbox/cli.py` (125 стр.) — Точка входа: разбор подкоманд (gui, install, run, root, global, net-команды…).
   cmd_root(), cmd_global(), main()
-- `src/envbox/core/browser.py` (124 стр.) — Среды-браузеры: поиск Chrome/Chromium, монтирование, команда запуска, CDP-сокет.
+- `src/envbox/core/browser.py` (127 стр.) — Среды-браузеры: поиск Chrome/Chromium, монтирование, команда запуска, CDP-сокет.
   find_browser(), browser_mounts(), host_program_in_home(), browser_display_flag(), browser_command(), cdp_socket_path(), attach_snippets()
-- `src/envbox/core/consts.py` (113 стр.) — Общие константы ядра: регулярные выражения, режимы сети, подписи, пути установки.
+- `src/envbox/core/consts.py` (122 стр.) — Общие константы ядра: регулярные выражения, режимы сети, подписи, пути установки.
 - `src/envbox/core/describe.py` (176 стр.) — Человеческое описание того, что получит среда (для вкладки «Обзор»).
   describe()
 - `src/envbox/core/desktop.py` (43 стр.) — Ярлык и значок envbox в меню приложений.
@@ -41,7 +41,7 @@
   live_path(), live_data(), write_live(), live_supported()
 - `src/envbox/core/netlog.py` (137 стр.) — Журнал сети среды: чтение с хвоста, сводка, очистка.
   net_log_path(), LogTail (2 методов), NetSummary (3 методов), summarize(), filter_net_log(), clear_net_log()
-- `src/envbox/core/profile.py` (576 стр.) — Профиль среды (dataclass Profile) и его проверка.
+- `src/envbox/core/profile.py` (578 стр.) — Профиль среды (dataclass Profile) и его проверка.
   Profile (20 методов), locale_available(), timezone_exists(), new_profile()
 - `src/envbox/core/proxies.py` (325 стр.) — Хранилище прокси: список, папки (сервисы), поиск, пинг, проверка и проверка «для Claude».
   px_path(), load_px(), save_px(), parse_proxy_line(), proxy_lines(), is_proxy_list_url(), px_name_free(), import_proxies(), list_proxies(), proxy_credentials(), proxy_url_with_auth(), delete_proxies(), clear_proxies(), set_px_folder() …
@@ -83,7 +83,7 @@
   NetPageMixin (14 методов)
 - `src/envbox/gui/pages/overview.py` (162 стр.) — Страницы «Добро пожаловать» и «Обзор».
   OverviewMixin (3 методов)
-- `src/envbox/gui/pages/profile_net.py` (359 стр.) — Настройки сети среды: секрет, прокси, подключение приложений, CDP.
+- `src/envbox/gui/pages/profile_net.py` (361 стр.) — Настройки сети среды: секрет, прокси, подключение приложений, CDP.
   ProfileNetMixin (19 методов)
 - `src/envbox/gui/pages/profile_page.py` (583 стр.) — Страница настроек среды: сбор формы, сохранение.
   ProfilePageMixin (10 методов)

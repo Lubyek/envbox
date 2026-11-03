@@ -121,4 +121,7 @@ def attach_snippets(spec):
         ("Chrome DevTools MCP для Claude Code",
          f"claude mcp add chrome-devtools -- npx -y chrome-devtools-mcp@latest --browser-url={url}"),
         ("Playwright (Node.js)", f"const browser = await chromium.connectOverCDP('{url}');"),
+        # Расширение «Claude in Chrome» стоит в браузере-среде и входит в тот же аккаунт claude.ai; Claude Code
+        # находит его не по CDP, а через bridge.claudeusercontent.com (он должен быть в списке сайтов обеих сред).
+        ("Claude in Chrome (расширение в браузере; CDP не нужен)", "claude --chrome"),
     ]

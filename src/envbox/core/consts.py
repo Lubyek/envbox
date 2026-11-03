@@ -55,21 +55,30 @@ NET_MODES = ("off", "log", "allowlist", "host")
 # Что нужно Claude Code в сети (code.claude.com/docs/en/network-config): API, вход через claude.ai и
 # обновление OAuth-токена на platform.claude.com. Без *.claude.com токен через несколько часов не обновляется,
 # и Claude внутри среды «теряет сеть» (просит войти заново).
-CLAUDE_DOMAINS = ("*.anthropic.com", "*.claude.ai", "*.claude.com")
+#
+# bridge.claudeusercontent.com — WebSocket-мост расширения «Claude in Chrome» (`claude --chrome`): расширение живёт в
+# браузере-среде, а Claude Code — в другой среде, и друг до друга они доходят только через этот мост (общих файлов и
+# сокетов у сред нет, native messaging между ними не работает). Без него `claude --chrome` отвечает «Browser extension
+# is not connected» / «No browsers are connected».
+CLAUDE_DOMAINS = ("*.anthropic.com", "*.claude.ai", "*.claude.com", "bridge.claudeusercontent.com")
 
 
-# Claude Desktop дополнительно держит соединение с bridge.claudeusercontent.com. Если его закрыть, приложение
-# повторяет попытку каждые несколько секунд и показывает «Connection problem». Окна предпросмотра и артефактов
+# Claude Desktop (мост bridge.claudeusercontent.com уже входит в CLAUDE_DOMAINS: если его закрыть, приложение
+# повторяет попытку каждые несколько секунд и показывает «Connection problem»). Окна предпросмотра и артефактов
 # грузятся с <случайное>.frame.claudeusercontent.com. Вход проверяется через hCaptcha (js.hcaptcha.com и соседи): без
 # него страница входа пишет «Couldn't verify your browser». «Войти через Google» открывается окном внутри самого
 # приложения (claude.ai/login/popup-google-auth): нужны accounts.google.com, www.google.com (капча) и статика
 # gstatic. Телеметрия (Sentry, Datadog) и GitHub не нужны для работы и остаются закрытыми.
-CLAUDE_DESKTOP_DOMAINS = CLAUDE_DOMAINS + ("bridge.claudeusercontent.com", "*.claudeusercontent.com", "*.hcaptcha.com",
+CLAUDE_DESKTOP_DOMAINS = CLAUDE_DOMAINS + ("*.claudeusercontent.com", "*.hcaptcha.com",
                                            "accounts.google.com", "www.google.com", "*.gstatic.com")
 
 
+# Прежний список пресета «Claude CLI» (до поддержки Claude in Chrome): профили с ровно таким списком обновляются.
+OLD_CLAUDE_DOMAINS_V2 = ["*.anthropic.com", "*.claude.ai", "*.claude.com"]
+
+
 # Прежние списки пресета Claude Desktop: профили с ровно таким списком обновляются при загрузке.
-OLD_CLAUDE_DESKTOP_DOMAINS = list(CLAUDE_DOMAINS) + ["bridge.claudeusercontent.com"]
+OLD_CLAUDE_DESKTOP_DOMAINS = OLD_CLAUDE_DOMAINS_V2 + ["bridge.claudeusercontent.com"]
 
 
 OLD_CLAUDE_DESKTOP_DOMAINS_V2 = OLD_CLAUDE_DESKTOP_DOMAINS + ["*.hcaptcha.com"]

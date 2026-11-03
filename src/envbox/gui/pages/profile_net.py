@@ -306,7 +306,9 @@ class ProfileNetMixin:
         box = margins(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10))
         box.append(hint("Команды выполняются внутри ИИ-среды (Claude Code хранит настройки MCP в её "
                         "домашнем каталоге). Для npx нужен доступ к registry.npmjs.org в списке сети. "
-                        "Параметры MCP-серверов проверьте по их документации."))
+                        "Параметры MCP-серверов проверьте по их документации. Для «Claude in Chrome» один раз "
+                        "поставьте расширение в браузере-среде (запустите её с видимым окном) и войдите в тот же "
+                        "аккаунт claude.ai, что и Claude Code."))
         for label, text in attach_snippets(spec):
             box.append(Gtk.Label(label=label, xalign=0))
             line = Gtk.Box(spacing=6)

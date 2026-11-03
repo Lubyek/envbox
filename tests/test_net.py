@@ -671,13 +671,29 @@ class Presets(unittest.TestCase):
         custom = Profile.from_dict({"name": "c", "net": "allowlist", "allow_domains": ["example.com"]})
         self.assertEqual(custom.allow_domains, ["example.com"])    # чужие списки не трогаем
 
+    def test_cli_preset_allows_the_chrome_bridge(self):
+        # `claude --chrome` в одной среде и расширение в другой (браузере) связаны только мостом
+        # bridge.claudeusercontent.com; без него: «Browser extension is not connected»
+        from envbox.core.consts import OLD_CLAUDE_DOMAINS, OLD_CLAUDE_DOMAINS_V2
+        from envbox.core.browser import attach_snippets
+        from envbox.core.profile import Profile
+        from envbox.net.proxy import host_matches
+        p = Profile.claude_preset("c")
+        self.assertTrue(host_matches(p.allow_domains, "bridge.claudeusercontent.com"))
+        self.assertFalse(host_matches(p.allow_domains, "evil.claudeusercontent.com"))   # только мост, не весь домен
+        for old in (list(OLD_CLAUDE_DOMAINS), list(OLD_CLAUDE_DOMAINS_V2)):
+            q = Profile.from_dict({"name": "c", "net": "allowlist", "allow_domains": old})
+            self.assertTrue(host_matches(q.allow_domains, "bridge.claudeusercontent.com"), old)
+        custom = Profile.from_dict({"name": "c", "net": "allowlist", "allow_domains": OLD_CLAUDE_DOMAINS_V2 + ["x.com"]})
+        self.assertNotIn("bridge.claudeusercontent.com", custom.allow_domains)          # свои списки не трогаем
+        self.assertIn("claude --chrome", [t for _, t in attach_snippets("браузер")])
+
     def test_desktop_preset_allows_the_claude_bridge(self):
         # без bridge.claudeusercontent.com Claude Desktop повторяет попытку каждые секунды: «Connection problem»
         from envbox.core.consts import CLAUDE_DOMAINS, OLD_CLAUDE_DOMAINS
         from envbox.core.profile import Profile
         p = Profile.claude_desktop_preset("d")
         self.assertIn("bridge.claudeusercontent.com", p.allow_domains)
-        self.assertNotIn("bridge.claudeusercontent.com", Profile.claude_preset("c").allow_domains)   # CLI он не нужен
         for old in (list(CLAUDE_DOMAINS), list(OLD_CLAUDE_DOMAINS)):
             q = Profile.from_dict({"name": "d", "net": "allowlist", "link_handler": "claude-desktop",
                                    "allow_domains": old})

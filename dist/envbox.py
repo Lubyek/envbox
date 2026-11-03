@@ -38,7 +38,7 @@ import time
 
 # ---- version.py: Версия envbox (строка читается регулярным выражением при установке — не менять формат).
 
-ENVBOX_VERSION = "2026.11.02.17"
+ENVBOX_VERSION = "2026.11.03.1"
 
 
 # ---- lazy.py: Ленивые модули стандартной библиотеки: настоящий import происходит при первом обращении к атрибуту.
@@ -4599,21 +4599,30 @@ NET_MODES = ("off", "log", "allowlist", "host")
 # Что нужно Claude Code в сети (code.claude.com/docs/en/network-config): API, вход через claude.ai и
 # обновление OAuth-токена на platform.claude.com. Без *.claude.com токен через несколько часов не обновляется,
 # и Claude внутри среды «теряет сеть» (просит войти заново).
-CLAUDE_DOMAINS = ("*.anthropic.com", "*.claude.ai", "*.claude.com")
+#
+# bridge.claudeusercontent.com — WebSocket-мост расширения «Claude in Chrome» (`claude --chrome`): расширение живёт в
+# браузере-среде, а Claude Code — в другой среде, и друг до друга они доходят только через этот мост (общих файлов и
+# сокетов у сред нет, native messaging между ними не работает). Без него `claude --chrome` отвечает «Browser extension
+# is not connected» / «No browsers are connected».
+CLAUDE_DOMAINS = ("*.anthropic.com", "*.claude.ai", "*.claude.com", "bridge.claudeusercontent.com")
 
 
-# Claude Desktop дополнительно держит соединение с bridge.claudeusercontent.com. Если его закрыть, приложение
-# повторяет попытку каждые несколько секунд и показывает «Connection problem». Окна предпросмотра и артефактов
+# Claude Desktop (мост bridge.claudeusercontent.com уже входит в CLAUDE_DOMAINS: если его закрыть, приложение
+# повторяет попытку каждые несколько секунд и показывает «Connection problem»). Окна предпросмотра и артефактов
 # грузятся с <случайное>.frame.claudeusercontent.com. Вход проверяется через hCaptcha (js.hcaptcha.com и соседи): без
 # него страница входа пишет «Couldn't verify your browser». «Войти через Google» открывается окном внутри самого
 # приложения (claude.ai/login/popup-google-auth): нужны accounts.google.com, www.google.com (капча) и статика
 # gstatic. Телеметрия (Sentry, Datadog) и GitHub не нужны для работы и остаются закрытыми.
-CLAUDE_DESKTOP_DOMAINS = CLAUDE_DOMAINS + ("bridge.claudeusercontent.com", "*.claudeusercontent.com", "*.hcaptcha.com",
+CLAUDE_DESKTOP_DOMAINS = CLAUDE_DOMAINS + ("*.claudeusercontent.com", "*.hcaptcha.com",
                                            "accounts.google.com", "www.google.com", "*.gstatic.com")
 
 
+# Прежний список пресета «Claude CLI» (до поддержки Claude in Chrome): профили с ровно таким списком обновляются.
+OLD_CLAUDE_DOMAINS_V2 = ["*.anthropic.com", "*.claude.ai", "*.claude.com"]
+
+
 # Прежние списки пресета Claude Desktop: профили с ровно таким списком обновляются при загрузке.
-OLD_CLAUDE_DESKTOP_DOMAINS = list(CLAUDE_DOMAINS) + ["bridge.claudeusercontent.com"]
+OLD_CLAUDE_DESKTOP_DOMAINS = OLD_CLAUDE_DOMAINS_V2 + ["bridge.claudeusercontent.com"]
 
 
 OLD_CLAUDE_DESKTOP_DOMAINS_V2 = OLD_CLAUDE_DESKTOP_DOMAINS + ["*.hcaptcha.com"]
@@ -5080,6 +5089,9 @@ def attach_snippets(spec):
         ("Chrome DevTools MCP для Claude Code",
          f"claude mcp add chrome-devtools -- npx -y chrome-devtools-mcp@latest --browser-url={url}"),
         ("Playwright (Node.js)", f"const browser = await chromium.connectOverCDP('{url}');"),
+        # Расширение «Claude in Chrome» стоит в браузере-среде и входит в тот же аккаунт claude.ai; Claude Code
+        # находит его не по CDP, а через bridge.claudeusercontent.com (он должен быть в списке сайтов обеих сред).
+        ("Claude in Chrome (расширение в браузере; CDP не нужен)", "claude --chrome"),
     ]
 
 
@@ -7102,8 +7114,9 @@ class Profile:
             p.isolation = {"host_net_forbidden": False, "seccomp": False, "neutral_dns": False}
         if p.net not in NET_MODES:
             p.net = "log"
-        if p.net == "allowlist" and p.allow_domains == OLD_CLAUDE_DOMAINS:
-            p.allow_domains = list(CLAUDE_DOMAINS)   # старый пресет не пускал обновление токена на claude.com
+        if p.net == "allowlist" and p.allow_domains in (OLD_CLAUDE_DOMAINS, OLD_CLAUDE_DOMAINS_V2):
+            # старые пресеты не пускали обновление токена на claude.com и мост Claude in Chrome
+            p.allow_domains = list(CLAUDE_DOMAINS)
         if (p.net == "allowlist" and p.link_handler == "claude-desktop"
                 and p.allow_domains in (list(CLAUDE_DOMAINS), OLD_CLAUDE_DOMAINS, OLD_CLAUDE_DESKTOP_DOMAINS,
                                         OLD_CLAUDE_DESKTOP_DOMAINS_V2)):
@@ -12685,7 +12698,9 @@ def _build_gui():
             box = margins(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10))
             box.append(hint("Команды выполняются внутри ИИ-среды (Claude Code хранит настройки MCP в её "
                             "домашнем каталоге). Для npx нужен доступ к registry.npmjs.org в списке сети. "
-                            "Параметры MCP-серверов проверьте по их документации."))
+                            "Параметры MCP-серверов проверьте по их документации. Для «Claude in Chrome» один раз "
+                            "поставьте расширение в браузере-среде (запустите её с видимым окном) и войдите в тот же "
+                            "аккаунт claude.ai, что и Claude Code."))
             for label, text in attach_snippets(spec):
                 box.append(Gtk.Label(label=label, xalign=0))
                 line = Gtk.Box(spacing=6)
