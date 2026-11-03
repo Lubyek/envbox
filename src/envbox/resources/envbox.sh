@@ -730,6 +730,7 @@ if (( net_log )); then
     [[ -z "$upstream" ]] || proxy_args+=(--upstream "$upstream")
     for c in "${chain_specs[@]}"; do proxy_args+=(--chain "$c"); done
     (( accel )) || proxy_args+=(--no-accel)
+    proxy_args+=(--live "$box_dir/live.json")    # GUI обновляет файл, шлюз применяет новые списки сайтов сразу
     for d in "${direct_domains[@]}"; do proxy_args+=(--direct "$d"); done
     for d in "${dns_servers[@]}"; do proxy_args+=(--dns "$d"); done
     rm -f -- "$sock"

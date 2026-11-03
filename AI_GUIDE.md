@@ -199,6 +199,18 @@ claude.ai и api.anthropic.com без ключа (401 — регион разр�
 Выключатель: профиль `accelerate`, флаг `--no-accel` у `envbox.sh` и шлюза. Что НЕ лечится: потолок скорости и жёсткий лимит жизни
 туннеля (60 с) у самого поставщика прокси.
 
+### 2.2г. Списки сайтов без перезапуска среды (`core/liveconf.py`, `Proxy.live_loop`, `--live`)
+
+GUI при каждом сохранении профиля (`save_current` → `write_live`) пишет `<каталог среды>/live.json` (0600, атомарно через `.new`;
+пропускается, если данные не изменились или режим сети не «журнал/список»): `{"allow": [...], "direct": [...], "allow_private": bool}`.
+`envbox.sh` запускает шлюз с `--live <каталог>/live.json`; `Proxy.live_loop` раз в секунду сверяет mtime и применяет файл
+(`read_live` → `apply_live`: подменяет `allow/direct/allow_private`, перезаполняет запас туннелей), в журнал пишет `reload`
+(`ok: true/false`). Файл разбирается строго: любая лишняя или недопустимая запись отвергает его целиком, остаются прежние списки.
+Каталог среды недоступен песочнице, поэтому среда расширить себе доступ не может. Старый шлюз (до .17) поля `live` в `proxy-start` не
+пишет: `live_supported` сообщает об этом, и GUI просит перезапустить среду. Уже открытые соединения не рвутся; приложение, получившее
+403 и запомнившее отказ (сеанс Claude), нужно повторить или открыть заново. Проверка: тесты `LiveReload`, `LiveConfFiles`; вручную —
+заглушка bwrap со `sleep 8` (§11.2), подождать `proxy-start`, записать `live.json` и через ~2 с увидеть `reload` в `net.log`.
+
 ### 2.2б. Списки VPN и прокси, массовые действия, журнал сети
 
 Вкладки «VPN» (`gui/pages/vpn.py`, ядро `core/vpn.py`) и «Прокси» (`gui/pages/proxies.py`, ядро `core/proxies.py`) устроены
@@ -759,6 +771,7 @@ python3 -I dist/envbox.py wrap --map 3999:/tmp/ebp/p.sock -- curl --noproxy '' -
 
 | Симптом у пользователя | Вероятная причина | Где смотреть / что делать |
 |---|---|---|
+| После добавления домена в «Журнал сети» в запущенной среде всё ещё `403` | старый шлюз без `live`, или приложение запомнило отказ | `net.log`: событие `reload` после правки; нет — перезапустить среду (§2.2г); есть — повторить запрос/открыть новый сеанс |
 | Claude (или другая программа) в среде «потерял сеть», просит войти заново | allowlist без `platform.claude.com` (обновление OAuth-токена) | `net.log`: `deny not-in-allowlist`; добавить `*.claude.com`, `*.claude.ai` (`CLAUDE_DOMAINS`) |
 | Claude Desktop: «Connection problem», попытки каждые несколько секунд | в журнале повторяются `deny not-in-allowlist` для `bridge.claudeusercontent.com` (список профиля без него) | `CLAUDE_DESKTOP_DOMAINS` (пресет и миграция в `Profile.from_dict`); у профиля со своим списком — добавить хост вручную (вкладка «Сеть» → разрешить). Sentry/Datadog/GitHub отказы безвредны |
 | Вход в браузере-среде: Google/Cloudflare пишут «браузер не прошёл проверку»; окно просмотра зависает после входа через Google | (1) порт отладки включает `navigator.webdriver`; (2) страница открыла JS-диалог (`alert`, `beforeunload`), пока он открыт, кадры не идут; (3) allowlist браузера не пускает `challenges.cloudflare.com`/`*.gstatic.com` | (1) `--disable-blink-features=AutomationControlled` в `core/browser.py browser_command`; (2) `cdp/viewer.py _page_event` закрывает диалоги сам; (3) `net.log` браузера: `deny not-in-allowlist` |

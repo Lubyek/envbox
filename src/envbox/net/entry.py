@@ -16,7 +16,7 @@ from .seccomp import cmd_seccomp
 NET_OPTIONS = {
     "proxy": {"--socket": "str", "--log": "str", "--allow": "list", "--allow-private": "flag",
               "--parent-pid": "int", "--upstream": "str", "--dns": "list", "--direct": "list", "--chain": "list",
-              "--no-accel": "flag"},
+              "--no-accel": "flag", "--live": "str"},
     "wrap": {"--map": "list", "--serve": "list", "--inbox": "str", "--inbox-cmd": "str",
              "--inbox-scheme": "list", "--inbox-callback": "flag"},
     "seccomp": {"--allow": "list"},

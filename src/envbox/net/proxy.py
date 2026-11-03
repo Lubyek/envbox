@@ -5,7 +5,7 @@ import os
 import sys
 import time
 
-from ..lazy import asyncio, ipaddress, json, signal, urllib_parse
+from ..lazy import asyncio, ipaddress, json, re, signal, urllib_parse
 from .common import (
     BUF,
     HEAD_LIMIT,
@@ -76,7 +76,7 @@ class OpenFailed(OSError):
 class Proxy:
     def __init__(self, log_path, allow, allow_private, upstream=None, dns=None, direct=None,
                  idle=IDLE_TIMEOUT, hedge=HEDGE_DELAY, max_hedges=MAX_HEDGES, max_setups=MAX_SETUPS, chain=None,
-                 accel=True, hot=(), stall=STALL_TIMEOUT, hot_idle=HOT_IDLE):
+                 accel=True, hot=(), stall=STALL_TIMEOUT, hot_idle=HOT_IDLE, live=None):
         self.log_path = log_path
         self.setups = SetupGate(max_setups)   # одновременные установки туннеля к вышестоящему прокси (лимит подстраивается)
         self.max_hedges = max_hedges
@@ -91,6 +91,8 @@ class Proxy:
         self.chain = chain if chain is not None else Chain(
             [Channel("proxy", "proxy", upstream)] if upstream is not None else [])
         self.tasks = []
+        self.live = live          # файл настроек, который GUI обновляет у работающей среды (списки сайтов)
+        self.live_seen = self.live_mtime() if live else None   # правка после создания шлюза не потеряется до первого опроса
         # ускорение: запас готовых туннелей к «горячим» сайтам, адаптивный повтор, быстрый обрыв мёртвых туннелей
         self.warm = WarmPool() if accel else None
         self.hot = tuple(hot)
@@ -360,6 +362,64 @@ class Proxy:
         via = ch.upstream.label if ch.upstream is not None and ch.kind == "proxy" else None
         raise OpenFailed(why, text, via)
 
+    def live_mtime(self):
+        try:
+            return os.stat(self.live).st_mtime_ns
+        except OSError:
+            return None
+
+    @staticmethod
+    def read_live(path):
+        """Новые списки сайтов из файла настроек среды или None, если файл не разобран (тогда остаётся прежнее).
+
+        Файл лежит в каталоге среды на хосте, куда песочница не смонтирована, поэтому среда расширить себе доступ не
+        может. Проверка строгая: любая лишняя запись отвергает файл целиком."""
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.loads(f.read(1 << 20))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+
+        def names(key):
+            v = data.get(key, [])
+            if not isinstance(v, list) or len(v) > 5000:
+                raise ValueError(key)
+            out = []
+            for x in v:
+                x = x.lower().rstrip(".") if isinstance(x, str) else ""
+                if not re.match(r"^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$", x):
+                    raise ValueError(key)
+                out.append(x)
+            return out
+        try:
+            return {"allow": names("allow"), "direct": names("direct"), "allow_private": bool(data.get("allow_private"))}
+        except ValueError:
+            return None
+
+    def apply_live(self, data):
+        self.allow, self.direct, self.allow_private = data["allow"], data["direct"], data["allow_private"]
+        if self.warm is not None:
+            self.prewarm()      # у новых разрешённых сайтов Claude сразу появляется запас туннелей
+
+    async def live_loop(self):
+        """Раз в секунду смотрит, не изменился ли файл настроек: новые списки сайтов применяются без перезапуска среды."""
+        last = self.live_seen
+        while True:
+            await asyncio.sleep(1.0)
+            m = self.live_mtime()
+            if m is None or m == last:
+                continue
+            last = m
+            data = self.read_live(self.live)
+            if data is None:
+                self.write({"event": "reload", "ok": False, "reason": "файл настроек не разобран, оставлены прежние списки"})
+                continue
+            self.apply_live(data)
+            self.write({"event": "reload", "ok": True, "allow": data["allow"] or ["*"], "direct": data["direct"] or None,
+                        "allow_private": data["allow_private"]})
+
     def prewarm(self):
         """Первый всплеск соединений приложения (Claude открывает десятки сразу) не ждёт прокси: туннели к главным сайтам
         открываются при старте. Только разрешённые сайты и только через первый прокси цепочки."""
@@ -414,6 +474,8 @@ class Proxy:
                 self.tasks.append(asyncio.ensure_future(self.start_client(ch)))
         if len(self.chain.channels) > 1:
             self.tasks.append(asyncio.ensure_future(self.probe_loop()))
+        if self.live:
+            self.tasks.append(asyncio.ensure_future(self.live_loop()))
         if self.warm is not None:
             self.tasks.append(asyncio.ensure_future(self.warm.maintain()))
             self.prewarm()
@@ -600,7 +662,7 @@ def cmd_proxy(a):
         except ValueError:
             sys.exit(f"envbox-net: недопустимый DNS-сервер: {d}")
     chain = build_chain(a.chain, upstream, os.path.dirname(os.path.abspath(a.log))) if a.chain else None
-    proxy = Proxy(a.log, a.allow, a.allow_private, upstream, a.dns, a.direct, chain=chain, accel=not a.no_accel)
+    proxy = Proxy(a.log, a.allow, a.allow_private, upstream, a.dns, a.direct, chain=chain, accel=not a.no_accel, live=a.live or None)
 
     async def main():
         if os.path.lexists(a.socket):
@@ -614,7 +676,7 @@ def cmd_proxy(a):
                      "allow_private": proxy.allow_private,
                      "upstream": upstream.label if upstream else None,
                      "chain": proxy.chain.describe() if chain is not None else None,
-                     "accel": proxy.warm is not None, "congestion": congestion_control(),
+                     "accel": proxy.warm is not None, "congestion": congestion_control(), "live": bool(proxy.live),
                      "dns": proxy.dns or None, "direct": proxy.direct or None})
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()

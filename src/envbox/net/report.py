@@ -36,6 +36,11 @@ def _fmt_event(e):
     if ev in ("proxy-start", "proxy-stop"):
         extra = f" разрешено: {', '.join(map(str, e.get('allow', [])))}" if ev == "proxy-start" else ""
         return f"{e.get('ts', '')}  --- {ev}{extra}"
+    if ev == "reload":
+        if not e.get("ok"):
+            return f"{e.get('ts', '')}  НАСТРОЙКИ {e.get('reason', 'не применены')}"
+        allow = ", ".join(map(str, e.get("allow", []))) if e.get("allow") != ["*"] else "все сайты"
+        return f"{e.get('ts', '')}  НАСТРОЙКИ применены без перезапуска, разрешено: {allow}"
     if ev == "channel":
         state = {"down": "ОТКАЗАЛ", "up": "СНОВА РАБОТАЕТ", "started": "ЗАПУЩЕН", "broken": "НЕ ЗАПУСТИЛСЯ"}.get(
             e.get("state"), e.get("state", "?"))

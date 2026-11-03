@@ -38,7 +38,7 @@ import time
 
 # ---- version.py: Версия envbox (строка читается регулярным выражением при установке — не менять формат).
 
-ENVBOX_VERSION = "2026.11.02.16"
+ENVBOX_VERSION = "2026.11.02.17"
 
 
 # ---- lazy.py: Ленивые модули стандартной библиотеки: настоящий import происходит при первом обращении к атрибуту.
@@ -1973,7 +1973,7 @@ class OpenFailed(OSError):
 class Proxy:
     def __init__(self, log_path, allow, allow_private, upstream=None, dns=None, direct=None,
                  idle=IDLE_TIMEOUT, hedge=HEDGE_DELAY, max_hedges=MAX_HEDGES, max_setups=MAX_SETUPS, chain=None,
-                 accel=True, hot=(), stall=STALL_TIMEOUT, hot_idle=HOT_IDLE):
+                 accel=True, hot=(), stall=STALL_TIMEOUT, hot_idle=HOT_IDLE, live=None):
         self.log_path = log_path
         self.setups = SetupGate(max_setups)   # одновременные установки туннеля к вышестоящему прокси (лимит подстраивается)
         self.max_hedges = max_hedges
@@ -1988,6 +1988,8 @@ class Proxy:
         self.chain = chain if chain is not None else Chain(
             [Channel("proxy", "proxy", upstream)] if upstream is not None else [])
         self.tasks = []
+        self.live = live          # файл настроек, который GUI обновляет у работающей среды (списки сайтов)
+        self.live_seen = self.live_mtime() if live else None   # правка после создания шлюза не потеряется до первого опроса
         # ускорение: запас готовых туннелей к «горячим» сайтам, адаптивный повтор, быстрый обрыв мёртвых туннелей
         self.warm = WarmPool() if accel else None
         self.hot = tuple(hot)
@@ -2257,6 +2259,64 @@ class Proxy:
         via = ch.upstream.label if ch.upstream is not None and ch.kind == "proxy" else None
         raise OpenFailed(why, text, via)
 
+    def live_mtime(self):
+        try:
+            return os.stat(self.live).st_mtime_ns
+        except OSError:
+            return None
+
+    @staticmethod
+    def read_live(path):
+        """Новые списки сайтов из файла настроек среды или None, если файл не разобран (тогда остаётся прежнее).
+
+        Файл лежит в каталоге среды на хосте, куда песочница не смонтирована, поэтому среда расширить себе доступ не
+        может. Проверка строгая: любая лишняя запись отвергает файл целиком."""
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.loads(f.read(1 << 20))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+
+        def names(key):
+            v = data.get(key, [])
+            if not isinstance(v, list) or len(v) > 5000:
+                raise ValueError(key)
+            out = []
+            for x in v:
+                x = x.lower().rstrip(".") if isinstance(x, str) else ""
+                if not re.match(r"^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$", x):
+                    raise ValueError(key)
+                out.append(x)
+            return out
+        try:
+            return {"allow": names("allow"), "direct": names("direct"), "allow_private": bool(data.get("allow_private"))}
+        except ValueError:
+            return None
+
+    def apply_live(self, data):
+        self.allow, self.direct, self.allow_private = data["allow"], data["direct"], data["allow_private"]
+        if self.warm is not None:
+            self.prewarm()      # у новых разрешённых сайтов Claude сразу появляется запас туннелей
+
+    async def live_loop(self):
+        """Раз в секунду смотрит, не изменился ли файл настроек: новые списки сайтов применяются без перезапуска среды."""
+        last = self.live_seen
+        while True:
+            await asyncio.sleep(1.0)
+            m = self.live_mtime()
+            if m is None or m == last:
+                continue
+            last = m
+            data = self.read_live(self.live)
+            if data is None:
+                self.write({"event": "reload", "ok": False, "reason": "файл настроек не разобран, оставлены прежние списки"})
+                continue
+            self.apply_live(data)
+            self.write({"event": "reload", "ok": True, "allow": data["allow"] or ["*"], "direct": data["direct"] or None,
+                        "allow_private": data["allow_private"]})
+
     def prewarm(self):
         """Первый всплеск соединений приложения (Claude открывает десятки сразу) не ждёт прокси: туннели к главным сайтам
         открываются при старте. Только разрешённые сайты и только через первый прокси цепочки."""
@@ -2311,6 +2371,8 @@ class Proxy:
                 self.tasks.append(asyncio.ensure_future(self.start_client(ch)))
         if len(self.chain.channels) > 1:
             self.tasks.append(asyncio.ensure_future(self.probe_loop()))
+        if self.live:
+            self.tasks.append(asyncio.ensure_future(self.live_loop()))
         if self.warm is not None:
             self.tasks.append(asyncio.ensure_future(self.warm.maintain()))
             self.prewarm()
@@ -2497,7 +2559,7 @@ def cmd_proxy(a):
         except ValueError:
             sys.exit(f"envbox-net: недопустимый DNS-сервер: {d}")
     chain = build_chain(a.chain, upstream, os.path.dirname(os.path.abspath(a.log))) if a.chain else None
-    proxy = Proxy(a.log, a.allow, a.allow_private, upstream, a.dns, a.direct, chain=chain, accel=not a.no_accel)
+    proxy = Proxy(a.log, a.allow, a.allow_private, upstream, a.dns, a.direct, chain=chain, accel=not a.no_accel, live=a.live or None)
 
     async def main():
         if os.path.lexists(a.socket):
@@ -2511,7 +2573,7 @@ def cmd_proxy(a):
                      "allow_private": proxy.allow_private,
                      "upstream": upstream.label if upstream else None,
                      "chain": proxy.chain.describe() if chain is not None else None,
-                     "accel": proxy.warm is not None, "congestion": congestion_control(),
+                     "accel": proxy.warm is not None, "congestion": congestion_control(), "live": bool(proxy.live),
                      "dns": proxy.dns or None, "direct": proxy.direct or None})
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -2570,6 +2632,11 @@ def _fmt_event(e):
     if ev in ("proxy-start", "proxy-stop"):
         extra = f" разрешено: {', '.join(map(str, e.get('allow', [])))}" if ev == "proxy-start" else ""
         return f"{e.get('ts', '')}  --- {ev}{extra}"
+    if ev == "reload":
+        if not e.get("ok"):
+            return f"{e.get('ts', '')}  НАСТРОЙКИ {e.get('reason', 'не применены')}"
+        allow = ", ".join(map(str, e.get("allow", []))) if e.get("allow") != ["*"] else "все сайты"
+        return f"{e.get('ts', '')}  НАСТРОЙКИ применены без перезапуска, разрешено: {allow}"
     if ev == "channel":
         state = {"down": "ОТКАЗАЛ", "up": "СНОВА РАБОТАЕТ", "started": "ЗАПУЩЕН", "broken": "НЕ ЗАПУСТИЛСЯ"}.get(
             e.get("state"), e.get("state", "?"))
@@ -2708,7 +2775,7 @@ def cmd_seccomp(a):
 NET_OPTIONS = {
     "proxy": {"--socket": "str", "--log": "str", "--allow": "list", "--allow-private": "flag",
               "--parent-pid": "int", "--upstream": "str", "--dns": "list", "--direct": "list", "--chain": "list",
-              "--no-accel": "flag"},
+              "--no-accel": "flag", "--live": "str"},
     "wrap": {"--map": "list", "--serve": "list", "--inbox": "str", "--inbox-cmd": "str",
              "--inbox-scheme": "list", "--inbox-callback": "flag"},
     "seccomp": {"--allow": "list"},
@@ -3590,6 +3657,7 @@ if (( net_log )); then
     [[ -z "$upstream" ]] || proxy_args+=(--upstream "$upstream")
     for c in "${chain_specs[@]}"; do proxy_args+=(--chain "$c"); done
     (( accel )) || proxy_args+=(--no-accel)
+    proxy_args+=(--live "$box_dir/live.json")    # GUI обновляет файл, шлюз применяет новые списки сайтов сразу
     for d in "${direct_domains[@]}"; do proxy_args+=(--direct "$d"); done
     for d in "${dns_servers[@]}"; do proxy_args+=(--dns "$d"); done
     rm -f -- "$sock"
@@ -8941,6 +9009,60 @@ def diagnostics(settings=None):
     return res
 
 
+# ---- core/liveconf.py: Настройки запущенной среды, которые применяются сразу, без перезапуска: списки сайтов.
+
+def live_path(name):
+    return os.path.join(box_dir(name), "live.json")
+
+
+def live_data(p):
+    """Что применяется на лету: разрешённые сайты (пусто — все), сайты «напрямую», пускать ли на частные адреса."""
+    return {"allow": [d.lower() for d in p.allow_domains] if p.net == "allowlist" else [],
+            "direct": [d.lower() for d in p.direct_domains] if p.has_remote else [],
+            "allow_private": bool(p.net_allow_private)}
+
+
+def write_live(p):
+    """Записать настройки для работающего шлюза среды (атомарно: шлюз никогда не увидит половину файла).
+
+    Возвращает True, если файл записан; False — шлюзу среды (режим без сети или нет каталога среды) нечего обновлять
+    либо данные не изменились с прошлой записи (тогда шлюз зря не перечитывает файл)."""
+    if p.net not in ("log", "allowlist") or not os.path.isdir(box_dir(p.name)):
+        return False
+    path = live_path(p.name)
+    data = live_data(p)
+    try:
+        with open(path, encoding="utf-8") as f:
+            if json.load(f) == data:
+                return False
+    except (OSError, ValueError):
+        pass
+    fd = os.open(path + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(path + ".new", path)
+    return True
+
+
+def live_supported(name):
+    """Следит ли запущенный шлюз за файлом настроек: по последнему proxy-start в журнале (старый шлюз поля live не пишет)."""
+    path = os.path.join(box_dir(name), "net.log")
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 262144))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        return False
+    for line in reversed(tail.splitlines()):
+        if '"proxy-start"' in line:
+            try:
+                return json.loads(line).get("live") is True
+            except ValueError:
+                return False
+    return False
+
+
 # ---- core/vpncheck.py: Проверка выхода в интернет (VPN, прокси, этот компьютер) с точки зрения Claude.
 
 # Сервисы определения адреса: (адрес запроса, разбор ответа). Берём ответы всех, кто ответил: у одних есть пометки
@@ -12015,12 +12137,21 @@ def _build_gui():
             added = [h for h in valid if h not in lines]
             set_text(self.tv_domains, "\n".join(lines + added))
             self.dd_net.set_selected(NET_MODES.index("allowlist"))
+            name = self.current.name
             if self.save_current(quiet=True):
                 more = f"\nНе добавлены (не домены): {', '.join(invalid[:8])}" if invalid else ""
+                running = any(s.name == name for s in list_sessions())
+                if running and live_supported(name):
+                    when = ("Применено к работающей среде сразу (шлюз подхватывает список за секунду). Сеанс приложения, "
+                            "уже получивший отказ 403, мог его запомнить: повторите действие или откройте новый сеанс.")
+                elif running:
+                    when = ("Среда запущена старой версией шлюза и не умеет применять список на лету: перезапустите среду, "
+                            "тогда новые домены заработают.")
+                else:
+                    when = "Изменение вступит в силу при следующем запуске среды."
                 alert(self, f"Разрешено доменов: {len(valid)} (новых {len(added)})",
                       ", ".join(valid[:12]) + (" …" if len(valid) > 12 else "") + more +
-                      "\n\nРежим сети переключён на «только разрешённые домены». "
-                      "Изменение вступит в силу при следующем запуске среды.")
+                      "\n\nРежим сети переключён на «только разрешённые домены». " + when)
 
         def on_claude_diag(self, *_):
             """Разбор журнала шлюза и записей Claude за последние часы: обрывы, зависшие туннели, лимит жизни туннеля."""
@@ -13119,6 +13250,10 @@ def _build_gui():
                 if not quiet:
                     alert(self, "Не удалось сохранить профиль", str(e))
                 return None
+            try:
+                write_live(p)    # шлюз запущенной среды подхватит новые списки сайтов сам
+            except OSError:
+                pass
             self.current = p
             self.update_upstream_status()
             self.update_overview(p)

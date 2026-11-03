@@ -2123,6 +2123,138 @@ class VpnCheck(unittest.TestCase):
         self.assertIn("wireproxy", str(cm.exception))
 
 
+class LiveReload(unittest.IsolatedAsyncioTestCase):
+    """Списки сайтов меняются у работающего шлюза без перезапуска (файл live.json, который пишет GUI)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="eb")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.live = os.path.join(self.tmp, "live.json")
+
+    def put(self, data, raw=None):
+        with open(self.live + ".new", "w", encoding="utf-8") as f:
+            f.write(raw if raw is not None else json.dumps(data))
+        os.replace(self.live + ".new", self.live)
+        st = os.stat(self.live)
+        os.utime(self.live, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000 * self.bump()))   # mtime точно новый
+
+    def bump(self):
+        self.n = getattr(self, "n", 0) + 1
+        return self.n
+
+    def events(self):
+        with open(os.path.join(self.tmp, "net.log"), encoding="utf-8") as f:
+            return [json.loads(x) for x in f]
+
+    async def wait_for(self, cond, secs=4.0):
+        end = time.monotonic() + secs
+        while time.monotonic() < end:
+            if cond():
+                return True
+            await asyncio.sleep(0.05)
+        return cond()
+
+    async def test_new_domain_is_allowed_without_restart(self):
+        proxy, server, path = await start_proxy(self.tmp, allow=["example.com"], live=self.live)
+        self.addCleanup(proxy.log.close)
+        self.addCleanup(server.close)
+        proxy.begin()
+        self.addCleanup(proxy.end)
+        data, _r, w = await ask(path, b"CONNECT vk.com:443 HTTP/1.1\r\nHost: x\r\n\r\n", read=-1)
+        self.assertTrue(data.startswith(b"HTTP/1.1 403"), data)
+        w.close()
+        self.put({"allow": ["example.com", "*.vk.com", "vk.com", "2gis.ru"], "direct": [], "allow_private": False})
+        self.assertTrue(await self.wait_for(lambda: proxy.allowed("vk.com")))
+        self.assertTrue(proxy.allowed("m.vk.com"))
+        self.assertTrue(proxy.allowed("2gis.ru"))
+        self.assertFalse(proxy.allowed("evil.com"))
+        self.assertFalse(proxy.allow_private)                      # и частные адреса снова закрыты
+        # ужесточение тоже применяется: убранный домен снова закрыт
+        self.put({"allow": ["example.com"], "direct": [], "allow_private": False})
+        self.assertTrue(await self.wait_for(lambda: not proxy.allowed("vk.com")))
+        events = self.events()
+        reloads = [e for e in events if e.get("event") == "reload"]
+        self.assertEqual([e["ok"] for e in reloads], [True, True])
+
+    async def test_broken_file_keeps_previous_lists(self):
+        proxy, server, _path = await start_proxy(self.tmp, allow=["example.com"], live=self.live)
+        self.addCleanup(proxy.log.close)
+        self.addCleanup(server.close)
+        proxy.begin()
+        self.addCleanup(proxy.end)
+        for raw in ("{не json", json.dumps({"allow": ["ok.com", "bad host!"]}), json.dumps({"allow": "ok.com"}),
+                    json.dumps(["ok.com"]), json.dumps({"allow": ["ok.com", 5]})):
+            self.put(None, raw=raw)
+            await asyncio.sleep(1.3)
+            self.assertEqual(proxy.allow, ["example.com"], raw)
+            self.assertFalse(proxy.allowed("ok.com"), raw)
+        events = self.events()
+        self.assertTrue(all(e["ok"] is False for e in events if e.get("event") == "reload"))
+
+    async def test_empty_allow_list_means_everything_and_direct_is_applied(self):
+        proxy, server, _path = await start_proxy(self.tmp, allow=["example.com"], live=self.live)
+        self.addCleanup(proxy.log.close)
+        self.addCleanup(server.close)
+        proxy.begin()
+        self.addCleanup(proxy.end)
+        self.put({"allow": [], "direct": ["*.2gis.ru"], "allow_private": True})
+        self.assertTrue(await self.wait_for(lambda: proxy.allowed("anything.org")))
+        self.assertEqual(proxy.direct, ["*.2gis.ru"])
+        self.assertTrue(proxy.allow_private)
+
+    def test_gateway_args_and_report(self):
+        a = net_parse("proxy", ["--socket", "s", "--log", "l", "--live", "/x/live.json"])
+        self.assertEqual(a.live, "/x/live.json")
+        text = fmt_event({"event": "reload", "ok": True, "allow": ["a.com"], "ts": "2026-01-01T00:00:00"})
+        self.assertIn("применены без перезапуска", text)
+        self.assertIn("a.com", text)
+        bad = fmt_event({"event": "reload", "ok": False, "reason": "не разобран", "ts": "2026-01-01T00:00:00"})
+        self.assertIn("не разобран", bad)
+
+
+class LiveConfFiles(unittest.TestCase):
+    """GUI пишет live.json; запись атомарна, закрыта для других и пропускается, когда менять нечего."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="eb")
+        self.addCleanup(shutil.rmtree, self.root, True)
+        patcher = mock.patch("envbox.core.root.envbox_root", return_value=self.root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_write_skip_and_modes(self):
+        from envbox.core.liveconf import live_data, live_path, live_supported, write_live
+        from envbox.core.profile import Profile
+        p = Profile(name="e1", net="allowlist", allow_domains=["VK.com", "*.2gis.ru"])
+        self.assertFalse(write_live(p))                              # каталога среды ещё нет
+        os.makedirs(os.path.join(self.root, "e1"), mode=0o700)
+        self.assertEqual(live_data(p)["allow"], ["vk.com", "*.2gis.ru"])
+        self.assertTrue(write_live(p))
+        path = live_path("e1")
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["allow"], ["vk.com", "*.2gis.ru"])
+        self.assertFalse(write_live(p))                              # те же данные: файл не трогаем
+        p.allow_domains.append("ya.ru")
+        self.assertTrue(write_live(p))
+        p.net = "none"
+        self.assertFalse(write_live(p))                              # без сети шлюза нет
+        self.assertFalse(os.path.exists(path + ".new"))
+        self.assertFalse(live_supported("e1"))
+        with open(os.path.join(self.root, "e1", "net.log"), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"event": "proxy-start", "live": False}) + "\n")
+        self.assertFalse(live_supported("e1"))                       # старый шлюз
+        with open(os.path.join(self.root, "e1", "net.log"), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"event": "proxy-start", "live": True}) + "\n" + json.dumps({"event": "open"}) + "\n")
+        self.assertTrue(live_supported("e1"))
+
+    def test_log_mode_allows_everything(self):
+        from envbox.core.liveconf import live_data
+        from envbox.core.profile import Profile
+        p = Profile(name="e2", net="log", allow_domains=["a.com"])
+        self.assertEqual(live_data(p)["allow"], [])
+
+
 class NetLogEdit(unittest.TestCase):
     def test_remove_selected_hosts_in_place(self):
         import json as _json

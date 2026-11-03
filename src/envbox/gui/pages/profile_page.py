@@ -6,6 +6,7 @@ import subprocess
 from ...core.browser import find_browser
 from ...core.consts import NET_LABELS, NET_MODES, SHELLS, UPSTREAM_AUTH_VAR
 from ...core.keyring import secret_store, secret_tool_available
+from ...core.liveconf import write_live
 from ...core.profile import Profile
 from ...core.root import envbox_root
 from ...core.store import browser_profiles, save_profile
@@ -541,6 +542,10 @@ class ProfilePageMixin:
             if not quiet:
                 alert(self, "Не удалось сохранить профиль", str(e))
             return None
+        try:
+            write_live(p)    # шлюз запущенной среды подхватит новые списки сайтов сам
+        except OSError:
+            pass
         self.current = p
         self.update_upstream_status()
         self.update_overview(p)

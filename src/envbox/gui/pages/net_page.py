@@ -2,6 +2,7 @@
 
 from ...core.consts import DOMAIN_RE, NET_LABELS, NET_MODES
 from ...core.diagnose import diagnose_claude
+from ...core.liveconf import live_supported
 from ...core.netlog import LogTail, NetSummary, clear_net_log, filter_net_log, format_event, human_size, net_log_path
 from ...core.sessions import list_sessions
 from ..gtk import Gtk
@@ -130,12 +131,21 @@ class NetPageMixin:
         added = [h for h in valid if h not in lines]
         set_text(self.tv_domains, "\n".join(lines + added))
         self.dd_net.set_selected(NET_MODES.index("allowlist"))
+        name = self.current.name
         if self.save_current(quiet=True):
             more = f"\nНе добавлены (не домены): {', '.join(invalid[:8])}" if invalid else ""
+            running = any(s.name == name for s in list_sessions())
+            if running and live_supported(name):
+                when = ("Применено к работающей среде сразу (шлюз подхватывает список за секунду). Сеанс приложения, "
+                        "уже получивший отказ 403, мог его запомнить: повторите действие или откройте новый сеанс.")
+            elif running:
+                when = ("Среда запущена старой версией шлюза и не умеет применять список на лету: перезапустите среду, "
+                        "тогда новые домены заработают.")
+            else:
+                when = "Изменение вступит в силу при следующем запуске среды."
             alert(self, f"Разрешено доменов: {len(valid)} (новых {len(added)})",
                   ", ".join(valid[:12]) + (" …" if len(valid) > 12 else "") + more +
-                  "\n\nРежим сети переключён на «только разрешённые домены». "
-                  "Изменение вступит в силу при следующем запуске среды.")
+                  "\n\nРежим сети переключён на «только разрешённые домены». " + when)
 
     def on_claude_diag(self, *_):
         """Разбор журнала шлюза и записей Claude за последние часы: обрывы, зависшие туннели, лимит жизни туннеля."""

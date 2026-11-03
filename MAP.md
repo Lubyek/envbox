@@ -37,6 +37,8 @@
   link_handler_desktop(), install_link_handler(), link_handler_installed(), remove_link_handler(), cmd_open_link()
 - `src/envbox/core/links.py` (313 стр.) — Ссылки из среды: очередь, выбор браузера, отправка в среду.
   parse_link(), link_spool_dir(), read_link_spool(), link_spool_pending(), cdp_open_url(), browser_profiles_names(), url_scheme(), parse_inbound(), inbox_dir(), send_link(), inbox_result(), env_running(), find_env_for_url(), open_link_in_env() …
+- `src/envbox/core/liveconf.py` (61 стр.) — Настройки запущенной среды, которые применяются сразу, без перезапуска: списки сайтов.
+  live_path(), live_data(), write_live(), live_supported()
 - `src/envbox/core/netlog.py` (137 стр.) — Журнал сети среды: чтение с хвоста, сводка, очистка.
   net_log_path(), LogTail (2 методов), NetSummary (3 методов), summarize(), filter_net_log(), clear_net_log()
 - `src/envbox/core/profile.py` (576 стр.) — Профиль среды (dataclass Profile) и его проверка.
@@ -77,13 +79,13 @@
   LaunchMixin (7 методов)
 - `src/envbox/gui/pages/links.py` (502 стр.) — Ссылки: очередь запросов, выбор браузера, привязка схем.
   LinksMixin (16 методов)
-- `src/envbox/gui/pages/net_page.py` (220 стр.) — Вкладка «Сеть»: журнал, фильтр, разрешение доменов, сеансы.
+- `src/envbox/gui/pages/net_page.py` (230 стр.) — Вкладка «Сеть»: журнал, фильтр, разрешение доменов, сеансы.
   NetPageMixin (14 методов)
 - `src/envbox/gui/pages/overview.py` (162 стр.) — Страницы «Добро пожаловать» и «Обзор».
   OverviewMixin (3 методов)
 - `src/envbox/gui/pages/profile_net.py` (359 стр.) — Настройки сети среды: секрет, прокси, подключение приложений, CDP.
   ProfileNetMixin (19 методов)
-- `src/envbox/gui/pages/profile_page.py` (578 стр.) — Страница настроек среды: сбор формы, сохранение.
+- `src/envbox/gui/pages/profile_page.py` (583 стр.) — Страница настроек среды: сбор формы, сохранение.
   ProfilePageMixin (10 методов)
 - `src/envbox/gui/pages/proxies.py` (476 стр.) — Вкладка «Прокси»: список прокси по папкам (сервисам), поиск, пинг, проверка, проверка для Claude, выделение.
   ProxyPageMixin (27 методов)
@@ -119,9 +121,9 @@
   NetArgs (1 методов), net_usage(), net_parse(), net_main()
 - `src/envbox/net/gitcheck.py` (112 стр.) — Проверка Git после работы среды: хуки и config проекта не должны меняться незаметно.
   git_state(), cmd_gitcheck()
-- `src/envbox/net/proxy.py` (640 стр.) — Сетевой шлюз: журналирующий прокси (команда proxy).
-  host_matches(), err_text(), PrivateAddress (1 методов), OpenFailed (1 методов), Proxy (11 методов), build_chain(), cmd_proxy()
-- `src/envbox/net/report.py` (117 стр.) — Сетевой шлюз: чтение и вывод журнала соединений (команда report).
+- `src/envbox/net/proxy.py` (702 стр.) — Сетевой шлюз: журналирующий прокси (команда proxy).
+  host_matches(), err_text(), PrivateAddress (1 методов), OpenFailed (1 методов), Proxy (14 методов), build_chain(), cmd_proxy()
+- `src/envbox/net/report.py` (122 стр.) — Сетевой шлюз: чтение и вывод журнала соединений (команда report).
   human(), clean(), events(), fmt_event(), cmd_report()
 - `src/envbox/net/seccomp.py` (52 стр.) — seccomp-фильтр для bwrap (команда seccomp).
   seccomp_program_x86_64(), cmd_seccomp()
